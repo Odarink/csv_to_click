@@ -13,7 +13,6 @@ import pandas as pd
 from csv_click.clickhouse import raw_insert_batch
 from csv_click.errors import CsvSchemaError
 from csv_click.schema import (
-    CLICKHOUSE_TYPE_OPTIONS,
     CsvColumn,
     CsvSchema,
     _ColumnStats,
@@ -21,6 +20,7 @@ from csv_click.schema import (
     convert_value,
     normalize_identifier,
     unwrap_nullable,
+    validate_clickhouse_type_expression,
 )
 
 
@@ -142,8 +142,7 @@ def mappings_to_schema(mappings: list[SchemaMapping]) -> CsvSchema:
         if not target_name:
             raise CsvSchemaError("Target column name cannot be empty")
         final_type = _normalize_nullable_type(mapping.final_type, mapping.nullable)
-        if final_type not in CLICKHOUSE_TYPE_OPTIONS:
-            raise CsvSchemaError(f"Unsupported ClickHouse type: {final_type}")
+        final_type = validate_clickhouse_type_expression(final_type)
         columns.append(
             CsvColumn(
                 column_name=target_name,
@@ -168,6 +167,7 @@ def mappings_to_editor_rows(mappings: list[SchemaMapping]) -> list[dict[str, obj
             "include": mapping.include,
             "inferred_type": mapping.inferred_type or mapping.final_type,
             "final_type": mapping.final_type,
+            "custom_type": "",
             "nullable": mapping.final_type.startswith("Nullable("),
             "sample_values": ", ".join(mapping.sample_values),
             "notes": mapping.notes,
@@ -179,7 +179,10 @@ def mappings_to_editor_rows(mappings: list[SchemaMapping]) -> list[dict[str, obj
 def mappings_from_editor_rows(rows: list[dict[str, object]]) -> list[SchemaMapping]:
     mappings = []
     for row in rows:
-        final_type = _normalize_nullable_type(str(row["final_type"]), bool(row.get("nullable", False)))
+        custom_type = str(row.get("custom_type") or "").strip()
+        selected_type = custom_type or str(row["final_type"])
+        final_type = _normalize_nullable_type(selected_type, bool(row.get("nullable", False)))
+        final_type = validate_clickhouse_type_expression(final_type)
         mappings.append(
             SchemaMapping(
                 source_name=str(row["source_name"]),
@@ -300,7 +303,10 @@ def _convert_series(series: pd.Series, clickhouse_type: str) -> pd.Series:
         return converted.map(lambda value: None if pd.isna(value) else value.to_pydatetime()).astype("object")
     if inner_type == "Bool":
         return series.map(lambda value: convert_value(_value_to_string(value), clickhouse_type)).astype("object")
-    raise CsvSchemaError(f"unsupported ClickHouse type: {clickhouse_type}")
+    validate_clickhouse_type_expression(clickhouse_type)
+    if not nullable and series.isna().any():
+        raise CsvSchemaError(f"empty value is not allowed for non-nullable {clickhouse_type}")
+    return series.map(lambda value: None if pd.isna(value) else _value_to_string(value)).astype("object")
 
 
 def _first_bad_value(series: pd.Series, clickhouse_type: str) -> object:

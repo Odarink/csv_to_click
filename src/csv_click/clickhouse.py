@@ -81,7 +81,9 @@ def get_client(config: ClickHouseConfig):
     except CertificateError:
         raise
     except Exception as exc:
-        raise ClickHouseConnectionError(f"ClickHouse client initialization failed: {exc}") from exc
+        raise ClickHouseConnectionError(
+            f"ClickHouse client initialization failed: {_format_connection_error(config, exc)}"
+        ) from exc
 
 
 def test_connection(client: ClickHouseClient) -> None:
@@ -135,12 +137,15 @@ def build_create_local_table_sql(
         f"`{column.column_name}` {column.final_type}" for column in schema.columns
     )
     partition_sql = f"\nPARTITION BY {partition_by.strip()}" if partition_by and partition_by.strip() else ""
-    return f"""CREATE TABLE {database}.{table} ON CLUSTER '{cluster}'
+    return f"""CREATE TABLE {database}.{table}
+ON CLUSTER {cluster}
 (
     {columns_sql}
 )
-ENGINE = ReplicatedMergeTree('/clickhouse/tables/{{shard}}/{database}/{table}', '{{replica}}'){partition_sql}
-ORDER BY {order_by.strip()}"""
+ENGINE = ReplicatedMergeTree('/clickhouse/tables/{{shard}}-{{uuid}}/{table}',
+ '{{replica}}'){partition_sql}
+ORDER BY {order_by.strip()}
+SETTINGS index_granularity = 8192"""
 
 
 def build_create_distributed_table_sql(
@@ -148,16 +153,24 @@ def build_create_distributed_table_sql(
     distributed_table: str,
     local_table: str,
     cluster: str,
-    sharding_key: str = "rand()",
+    sharding_key: str = "",
 ) -> str:
     database = quote_identifier(database)
     distributed_table = quote_identifier(distributed_table)
     local_table = quote_identifier(local_table)
     cluster = quote_identifier(cluster)
-    sharding_key = sharding_key.strip() or "rand()"
-    return f"""CREATE TABLE {database}.{distributed_table} ON CLUSTER '{cluster}'
+    sharding_key = sharding_key.strip()
+    if not sharding_key:
+        raise ValueError("Distributed sharding key is required")
+    return f"""CREATE TABLE {database}.{distributed_table}
+ON CLUSTER {cluster}
 AS {database}.{local_table}
-ENGINE = Distributed('{cluster}', '{database}', '{local_table}', {sharding_key})"""
+ENGINE = Distributed(
+    '{cluster}',
+    '{database}',
+    '{local_table}',
+    {sharding_key}
+)"""
 
 
 def create_tables(
@@ -167,7 +180,7 @@ def create_tables(
     distributed_table: str,
     order_by: str,
     partition_by: str | None = None,
-    sharding_key: str = "rand()",
+    sharding_key: str = "",
 ) -> TableNames:
     names = build_table_names(distributed_table)
     ensure_tables_do_not_exist(client, config, names.distributed, names.local)
@@ -233,3 +246,15 @@ def _validate_certificate_files(config: ClickHouseConfig) -> None:
     ]
     if missing:
         raise CertificateError("ClickHouse certificate file is missing: " + ", ".join(missing))
+
+
+def _format_connection_error(config: ClickHouseConfig, exc: Exception) -> str:
+    message = str(exc)
+    normalized = message.lower()
+    if "certificate_expired" not in normalized and "certificate expired" not in normalized:
+        return message
+    return (
+        f"{message}. The client certificate may be expired. "
+        f"Current client_cert={config.client_cert}, client_key={config.client_key}. "
+        "Update these paths in the UI or replace the certificate files."
+    )

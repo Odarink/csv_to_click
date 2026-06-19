@@ -33,6 +33,57 @@ CLICKHOUSE_TYPE_OPTIONS = [
 ]
 
 
+def validate_clickhouse_type_expression(clickhouse_type: str) -> str:
+    normalized = clickhouse_type.strip()
+    if not normalized:
+        raise CsvSchemaError("ClickHouse type cannot be empty")
+    if any(token in normalized for token in [";", "--", "/*", "*/", "\n", "\r"]):
+        raise CsvSchemaError(f"Unsafe ClickHouse type expression: {clickhouse_type}")
+    if not re.match(r"[A-Za-z]", normalized):
+        raise CsvSchemaError(f"Unsafe ClickHouse type expression: {clickhouse_type}")
+    if _has_top_level_comma(normalized):
+        raise CsvSchemaError(f"Unsafe ClickHouse type expression: {clickhouse_type}")
+    if not _has_balanced_parentheses(normalized):
+        raise CsvSchemaError(f"Unbalanced ClickHouse type expression: {clickhouse_type}")
+    return normalized
+
+
+def _has_balanced_parentheses(value: str) -> bool:
+    depth = 0
+    quote: str | None = None
+    for char in value:
+        if char in {"'", '"'}:
+            quote = None if quote == char else char if quote is None else quote
+            continue
+        if quote:
+            continue
+        if char == "(":
+            depth += 1
+        elif char == ")":
+            depth -= 1
+            if depth < 0:
+                return False
+    return depth == 0 and quote is None
+
+
+def _has_top_level_comma(value: str) -> bool:
+    depth = 0
+    quote: str | None = None
+    for char in value:
+        if char in {"'", '"'}:
+            quote = None if quote == char else char if quote is None else quote
+            continue
+        if quote:
+            continue
+        if char == "(":
+            depth += 1
+        elif char == ")":
+            depth -= 1
+        elif char == "," and depth == 0:
+            return True
+    return False
+
+
 @dataclass
 class CsvColumn:
     column_name: str
@@ -221,7 +272,8 @@ def convert_value(value: str, clickhouse_type: str) -> object:
         if not _is_bool(raw):
             raise CsvSchemaError("expected Bool")
         return raw.lower() in {"true", "1", "yes", "y"}
-    raise CsvSchemaError(f"unsupported ClickHouse type: {clickhouse_type}")
+    validate_clickhouse_type_expression(clickhouse_type)
+    return value
 
 
 def unwrap_nullable(clickhouse_type: str) -> tuple[bool, str]:
@@ -233,14 +285,14 @@ def unwrap_nullable(clickhouse_type: str) -> tuple[bool, str]:
 def schema_from_editor_rows(rows: Iterable[dict[str, object]]) -> CsvSchema:
     columns = []
     for row in rows:
-        final_type = str(row["final_type"])
+        custom_type = str(row.get("custom_type") or "").strip()
+        final_type = custom_type or str(row["final_type"])
         nullable = bool(row.get("nullable", final_type.startswith("Nullable(")))
         if nullable and not final_type.startswith("Nullable("):
             final_type = f"Nullable({final_type})"
         if not nullable and final_type.startswith("Nullable("):
             final_type = final_type.removeprefix("Nullable(").removesuffix(")")
-        if final_type not in CLICKHOUSE_TYPE_OPTIONS:
-            raise CsvSchemaError(f"Unsupported ClickHouse type: {final_type}")
+        final_type = validate_clickhouse_type_expression(final_type)
         columns.append(
             CsvColumn(
                 column_name=str(row["column_name"]),
@@ -262,6 +314,7 @@ def schema_to_editor_rows(schema: CsvSchema) -> list[dict[str, object]]:
             "source_name": column.source_name,
             "inferred_type": column.inferred_type,
             "final_type": column.final_type,
+            "custom_type": "",
             "nullable": column.final_type.startswith("Nullable("),
             "sample_values": ", ".join(column.sample_values),
             "notes": column.notes,

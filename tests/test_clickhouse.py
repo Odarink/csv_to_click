@@ -1,6 +1,7 @@
 from csv_click.clickhouse import (
     ClickHouseConfig,
     ExistingTableError,
+    _format_connection_error,
     _validate_certificate_files,
     build_create_distributed_table_sql,
     build_create_local_table_sql,
@@ -68,10 +69,13 @@ def test_build_local_ddl_contains_cluster_replicated_engine_order_and_partition(
         partition_by="toYYYYMM(id)",
     )
 
-    assert "CREATE TABLE sandbox.orders_local ON CLUSTER 'clickhouse'" in sql
+    assert "CREATE TABLE sandbox.orders_local\nON CLUSTER clickhouse" in sql
     assert "ReplicatedMergeTree" in sql
+    assert "'/clickhouse/tables/{shard}-{uuid}/orders_local'" in sql
     assert "PARTITION BY toYYYYMM(id)" in sql
     assert "ORDER BY id" in sql
+    assert "SETTINGS index_granularity = 8192" in sql
+    assert not sql.rstrip().endswith(";")
 
 
 def test_build_distributed_ddl_uses_local_table() -> None:
@@ -83,9 +87,30 @@ def test_build_distributed_ddl_uses_local_table() -> None:
         sharding_key="sipHash64(ID)",
     )
 
-    assert "CREATE TABLE sandbox.orders ON CLUSTER 'clickhouse'" in sql
+    assert "CREATE TABLE sandbox.orders\nON CLUSTER clickhouse" in sql
     assert "AS sandbox.orders_local" in sql
-    assert "Distributed('clickhouse', 'sandbox', 'orders_local', sipHash64(ID))" in sql
+    assert """ENGINE = Distributed(
+    'clickhouse',
+    'sandbox',
+    'orders_local',
+    sipHash64(ID)
+)""" in sql
+    assert not sql.rstrip().endswith(";")
+
+
+def test_build_distributed_ddl_requires_sharding_key() -> None:
+    try:
+        build_create_distributed_table_sql(
+            database="sandbox",
+            distributed_table="orders",
+            local_table="orders_local",
+            cluster="clickhouse",
+            sharding_key="",
+        )
+    except ValueError as exc:
+        assert "sharding key" in str(exc)
+    else:
+        raise AssertionError("Expected ValueError")
 
 
 def test_existing_table_check_blocks_create_load() -> None:
@@ -123,6 +148,18 @@ def test_validate_certificate_files_reports_missing_certificates(tmp_path) -> No
         assert str(missing_key) in str(exc)
     else:
         raise AssertionError("Expected CertificateError")
+
+
+def test_format_connection_error_explains_expired_client_certificate() -> None:
+    config = ClickHouseConfig(client_cert="/tmp/current.crt", client_key="/tmp/current.key")
+    message = _format_connection_error(
+        config,
+        Exception("[SSL: SSLV3_ALERT_CERTIFICATE_EXPIRED] sslv3 alert certificate expired"),
+    )
+
+    assert "client certificate may be expired" in message
+    assert "/tmp/current.crt" in message
+    assert "/tmp/current.key" in message
 
 
 def test_raw_insert_batch_uses_json_each_row() -> None:

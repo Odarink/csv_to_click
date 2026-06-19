@@ -118,6 +118,19 @@ def test_clickhouse_type_options_include_nullable_dropdown_values() -> None:
     assert "Nullable(Decimal(38, 10))" in CLICKHOUSE_TYPE_OPTIONS
 
 
+def test_schema_from_editor_rows_accepts_datetime64_timezone_custom_type(tmp_path: Path) -> None:
+    from csv_click.schema import schema_from_editor_rows, schema_to_editor_rows
+
+    csv_path = write_csv(tmp_path / "manual_datetime64.csv", "dt\n2026-06-19 10:00:00\n")
+    schema = analyze_csv_schema(csv_path)
+    rows = schema_to_editor_rows(schema)
+    rows[0]["custom_type"] = "DateTime64(3, 'Europe/Moscow')"
+
+    edited_schema = schema_from_editor_rows(rows)
+
+    assert edited_schema.columns[0].final_type == "DateTime64(3, 'Europe/Moscow')"
+
+
 def test_normalize_identifier_rejects_duplicate_columns_after_normalization() -> None:
     assert normalize_identifier("Order ID") == "order_id"
     assert normalize_identifier("123") == "col_123"

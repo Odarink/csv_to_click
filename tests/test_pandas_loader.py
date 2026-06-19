@@ -13,6 +13,8 @@ from csv_click.pandas_loader import (
     convert_chunk_to_schema,
     iter_pandas_chunks,
     load_csv_via_raw_insert,
+    mappings_from_editor_rows,
+    mappings_to_schema,
 )
 
 
@@ -131,3 +133,42 @@ def test_load_csv_via_raw_insert_uses_json_each_row_chunks(tmp_path: Path) -> No
     assert client.calls[0]["table"] == "sandbox.target_table"
     assert client.calls[0]["column_names"] == ["ID", "VALUE"]
     assert client.calls[0]["fmt"] == "JSONEachRow"
+
+
+def test_mappings_from_editor_rows_prefers_custom_type_override() -> None:
+    rows = [
+        {
+            "source_name": "NAME",
+            "target_name": "name",
+            "include": True,
+            "inferred_type": "String",
+            "final_type": "String",
+            "custom_type": "LowCardinality(String)",
+            "nullable": False,
+            "sample_values": "alice",
+            "notes": "",
+        }
+    ]
+
+    mappings = mappings_from_editor_rows(rows)
+    schema = mappings_to_schema(mappings)
+
+    assert mappings[0].final_type == "LowCardinality(String)"
+    assert schema.columns[0].final_type == "LowCardinality(String)"
+
+
+def test_convert_chunk_passes_custom_type_values_as_strings() -> None:
+    chunk = pd.DataFrame({"NAME": ["alice", "bob"]})
+    mappings = [
+        SchemaMapping(
+            source_name="NAME",
+            target_name="name",
+            include=True,
+            final_type="LowCardinality(String)",
+            nullable=False,
+        )
+    ]
+
+    converted = convert_chunk_to_schema(chunk, mappings, chunk_number=1)
+
+    assert converted["name"].tolist() == ["alice", "bob"]

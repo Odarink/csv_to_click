@@ -12,10 +12,6 @@ import pandas as pd
 import streamlit as st
 
 from csv_click.clickhouse import (
-    DEFAULT_CLIENT_CERT,
-    DEFAULT_CLIENT_KEY,
-    DEFAULT_HOST,
-    DEFAULT_PORT,
     ClickHouseConfig,
     build_create_distributed_table_sql,
     build_create_local_table_sql,
@@ -45,36 +41,43 @@ from csv_click.schema import (
     CLICKHOUSE_TYPE_OPTIONS,
     CsvSchema,
 )
+from csv_click.settings import AppSettings, load_app_settings, save_app_settings
 
 
 def main() -> None:
     st.set_page_config(page_title="CSV to ClickHouse", layout="wide")
     st.title("CSV to ClickHouse")
 
+    csv_context = _render_csv_path_step()
+    if not csv_context:
+        return
+
+    csv_context = _render_csv_read_options_step(csv_context)
+
+    mappings = _render_column_mapping_editor()
+    if mappings is None:
+        return
+
+    schema = _render_type_editor()
+    if schema is None:
+        return
+
     params = _render_connection_and_load_form()
     if not params:
         return
 
     config = params["config"]
-    csv_path = params["csv_path"]
+    csv_path = csv_context["csv_path"]
     read_options = params["read_options"]
     distributed_table = params["distributed_table"]
     table_names = build_table_names(distributed_table)
 
     st.info(f"Local table: `{table_names.local}`")
 
-    col_test, col_analyze = st.columns(2)
+    col_test, _ = st.columns(2)
     with col_test:
         if st.button("Test connection", type="secondary", use_container_width=True):
             _test_connection(config)
-
-    with col_analyze:
-        if st.button("Analyze CSV", type="primary", use_container_width=True):
-            _analyze_csv(csv_path, read_options)
-
-    schema = _render_schema_editor()
-    if schema is None:
-        return
 
     ddl_local = build_create_local_table_sql(
         database=config.database,
@@ -114,39 +117,46 @@ def main() -> None:
 
 
 def _render_connection_and_load_form() -> dict[str, object] | None:
+    settings = _get_app_settings()
     with st.form("load_params_form"):
-        st.subheader("Load parameters")
+        st.subheader("ClickHouse and load parameters")
         left, right = st.columns(2)
         with left:
-            csv_path = st.text_input("CSV path")
-            database = st.text_input("Database", value="sandbox")
+            database = st.text_input("Database", value=settings.database)
             distributed_table = st.text_input("Distributed table name")
-            cluster = st.text_input("Cluster", value="clickhouse")
+            cluster = st.text_input("Cluster", value=settings.cluster)
             order_by = st.text_input("ORDER BY")
             partition_by = st.text_input("PARTITION BY (optional)")
-            sharding_key = st.text_input("Distributed sharding key", value="rand()")
-            batch_size = st.number_input("Batch size", min_value=1, value=1_000_000, step=10_000)
-            separator_choice = st.selectbox("Separator", options=[",", ";", "\\t", "|", "custom"])
-            custom_separator = st.text_input("Custom separator", value="")
-            encoding_choice = st.selectbox(
-                "Encoding",
-                options=["utf_8", "cp1251", "windows-1251", "utf-8-sig", "custom"],
+            sharding_key = st.text_input(
+                "Distributed sharding key",
+                help="Sharding example: sipHash64(<column>)",
             )
-            custom_encoding = st.text_input("Custom encoding", value="")
-            strict_preflight = st.checkbox("Strict preflight validation", value=True)
+            batch_size = st.number_input(
+                "Batch size",
+                min_value=1,
+                value=settings.batch_size,
+                step=10_000,
+            )
+            strict_preflight = st.checkbox(
+                "Strict preflight validation",
+                value=settings.strict_preflight,
+            )
         with right:
-            host = st.text_input("Host", value=DEFAULT_HOST)
-            port = st.number_input("Port", min_value=1, max_value=65535, value=DEFAULT_PORT)
-            username = st.text_input("Username", value=os.getenv("CLICKHOUSE_USER", ""))
+            host = st.text_input("Host", value=settings.host)
+            port = st.number_input("Port", min_value=1, max_value=65535, value=settings.port)
+            username = st.text_input(
+                "Username",
+                value=settings.username or os.getenv("CLICKHOUSE_USER", ""),
+            )
             password = st.text_input(
                 "Password",
                 value=os.getenv("CLICKHOUSE_PASSWORD", ""),
                 type="password",
             )
-            secure = st.checkbox("Secure", value=True)
-            verify = st.checkbox("Verify TLS", value=False)
-            client_cert = st.text_input("Client cert path", value=DEFAULT_CLIENT_CERT)
-            client_key = st.text_input("Client key path", value=DEFAULT_CLIENT_KEY)
+            secure = st.checkbox("Secure", value=settings.secure)
+            verify = st.checkbox("Verify TLS", value=settings.verify)
+            client_cert = st.text_input("Client cert path", value=settings.client_cert)
+            client_key = st.text_input("Client key path", value=settings.client_key)
 
         submitted = st.form_submit_button("Apply parameters", use_container_width=True)
 
@@ -154,16 +164,14 @@ def _render_connection_and_load_form() -> dict[str, object] | None:
         return None
 
     errors = []
-    if not csv_path:
-        errors.append("CSV path is required")
-    elif not Path(csv_path).exists():
-        errors.append(f"CSV path does not exist: {csv_path}")
     if not database:
         errors.append("Database is required")
     if not distributed_table:
         errors.append("Distributed table name is required")
     if not order_by:
         errors.append("ORDER BY is required")
+    if not sharding_key:
+        errors.append("Distributed sharding key is required")
 
     if errors:
         for error in errors:
@@ -182,33 +190,180 @@ def _render_connection_and_load_form() -> dict[str, object] | None:
         client_cert=client_cert,
         client_key=client_key,
     )
-    separator = custom_separator if separator_choice == "custom" else separator_choice
-    separator = "\t" if separator == "\\t" else separator
-    encoding = custom_encoding if encoding_choice == "custom" else encoding_choice
-    if not separator:
-        st.error("Separator is required")
-        return None
-    if not encoding:
-        st.error("Encoding is required")
-        return None
+    csv_read_options = st.session_state.get("csv_read_options", ReadOptions())
     read_options = ReadOptions(
-        separator=separator,
-        encoding=encoding,
+        separator=csv_read_options.separator,
+        encoding=csv_read_options.encoding,
         batch_size=int(batch_size),
     )
     params = {
-        "csv_path": csv_path,
         "read_options": read_options,
         "distributed_table": distributed_table,
         "order_by": order_by,
         "partition_by": partition_by or None,
-        "sharding_key": sharding_key or "rand()",
+        "sharding_key": sharding_key,
         "batch_size": int(batch_size),
         "strict_preflight": strict_preflight,
         "config": config,
     }
     st.session_state["load_params"] = params
+    _save_app_settings(
+        AppSettings(
+            host=host,
+            port=int(port),
+            username=username,
+            secure=secure,
+            verify=verify,
+            client_cert=client_cert,
+            client_key=client_key,
+            database=database,
+            cluster=cluster,
+            batch_size=int(batch_size),
+            strict_preflight=strict_preflight,
+            separator=read_options.separator,
+            encoding=read_options.encoding,
+        )
+    )
     return params
+
+
+def _get_app_settings() -> AppSettings:
+    if "app_settings" not in st.session_state:
+        st.session_state["app_settings"] = load_app_settings()
+    return st.session_state["app_settings"]
+
+
+def _save_app_settings(settings: AppSettings) -> None:
+    try:
+        save_app_settings(settings)
+    except OSError as exc:
+        st.warning(f"Could not save UI settings: {exc}")
+    else:
+        st.session_state["app_settings"] = settings
+
+
+def _render_csv_path_step() -> dict[str, object] | None:
+    with st.form("csv_path_form"):
+        csv_col, button_col = st.columns([5, 1])
+        with csv_col:
+            csv_path = st.text_input("CSV path", value=st.session_state.get("csv_path", ""))
+        with button_col:
+            st.write("")
+            submitted = st.form_submit_button("Read CSV", use_container_width=True)
+
+    if submitted:
+        _apply_csv_path(csv_path)
+
+    if "csv_path" not in st.session_state or "schema_rows" not in st.session_state:
+        return None
+
+    st.caption(f"CSV path: `{st.session_state['csv_path']}`")
+    return {
+        "csv_path": st.session_state["csv_path"],
+        "read_options": st.session_state.get(
+            "csv_read_options",
+            _read_options_from_settings(_get_app_settings()),
+        ),
+    }
+
+
+def _render_csv_read_options_step(csv_context: dict[str, object]) -> dict[str, object]:
+    read_options = csv_context["read_options"]
+    with st.expander("CSV read settings"):
+        with st.form("csv_read_options_form"):
+            separator_choice = st.selectbox(
+                "Separator",
+                options=[",", ";", "\\t", "|", "custom"],
+                index=_separator_index(read_options.separator),
+            )
+            custom_separator = st.text_input(
+                "Custom separator",
+                value="" if read_options.separator in {",", ";", "\t", "|"} else read_options.separator,
+            )
+            encoding_choice = st.selectbox(
+                "Encoding",
+                options=["utf_8", "cp1251", "windows-1251", "utf-8-sig", "custom"],
+                index=_encoding_index(read_options.encoding),
+            )
+            custom_encoding = st.text_input(
+                "Custom encoding",
+                value="" if read_options.encoding in {"utf_8", "cp1251", "windows-1251", "utf-8-sig"} else read_options.encoding,
+            )
+            submitted = st.form_submit_button("Re-read CSV", use_container_width=True)
+
+    if not submitted:
+        return csv_context
+
+    separator = custom_separator if separator_choice == "custom" else separator_choice
+    separator = "\t" if separator == "\\t" else separator
+    encoding = custom_encoding if encoding_choice == "custom" else encoding_choice
+    if not separator:
+        st.error("Separator is required")
+        return csv_context
+    if not encoding:
+        st.error("Encoding is required")
+        return csv_context
+
+    st.session_state["csv_read_options"] = ReadOptions(
+        separator=separator,
+        encoding=encoding,
+        batch_size=read_options.batch_size,
+    )
+    for key in [
+        "schema_rows",
+        "mapping_rows",
+        "type_rows",
+        "mapping_confirmed",
+        "types_confirmed",
+        "load_params",
+    ]:
+        st.session_state.pop(key, None)
+    _analyze_csv(str(csv_context["csv_path"]), st.session_state["csv_read_options"])
+    return {
+        "csv_path": csv_context["csv_path"],
+        "read_options": st.session_state["csv_read_options"],
+    }
+
+
+def _separator_index(separator: str) -> int:
+    normalized = "\\t" if separator == "\t" else separator
+    options = [",", ";", "\\t", "|", "custom"]
+    return options.index(normalized) if normalized in options else options.index("custom")
+
+
+def _encoding_index(encoding: str) -> int:
+    options = ["utf_8", "cp1251", "windows-1251", "utf-8-sig", "custom"]
+    return options.index(encoding) if encoding in options else options.index("custom")
+
+
+def _apply_csv_path(csv_path: str) -> None:
+    if not csv_path:
+        st.error("CSV path is required")
+        return
+    if not Path(csv_path).exists():
+        st.error(f"CSV path does not exist: {csv_path}")
+        return
+
+    st.session_state["csv_path"] = csv_path
+    st.session_state["csv_read_options"] = _read_options_from_settings(_get_app_settings())
+    for key in [
+        "schema_rows",
+        "mapping_rows",
+        "type_rows",
+        "mapping_confirmed",
+        "types_confirmed",
+        "load_params",
+    ]:
+        st.session_state.pop(key, None)
+    _analyze_csv(csv_path, st.session_state["csv_read_options"])
+
+
+def _read_options_from_settings(settings: AppSettings) -> ReadOptions:
+    return ReadOptions(
+        separator=settings.separator,
+        encoding=settings.encoding,
+        batch_size=settings.batch_size,
+    )
 
 
 def _test_connection(config: ClickHouseConfig) -> None:
@@ -232,39 +387,145 @@ def _analyze_csv(csv_path: str, read_options: ReadOptions) -> None:
         return
 
     st.session_state["schema_rows"] = mappings_to_editor_rows(schema_to_mappings(schema))
+    st.session_state["mapping_rows"] = _schema_rows_to_mapping_rows(st.session_state["schema_rows"])
     st.success(f"Schema inferred for {len(schema.columns)} columns")
 
 
-def _render_schema_editor() -> CsvSchema | None:
-    rows = st.session_state.get("schema_rows")
-    if not rows:
-        st.warning("Analyze CSV before previewing DDL or loading data.")
+def _render_column_mapping_editor() -> list[dict[str, object]] | None:
+    schema_rows = st.session_state.get("schema_rows")
+    if not schema_rows:
         return None
 
-    st.subheader("Schema")
+    st.subheader("Column mapping")
+    mapping_rows = st.session_state.get("mapping_rows") or _schema_rows_to_mapping_rows(schema_rows)
+    edited = st.data_editor(
+        pd.DataFrame(mapping_rows),
+        hide_index=True,
+        use_container_width=True,
+        disabled=["source_name"],
+        column_config={
+            "include": st.column_config.CheckboxColumn("include"),
+            "target_name": st.column_config.TextColumn("target_name", required=True),
+        },
+        key="mapping_editor",
+    )
+    edited_rows = edited.to_dict(orient="records")
+    st.session_state["mapping_rows"] = edited_rows
+
+    if st.button("Apply column mapping", type="primary", use_container_width=True):
+        try:
+            _validate_mapping_rows(edited_rows)
+        except CsvSchemaError as exc:
+            st.error(f"Column mapping error: {exc}")
+            return None
+        st.session_state["mapping_confirmed"] = True
+        st.session_state["types_confirmed"] = False
+        st.session_state.pop("load_params", None)
+        st.session_state["type_rows"] = _type_rows_from_mapping(schema_rows, edited_rows)
+
+    if not st.session_state.get("mapping_confirmed"):
+        st.info("Apply column mapping to continue to type review.")
+        return None
+
+    return st.session_state["mapping_rows"]
+
+
+def _render_type_editor() -> CsvSchema | None:
+    rows = st.session_state.get("type_rows")
+    if not rows:
+        return None
+
+    st.subheader("Type review")
     edited = st.data_editor(
         pd.DataFrame(rows),
         hide_index=True,
         use_container_width=True,
-        disabled=["source_name", "inferred_type", "sample_values", "notes"],
+        disabled=["source_name", "target_name", "inferred_type", "sample_values", "notes"],
         column_config={
-            "include": st.column_config.CheckboxColumn("include"),
             "final_type": st.column_config.SelectboxColumn(
                 "final_type",
                 options=CLICKHOUSE_TYPE_OPTIONS,
                 required=True,
             ),
+            "custom_type": st.column_config.TextColumn(
+                "custom_type",
+                help="Optional manual ClickHouse type. If filled, it overrides final_type.",
+            ),
             "nullable": st.column_config.CheckboxColumn("nullable"),
         },
-        key="schema_editor",
+        key="type_editor",
     )
     edited_rows = edited.to_dict(orient="records")
-    st.session_state["schema_rows"] = edited_rows
+    st.session_state["type_rows"] = edited_rows
     try:
-        return mappings_to_schema(mappings_from_editor_rows(edited_rows))
+        schema = mappings_to_schema(mappings_from_editor_rows(edited_rows))
     except CsvSchemaError as exc:
-        st.error(f"Schema editor error: {exc}")
+        st.error(f"Type editor error: {exc}")
         return None
+
+    if st.button("Apply types", type="primary", use_container_width=True):
+        st.session_state["types_confirmed"] = True
+        st.session_state.pop("load_params", None)
+
+    if not st.session_state.get("types_confirmed"):
+        st.info("Apply types to continue to ClickHouse settings.")
+        return None
+
+    return schema
+
+
+def _schema_rows_to_mapping_rows(rows: list[dict[str, object]]) -> list[dict[str, object]]:
+    return [
+        {
+            "source_name": row["source_name"],
+            "target_name": row["target_name"],
+            "include": row.get("include", True),
+        }
+        for row in rows
+    ]
+
+
+def _type_rows_from_mapping(
+    schema_rows: list[dict[str, object]],
+    mapping_rows: list[dict[str, object]],
+) -> list[dict[str, object]]:
+    schema_by_source = {str(row["source_name"]): row for row in schema_rows}
+    type_rows = []
+    for mapping in mapping_rows:
+        if not bool(mapping.get("include", True)):
+            continue
+        source_name = str(mapping["source_name"])
+        source_row = schema_by_source[source_name]
+        type_rows.append(
+            {
+                "source_name": source_name,
+                "target_name": str(mapping["target_name"]),
+                "include": True,
+                "inferred_type": source_row["inferred_type"],
+                "final_type": source_row["final_type"],
+                "custom_type": "",
+                "nullable": source_row["nullable"],
+                "sample_values": source_row["sample_values"],
+                "notes": source_row["notes"],
+            }
+        )
+    return type_rows
+
+
+def _validate_mapping_rows(rows: list[dict[str, object]]) -> None:
+    target_names = [
+        str(row.get("target_name", "")).strip()
+        for row in rows
+        if bool(row.get("include", True))
+    ]
+    if not target_names:
+        raise CsvSchemaError("At least one column must be included")
+    empty_names = [name for name in target_names if not name]
+    if empty_names:
+        raise CsvSchemaError("Target column name cannot be empty")
+    duplicates = sorted({name for name in target_names if target_names.count(name) > 1})
+    if duplicates:
+        raise CsvSchemaError("Duplicate target column names: " + ", ".join(duplicates))
 
 
 def _create_and_load(
@@ -286,7 +547,7 @@ def _create_and_load(
     inserted_rows = 0
 
     try:
-        mappings = mappings_from_editor_rows(st.session_state["schema_rows"])
+        mappings = mappings_from_editor_rows(st.session_state["type_rows"])
         total_rows = 0
         if strict_preflight:
             status.info("Validating CSV chunks against selected types...")
