@@ -114,7 +114,7 @@ def main() -> None:
 
 
 def _render_connection_and_load_form() -> dict[str, object] | None:
-    with st.form("load_params"):
+    with st.form("load_params_form"):
         st.subheader("Load parameters")
         left, right = st.columns(2)
         with left:
