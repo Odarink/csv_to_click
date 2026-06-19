@@ -1,0 +1,6 @@
+interface:
+  display_name: "Project Skill Creator"
+  short_description: "Create repo-scoped Codex skills"
+  default_prompt: "Use $skill-creator to create or migrate a focused Codex Agent Skill in this repository."
+policy:
+  allow_implicit_invocation: false

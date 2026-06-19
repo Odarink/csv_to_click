@@ -1,0 +1,4 @@
+interface:
+  display_name: "Technical Interviewer"
+  short_description: "Run structured technical interviews"
+  default_prompt: "Use $interviewer to run a focused technical interview on my chosen topic and provide scored feedback."

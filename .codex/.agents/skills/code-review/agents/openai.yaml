@@ -1,0 +1,4 @@
+interface:
+  display_name: "Code Review"
+  short_description: "Find bugs, regressions, and test gaps"
+  default_prompt: "Use $code-review to review these changes for concrete defects and missing verification."

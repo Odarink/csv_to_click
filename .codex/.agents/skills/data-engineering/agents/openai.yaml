@@ -1,0 +1,4 @@
+interface:
+  display_name: "Data Engineering"
+  short_description: "Solve practical data pipeline tasks"
+  default_prompt: "Use $data-engineering to analyze this SQL or pipeline task and produce an evidence-based solution."
