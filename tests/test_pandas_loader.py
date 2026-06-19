@@ -103,6 +103,20 @@ def test_choose_read_options_prefers_encoding_with_lower_mojibake_score(tmp_path
     assert "Auto-selected encoding utf_8" in warning.message
 
 
+def test_choose_read_options_recovers_real_cp1251_csv_from_utf8_default() -> None:
+    csv_path = Path("tests/test_csv.csv")
+    selected_options = ReadOptions(separator=";", encoding="utf_8", batch_size=1)
+
+    effective_options, preview, warning = choose_read_options_for_preview(csv_path, selected_options)
+
+    assert effective_options.encoding in {"cp1251", "windows-1251"}
+    assert preview.iloc[0]["C_NAME"] == "Гашение"
+    assert preview.iloc[0]["C_CODE"] == "ГАШЕНИЕ_SALE_DEBT"
+    assert "пїЅ" not in preview.to_string()
+    assert warning is not None
+    assert "Auto-selected encoding" in warning.message
+
+
 def test_analyze_csv_with_pandas_chunks_strips_and_normalizes_target_names(tmp_path: Path) -> None:
     csv_path = tmp_path / "source.csv"
     csv_path.write_text(" ID ,C_SPOSOB_KVIT#0,skip_me\n1,10,x\n", encoding="utf_8")

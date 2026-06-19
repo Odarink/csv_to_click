@@ -112,30 +112,38 @@ def choose_read_options_for_preview(
     read_options: ReadOptions,
     nrows: int = 20,
 ) -> tuple[ReadOptions, pd.DataFrame, MojibakeWarning | None]:
-    selected_preview = preview_csv_rows(csv_path, read_options, nrows=nrows)
-    selected_score = _mojibake_score(selected_preview)
-    best_options = read_options
-    best_preview = selected_preview
-    best_score = selected_score
+    candidates = (read_options.encoding,) + tuple(
+        encoding for encoding in ENCODING_SUGGESTIONS if encoding != read_options.encoding
+    )
+    best_options: ReadOptions | None = None
+    best_preview: pd.DataFrame | None = None
+    best_score: int | None = None
+    first_error: CsvSchemaError | None = None
 
-    if selected_score:
-        for encoding in ENCODING_SUGGESTIONS:
-            if encoding == read_options.encoding:
-                continue
-            candidate_options = ReadOptions(
-                separator=read_options.separator,
-                encoding=encoding,
-                batch_size=read_options.batch_size,
-            )
-            try:
-                candidate_preview = preview_csv_rows(csv_path, candidate_options, nrows=nrows)
-            except CsvSchemaError:
-                continue
-            candidate_score = _mojibake_score(candidate_preview)
-            if candidate_score < best_score:
-                best_options = candidate_options
-                best_preview = candidate_preview
-                best_score = candidate_score
+    for encoding in candidates:
+        candidate_options = ReadOptions(
+            separator=read_options.separator,
+            encoding=encoding,
+            batch_size=read_options.batch_size,
+        )
+        try:
+            candidate_preview = preview_csv_rows(csv_path, candidate_options, nrows=nrows)
+        except CsvSchemaError as exc:
+            if first_error is None:
+                first_error = exc
+            continue
+        candidate_score = _mojibake_score(candidate_preview)
+        if best_score is None or candidate_score < best_score:
+            best_options = candidate_options
+            best_preview = candidate_preview
+            best_score = candidate_score
+        if candidate_score == 0:
+            break
+
+    if best_options is None or best_preview is None:
+        if first_error is not None:
+            raise first_error
+        raise CsvSchemaError("Cannot decode CSV preview with configured encodings")
 
     warning = detect_mojibake(best_preview)
     if best_options.encoding != read_options.encoding:
