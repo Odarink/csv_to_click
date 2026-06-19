@@ -64,6 +64,18 @@ def test_analyze_csv_with_pandas_chunks_strips_and_normalizes_target_names(tmp_p
     ]
 
 
+def test_iter_pandas_chunks_wraps_parser_errors_with_csv_schema_error(tmp_path: Path) -> None:
+    csv_path = tmp_path / "bad_delimiter.csv"
+    csv_path.write_text('ID,NAME\n1,Alice\n2,"Bob\n', encoding="utf_8")
+
+    with pytest.raises(CsvSchemaError) as exc_info:
+        list(iter_pandas_chunks(csv_path, ReadOptions(separator=",", batch_size=1)))
+
+    message = str(exc_info.value)
+    assert "Cannot parse CSV" in message
+    assert "separator" in message
+
+
 def test_convert_chunk_supports_include_rename_and_nullable_int() -> None:
     chunk = pd.DataFrame(
         {

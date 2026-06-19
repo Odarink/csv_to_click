@@ -51,16 +51,22 @@ def iter_pandas_chunks(
     if read_options.batch_size <= 0:
         raise ValueError("batch_size must be positive")
 
-    reader = pd.read_csv(
-        csv_path,
-        sep=read_options.separator,
-        encoding=read_options.encoding,
-        chunksize=read_options.batch_size,
-        usecols=usecols,
-    )
-    for chunk in reader:
-        chunk.columns = chunk.columns.str.strip()
-        yield chunk
+    try:
+        reader = pd.read_csv(
+            csv_path,
+            sep=read_options.separator,
+            encoding=read_options.encoding,
+            chunksize=read_options.batch_size,
+            usecols=usecols,
+        )
+        for chunk in reader:
+            chunk.columns = chunk.columns.str.strip()
+            yield chunk
+    except pd.errors.ParserError as exc:
+        raise CsvSchemaError(
+            "Cannot parse CSV with "
+            f"separator {read_options.separator!r} and encoding {read_options.encoding}: {exc}"
+        ) from exc
 
 
 def analyze_csv_with_pandas_chunks(

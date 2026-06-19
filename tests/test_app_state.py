@@ -107,3 +107,17 @@ def test_connection_form_uses_persisted_settings_and_no_table_specific_defaults(
     assert '"sharding_key": sharding_key or "rand()"' not in source
     assert "Sharding example: sipHash64(<column>)" in form_source
     assert "Distributed sharding key is required" in form_source
+
+
+def test_csv_path_step_allows_read_settings_after_failed_schema_analysis() -> None:
+    source = Path("src/csv_click/app.py").read_text(encoding="utf-8")
+    match = re.search(
+        r"def _render_csv_path_step\(.*?\n(?=def _)",
+        source,
+        flags=re.DOTALL,
+    )
+
+    assert match is not None
+    csv_path_step_source = match.group(0)
+    assert 'if "csv_path" not in st.session_state:' in csv_path_step_source
+    assert '"schema_rows" not in st.session_state' not in csv_path_step_source

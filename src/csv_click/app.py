@@ -254,7 +254,7 @@ def _render_csv_path_step() -> dict[str, object] | None:
     if submitted:
         _apply_csv_path(csv_path)
 
-    if "csv_path" not in st.session_state or "schema_rows" not in st.session_state:
+    if "csv_path" not in st.session_state:
         return None
 
     st.caption(f"CSV path: `{st.session_state['csv_path']}`")
