@@ -1,40 +1,165 @@
 # CSV to ClickHouse
 
-Streamlit UI for loading server-side CSV files into new ClickHouse local and
-distributed tables from a JupyterHub terminal.
+Streamlit-приложение для загрузки CSV-файлов с сервера в новые таблицы
+ClickHouse: локальную `ReplicatedMergeTree` и распределенную `Distributed`.
 
-The load path uses chunked pandas reads and ClickHouse `raw_insert` with
-`JSONEachRow`. This is the default path because HTTP/proxy deployments can fail
-on `client.insert()` / `insert_df()` while accepting JSONEachRow payloads.
+Загрузка выполняется через pandas chunks и `clickhouse-connect.raw_insert()` в
+формате `JSONEachRow`. Этот путь выбран как основной, потому что в HTTP/proxy
+окружениях `client.insert()` и `insert_df()` могут падать, а `JSONEachRow`
+обычно проходит стабильно.
 
-## Run
+## Требования
+
+- Python 3.11+
+- `uv`
+- доступ к ClickHouse
+- CSV-файл должен лежать на той машине, где запущен Streamlit
+- CSV должен содержать строку заголовков
+- для secure-подключения нужны клиентские сертификат и ключ
+
+Зависимости описаны в `pyproject.toml` и фиксируются через `uv.lock`.
+
+## Быстрый запуск
+
+Установить зависимости:
+
+```bash
+uv sync
+```
+
+При необходимости задать пользователя и пароль ClickHouse:
+
+```bash
+export CLICKHOUSE_USER="<user>"
+export CLICKHOUSE_PASSWORD="<password>"
+```
+
+Запустить приложение:
 
 ```bash
 uv run streamlit run src/csv_click/app.py --server.address 0.0.0.0 --server.port 8501
 ```
 
-Open through JupyterHub proxy:
+Если приложение запускается в JupyterHub, открыть его через proxy:
 
 ```text
 https://<jupyterhub-host>/user/<username>/proxy/8501/
 ```
 
-## Behavior
+При локальном запуске открыть:
 
-- The CSV file must have a header.
-- The app scans CSV chunks to infer ClickHouse types.
-- Default CSV encoding is `utf_8`.
-- Default separator is `,`.
-- Encoding and separator are selectable in the UI, including `cp1251` and `;`.
-- The inferred schema can be edited before DDL generation and load, including
-  source-to-target column names and include/exclude flags.
-- Only the distributed table name is entered manually.
-- The local table name is generated as `{distributed_table}_local`.
-- If either target table already exists on the cluster, the load is blocked before DDL or insert.
-- Data is inserted sequentially in pandas chunks, default `1_000_000` rows.
-- Strict preflight validation is enabled by default, so selected types are checked before DDL/load.
+```text
+http://localhost:8501
+```
 
-Default ClickHouse certificate paths match the source notebook:
+## Параметры подключения
 
-- `/home/jovyan/tsh/clickhouse-prod.crt`
-- `/home/jovyan/tsh/clickhouse-prod.key`
+Поля по умолчанию:
+
+- `Host`: `tp17.wb-bank.ru`
+- `Port`: `443`
+- `Database`: `sandbox`
+- `Cluster`: `clickhouse`
+- `Secure`: включено
+- `Verify TLS`: выключено
+- `Client cert path`: `/home/jovyan/tsh/clickhouse-prod.crt`
+- `Client key path`: `/home/jovyan/tsh/clickhouse-prod.key`
+
+`Username` и `Password` можно ввести в UI или передать через переменные
+окружения `CLICKHOUSE_USER` и `CLICKHOUSE_PASSWORD`.
+
+Если `Secure` включен, приложение до подключения проверит наличие файлов
+сертификата и ключа.
+
+## Как пользоваться
+
+1. В поле `CSV path` указать путь к CSV-файлу на сервере.
+2. Указать `Database`, `Distributed table name`, `Cluster`.
+3. Заполнить `ORDER BY`. Это обязательный параметр для локальной
+   `ReplicatedMergeTree`.
+4. При необходимости заполнить `PARTITION BY (optional)`.
+5. При необходимости изменить `Distributed sharding key`. По умолчанию
+   используется `rand()`.
+6. Выбрать `Batch size`. По умолчанию загружается по `1_000_000` строк в чанке.
+7. Выбрать разделитель CSV: `,`, `;`, `\t`, `|` или `custom`.
+8. Выбрать кодировку: `utf_8`, `cp1251`, `windows-1251`, `utf-8-sig` или
+   `custom`.
+9. Оставить `Strict preflight validation` включенным, если нужно заранее
+   проверить конвертацию CSV в выбранные типы ClickHouse до создания и загрузки.
+10. Нажать `Apply parameters`.
+11. Нажать `Test connection`, чтобы проверить подключение к ClickHouse через
+    `SELECT 1`.
+12. Нажать `Analyze CSV`. Приложение просканирует CSV чанками, выведет схему и
+    примеры значений.
+13. В таблице `Schema` проверить и отредактировать:
+    - `target_name`: имя колонки в ClickHouse;
+    - `include`: загружать колонку или исключить;
+    - `final_type`: итоговый тип ClickHouse;
+    - `nullable`: обернуть тип в `Nullable(...)`.
+14. Нажать `Preview DDL`, чтобы посмотреть SQL создания локальной и
+    распределенной таблиц.
+15. Нажать `Create tables and load`, чтобы создать таблицы и загрузить данные.
+
+## Что создает приложение
+
+Если указать распределенную таблицу `my_table`, приложение создаст:
+
+- локальную таблицу `my_table_local`;
+- распределенную таблицу `my_table`.
+
+Локальная таблица создается как:
+
+```sql
+ENGINE = ReplicatedMergeTree('/clickhouse/tables/{shard}/<database>/<table>', '{replica}')
+ORDER BY <ORDER BY>
+```
+
+Если заполнен `PARTITION BY`, он будет добавлен в DDL локальной таблицы.
+
+Распределенная таблица создается как:
+
+```sql
+ENGINE = Distributed('<cluster>', '<database>', '<local_table>', <sharding_key>)
+```
+
+Перед созданием приложение проверяет через `clusterAllReplicas(system.tables)`,
+что ни локальная, ни распределенная целевая таблица еще не существуют. Если
+хотя бы одна из них уже есть, создание и загрузка блокируются.
+
+## Правила обработки CSV
+
+- Заголовок CSV обязателен.
+- Имена колонок нормализуются под ClickHouse identifier:
+  - приводятся к нижнему регистру;
+  - неподходящие символы заменяются на `_`;
+  - повторяющиеся `_` схлопываются;
+  - если имя начинается с цифры, добавляется префикс `col_`.
+- Если после нормализации появляются дубли колонок, анализ CSV завершается
+  ошибкой.
+- Пустые значения приводят к выбору `Nullable(...)` при автоопределении схемы.
+- Поддерживаемые итоговые типы:
+  - `String`, `Int64`, `UInt64`, `Float64`;
+  - `Decimal(18, 2)`, `Decimal(38, 10)`;
+  - `Date`, `DateTime`, `Bool`;
+  - `Nullable(...)` для этих типов.
+
+## Проверка перед загрузкой
+
+При включенном `Strict preflight validation` приложение до создания таблиц и
+загрузки:
+
+- читает CSV теми же чанками;
+- применяет выбранные маппинги колонок;
+- проверяет конвертацию значений в выбранные типы ClickHouse;
+- формирует `JSONEachRow` payload для проверки сериализации.
+
+Это увеличивает время перед загрузкой, но снижает риск создать таблицу и затем
+упасть на несовместимом значении в середине файла.
+
+## Проверки разработки
+
+Запустить тесты:
+
+```bash
+uv run --extra dev pytest
+```
