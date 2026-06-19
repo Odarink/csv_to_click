@@ -1,0 +1,26 @@
+[project]
+name = "csv-click"
+version = "0.1.0"
+description = "Streamlit UI for loading CSV files into ClickHouse local and distributed tables."
+requires-python = ">=3.11"
+dependencies = [
+    "clickhouse-connect>=0.8.0",
+    "pandas>=2.2.0",
+    "streamlit>=1.37.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.2.0",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/csv_click"]
