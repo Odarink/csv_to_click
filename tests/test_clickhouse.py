@@ -13,12 +13,13 @@ from csv_click.clickhouse import (
     build_create_distributed_table_sql,
     build_create_local_table_sql,
     build_table_names,
+    create_tables,
     ensure_tables_do_not_exist,
     get_client,
     quote_identifier,
     raw_insert_batch,
 )
-from csv_click.errors import CertificateError
+from csv_click.errors import CertificateError, ClickHouseConnectionError
 from csv_click.schema import CsvColumn, CsvSchema
 
 
@@ -81,7 +82,7 @@ def test_build_local_ddl_contains_cluster_replicated_engine_order_and_partition(
     assert "ReplicatedMergeTree" in sql
     assert "'/clickhouse/tables/{shard}-{uuid}/orders_local'" in sql
     assert "PARTITION BY toYYYYMM(id)" in sql
-    assert "ORDER BY id" in sql
+    assert "ORDER BY `id`" in sql
     assert "SETTINGS index_granularity = 8192" in sql
     assert not sql.rstrip().endswith(";")
 
@@ -92,7 +93,7 @@ def test_build_distributed_ddl_uses_local_table() -> None:
         distributed_table="orders",
         local_table="orders_local",
         cluster="clickhouse",
-        sharding_key="sipHash64(ID)",
+        sharding_key="ID",
     )
 
     assert "CREATE TABLE sandbox.orders\nON CLUSTER clickhouse" in sql
@@ -101,9 +102,21 @@ def test_build_distributed_ddl_uses_local_table() -> None:
     'clickhouse',
     'sandbox',
     'orders_local',
-    sipHash64(ID)
+    sipHash64(`ID`)
 )""" in sql
     assert not sql.rstrip().endswith(";")
+
+
+def test_build_local_ddl_rejects_multi_statement_partition() -> None:
+    with pytest.raises(ValueError, match="PARTITION BY"):
+        build_create_local_table_sql(
+            database="sandbox",
+            table="orders_local",
+            cluster="clickhouse",
+            schema=sample_schema(),
+            order_by="id",
+            partition_by="toYYYYMM(id); DROP TABLE x",
+        )
 
 
 def test_build_distributed_ddl_requires_sharding_key() -> None:
@@ -131,6 +144,92 @@ def test_existing_table_check_blocks_create_load() -> None:
         assert "orders" in str(exc)
     else:
         raise AssertionError("Expected ExistingTableError")
+
+
+class PartialDDLClient:
+    def __init__(self) -> None:
+        self.queries = []
+
+    def query(self, sql):
+        self.queries.append(sql)
+        if "name IN ('orders', 'orders_local')" in sql:
+            dropped = any("DROP TABLE IF EXISTS" in query for query in self.queries)
+            rows = [] if dropped else [("host1", "sandbox", "orders")]
+            return type("Result", (), {"result_rows": rows})()
+        if "name = 'orders_local'" in sql:
+            return type("Result", (), {"result_rows": [("host1", "sandbox", "orders_local")]})()
+        if "name = 'orders'" in sql:
+            return type("Result", (), {"result_rows": [("host1", "sandbox", "orders")]})()
+        return type("Result", (), {"result_rows": []})()
+
+
+def test_create_tables_drops_partial_state_and_verifies_local_before_distributed() -> None:
+    client = PartialDDLClient()
+
+    create_tables(
+        client=client,
+        config=ClickHouseConfig(database="sandbox", cluster="clickhouse"),
+        schema=sample_schema(),
+        distributed_table="orders",
+        order_by="id",
+        sharding_key="id",
+    )
+
+    queries = client.queries
+    assert any("DROP TABLE IF EXISTS sandbox.orders\nON CLUSTER clickhouse" in query for query in queries)
+    assert any("DROP TABLE IF EXISTS sandbox.orders_local\nON CLUSTER clickhouse" in query for query in queries)
+    local_create_idx = next(i for i, query in enumerate(queries) if "CREATE TABLE sandbox.orders_local" in query)
+    local_verify_idx = next(i for i, query in enumerate(queries) if "name = 'orders_local'" in query)
+    distributed_create_idx = next(i for i, query in enumerate(queries) if "CREATE TABLE sandbox.orders\n" in query)
+    assert local_create_idx < local_verify_idx < distributed_create_idx
+
+
+class MissingLocalDDLClient:
+    def __init__(self) -> None:
+        self.queries = []
+
+    def query(self, sql):
+        self.queries.append(sql)
+        return type("Result", (), {"result_rows": []})()
+
+
+def test_create_tables_stops_when_local_table_is_not_visible() -> None:
+    client = MissingLocalDDLClient()
+
+    with pytest.raises(ClickHouseConnectionError, match="orders_local"):
+        create_tables(
+            client=client,
+            config=ClickHouseConfig(database="sandbox", cluster="clickhouse"),
+            schema=sample_schema(),
+            distributed_table="orders",
+            order_by="id",
+            sharding_key="id",
+            verify_attempts=1,
+            verify_interval_seconds=0,
+        )
+
+    assert not any("CREATE TABLE sandbox.orders\n" in query for query in client.queries)
+
+
+def test_create_tables_blocks_when_both_target_tables_exist() -> None:
+    client = FakeClient(
+        [
+            ("host1", "sandbox", "orders"),
+            ("host1", "sandbox", "orders_local"),
+        ]
+    )
+
+    with pytest.raises(ExistingTableError):
+        create_tables(
+            client=client,
+            config=ClickHouseConfig(database="sandbox", cluster="clickhouse"),
+            schema=sample_schema(),
+            distributed_table="orders",
+            order_by="id",
+            sharding_key="id",
+        )
+
+    assert not any("DROP TABLE" in query for query in client.queries)
 
 
 def test_quote_identifier_rejects_unsafe_table_names() -> None:

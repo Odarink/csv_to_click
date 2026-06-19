@@ -2,10 +2,11 @@ from __future__ import annotations
 
 import re
 import ssl
+import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Protocol
+from typing import Callable, Protocol
 
 from csv_click.errors import (
     CertificateError,
@@ -63,6 +64,13 @@ def quote_identifier(identifier: str) -> str:
     raise ValueError(f"Unsafe ClickHouse identifier: {identifier}")
 
 
+def quote_column_identifier(identifier: str) -> str:
+    identifier = identifier.strip()
+    if not identifier or "`" in identifier or "\x00" in identifier:
+        raise ValueError(f"Unsafe ClickHouse column identifier: {identifier}")
+    return f"`{identifier}`"
+
+
 def get_client(config: ClickHouseConfig):
     _validate_certificate_files(config)
     try:
@@ -104,6 +112,18 @@ def ensure_tables_do_not_exist(
     distributed_table: str,
     local_table: str,
 ) -> None:
+    existing = _existing_target_tables(client, config, distributed_table, local_table)
+    if existing:
+        found = ", ".join(sorted(existing))
+        raise ExistingTableError(f"Target table already exists: {found}")
+
+
+def _existing_target_tables(
+    client: ClickHouseClient,
+    config: ClickHouseConfig,
+    distributed_table: str,
+    local_table: str,
+) -> set[str]:
     database = quote_identifier(config.database)
     cluster = quote_identifier(config.cluster)
     distributed_table = quote_identifier(distributed_table)
@@ -120,9 +140,70 @@ ORDER BY host_name, name
 """
     result = client.query(sql)
     rows = getattr(result, "result_rows", [])
-    if rows:
-        found = ", ".join(f"{row[1]}.{row[2]} on {row[0]}" for row in rows)
-        raise ExistingTableError(f"Target table already exists: {found}")
+    return {str(row[2]) for row in rows}
+
+
+def drop_target_tables(
+    client: ClickHouseClient,
+    config: ClickHouseConfig,
+    distributed_table: str,
+    local_table: str,
+    log_callback: Callable[[str], None] | None = None,
+) -> None:
+    database = quote_identifier(config.database)
+    cluster = quote_identifier(config.cluster)
+    distributed_table = quote_identifier(distributed_table)
+    local_table = quote_identifier(local_table)
+    for table in [distributed_table, local_table]:
+        sql = f"DROP TABLE IF EXISTS {database}.{table}\nON CLUSTER {cluster}"
+        if log_callback:
+            log_callback(f"Cleanup: {database}.{table}")
+        client.query(sql)
+
+
+def _table_exists_on_cluster(
+    client: ClickHouseClient,
+    config: ClickHouseConfig,
+    table: str,
+) -> bool:
+    database = quote_identifier(config.database)
+    cluster = quote_identifier(config.cluster)
+    table = quote_identifier(table)
+    sql = f"""
+SELECT
+    hostName() AS host_name,
+    database,
+    name
+FROM clusterAllReplicas('{cluster}', system.tables)
+WHERE database = '{database}'
+    AND name = '{table}'
+ORDER BY host_name, name
+"""
+    result = client.query(sql)
+    return bool(getattr(result, "result_rows", []))
+
+
+def _verify_table_exists_on_cluster(
+    client: ClickHouseClient,
+    config: ClickHouseConfig,
+    table: str,
+    attempts: int = 30,
+    interval_seconds: float = 1.0,
+) -> None:
+    for attempt in range(max(1, attempts)):
+        if _table_exists_on_cluster(client, config, table):
+            return
+        if attempt + 1 < attempts:
+            time.sleep(interval_seconds)
+    else:
+        raise ClickHouseConnectionError(
+            f"Table {config.database}.{table} is not visible on cluster {config.cluster} after CREATE"
+        )
+
+
+def _validate_single_statement_expression(label: str, expression: str | None) -> None:
+    if expression and ";" in expression:
+        raise ValueError(f"{label} cannot contain semicolon")
 
 
 def build_create_local_table_sql(
@@ -135,9 +216,11 @@ def build_create_local_table_sql(
 ) -> str:
     if not order_by.strip():
         raise ValueError("ORDER BY is required")
+    _validate_single_statement_expression("PARTITION BY", partition_by)
     database = quote_identifier(database)
     table = quote_identifier(table)
     cluster = quote_identifier(cluster)
+    order_by_sql = quote_column_identifier(order_by)
     columns_sql = ",\n    ".join(
         f"`{column.column_name}` {column.final_type}" for column in schema.columns
     )
@@ -149,7 +232,7 @@ ON CLUSTER {cluster}
 )
 ENGINE = ReplicatedMergeTree('/clickhouse/tables/{{shard}}-{{uuid}}/{table}',
  '{{replica}}'){partition_sql}
-ORDER BY {order_by.strip()}
+ORDER BY {order_by_sql}
 SETTINGS index_granularity = 8192"""
 
 
@@ -167,6 +250,7 @@ def build_create_distributed_table_sql(
     sharding_key = sharding_key.strip()
     if not sharding_key:
         raise ValueError("Distributed sharding key is required")
+    sharding_key_sql = f"sipHash64({quote_column_identifier(sharding_key)})"
     return f"""CREATE TABLE {database}.{distributed_table}
 ON CLUSTER {cluster}
 AS {database}.{local_table}
@@ -174,7 +258,7 @@ ENGINE = Distributed(
     '{cluster}',
     '{database}',
     '{local_table}',
-    {sharding_key}
+    {sharding_key_sql}
 )"""
 
 
@@ -186,28 +270,66 @@ def create_tables(
     order_by: str,
     partition_by: str | None = None,
     sharding_key: str = "",
+    log_callback: Callable[[str], None] | None = None,
+    verify_attempts: int = 30,
+    verify_interval_seconds: float = 1.0,
 ) -> TableNames:
     names = build_table_names(distributed_table)
-    ensure_tables_do_not_exist(client, config, names.distributed, names.local)
-    client.query(
-        build_create_local_table_sql(
-            database=config.database,
-            table=names.local,
-            cluster=config.cluster,
-            schema=schema,
-            order_by=order_by,
-            partition_by=partition_by,
+    existing = _existing_target_tables(client, config, names.distributed, names.local)
+    expected = {names.distributed, names.local}
+    if existing == expected:
+        found = ", ".join(sorted(existing))
+        raise ExistingTableError(f"Target table already exists: {found}")
+    if existing:
+        if log_callback:
+            log_callback("Partial target table state found. Dropping target tables before retry.")
+        drop_target_tables(client, config, names.distributed, names.local, log_callback)
+
+    created = False
+    try:
+        if log_callback:
+            log_callback(f"Creating local table {config.database}.{names.local}")
+        client.query(
+            build_create_local_table_sql(
+                database=config.database,
+                table=names.local,
+                cluster=config.cluster,
+                schema=schema,
+                order_by=order_by,
+                partition_by=partition_by,
+            )
         )
-    )
-    client.query(
-        build_create_distributed_table_sql(
-            database=config.database,
-            distributed_table=names.distributed,
-            local_table=names.local,
-            cluster=config.cluster,
-            sharding_key=sharding_key,
+        created = True
+        _verify_table_exists_on_cluster(
+            client,
+            config,
+            names.local,
+            attempts=verify_attempts,
+            interval_seconds=verify_interval_seconds,
         )
-    )
+
+        if log_callback:
+            log_callback(f"Creating distributed table {config.database}.{names.distributed}")
+        client.query(
+            build_create_distributed_table_sql(
+                database=config.database,
+                distributed_table=names.distributed,
+                local_table=names.local,
+                cluster=config.cluster,
+                sharding_key=sharding_key,
+            )
+        )
+        _verify_table_exists_on_cluster(
+            client,
+            config,
+            names.distributed,
+            attempts=verify_attempts,
+            interval_seconds=verify_interval_seconds,
+        )
+    except Exception:
+        if created:
+            drop_target_tables(client, config, names.distributed, names.local, log_callback)
+        raise
     return names
 
 

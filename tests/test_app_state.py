@@ -89,6 +89,22 @@ def test_create_and_load_uses_confirmed_type_rows_for_mappings() -> None:
     assert 'st.session_state["schema_rows"]' not in create_and_load_source
 
 
+def test_create_and_load_renders_progress_and_accumulated_log() -> None:
+    source = Path("src/csv_click/app.py").read_text(encoding="utf-8")
+    match = re.search(
+        r"def _create_and_load\(.*?\n(?=if __name__)",
+        source,
+        flags=re.DOTALL,
+    )
+
+    assert match is not None
+    create_and_load_source = match.group(0)
+    assert "st.progress(0)" in create_and_load_source
+    assert "log_container = st.empty()" in create_and_load_source
+    assert "_append_load_log" in create_and_load_source
+    assert "_render_load_log" in create_and_load_source
+
+
 def test_connection_form_uses_persisted_settings_and_no_table_specific_defaults() -> None:
     source = Path("src/csv_click/app.py").read_text(encoding="utf-8")
     match = re.search(
@@ -101,13 +117,31 @@ def test_connection_form_uses_persisted_settings_and_no_table_specific_defaults(
     form_source = match.group(0)
     assert "load_app_settings" in source
     assert "save_app_settings" in source
-    assert 'st.text_input("ORDER BY")' in form_source
+    assert 'st.text_input("ORDER BY")' not in form_source
+    assert 'st.selectbox("ORDER BY"' in form_source
     assert '"Distributed sharding key"' in form_source
+    assert 'st.text_input("Distributed sharding key"' not in form_source
+    assert 'st.selectbox("Distributed sharding key"' in form_source
+    assert 'st.text_input("PARTITION BY (optional)")' in form_source
     assert 'value="rand()"' not in form_source
     assert 'value="sipHash64(ID)"' not in form_source
     assert '"sharding_key": sharding_key or "rand()"' not in source
-    assert "Sharding example: sipHash64(<column>)" in form_source
     assert "Distributed sharding key is required" in form_source
+
+
+def test_connection_form_uses_schema_target_columns_for_sorting_and_sharding() -> None:
+    source = Path("src/csv_click/app.py").read_text(encoding="utf-8")
+    match = re.search(
+        r"def _render_connection_and_load_form\(.*?\n(?=def _)",
+        source,
+        flags=re.DOTALL,
+    )
+
+    assert match is not None
+    form_source = match.group(0)
+    assert "_schema_target_names(schema)" in form_source
+    assert "options=target_names" in form_source
+    assert '"sharding_key": sharding_column' in form_source
 
 
 def test_csv_path_step_renders_read_settings_before_first_analysis() -> None:

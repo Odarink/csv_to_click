@@ -17,6 +17,7 @@ from csv_click.clickhouse import (
     build_create_local_table_sql,
     build_table_names,
     create_tables,
+    drop_target_tables,
     get_client,
     test_connection,
 )
@@ -35,6 +36,7 @@ from csv_click.pandas_loader import (
     mappings_to_editor_rows,
     mappings_to_schema,
     preview_csv_rows,
+    detect_mojibake,
     schema_to_mappings,
     validate_csv_with_pandas_chunks,
 )
@@ -61,7 +63,7 @@ def main() -> None:
     if schema is None:
         return
 
-    params = _render_connection_and_load_form()
+    params = _render_connection_and_load_form(schema)
     if not params:
         return
 
@@ -78,21 +80,26 @@ def main() -> None:
         if st.button("Test connection", type="secondary", use_container_width=True):
             _test_connection(config)
 
-    ddl_local = build_create_local_table_sql(
-        database=config.database,
-        table=table_names.local,
-        cluster=config.cluster,
-        schema=schema,
-        order_by=params["order_by"],
-        partition_by=params["partition_by"],
-    )
-    ddl_distributed = build_create_distributed_table_sql(
-        database=config.database,
-        distributed_table=table_names.distributed,
-        local_table=table_names.local,
-        cluster=config.cluster,
-        sharding_key=params["sharding_key"],
-    )
+    try:
+        ddl_local = build_create_local_table_sql(
+            database=config.database,
+            table=table_names.local,
+            cluster=config.cluster,
+            schema=schema,
+            order_by=params["order_by"],
+            partition_by=params["partition_by"],
+        )
+        ddl_distributed = build_create_distributed_table_sql(
+            database=config.database,
+            distributed_table=table_names.distributed,
+            local_table=table_names.local,
+            cluster=config.cluster,
+            sharding_key=params["sharding_key"],
+        )
+    except ValueError as exc:
+        st.error(f"DDL parameter error: {exc}")
+        return
+
 
     if st.button("Preview DDL", use_container_width=True):
         st.subheader("Local table DDL")
@@ -115,8 +122,9 @@ def main() -> None:
         )
 
 
-def _render_connection_and_load_form() -> dict[str, object] | None:
+def _render_connection_and_load_form(schema: CsvSchema) -> dict[str, object] | None:
     settings = _get_app_settings()
+    target_names = _schema_target_names(schema)
     with st.form("load_params_form"):
         st.subheader("ClickHouse and load parameters")
         left, right = st.columns(2)
@@ -124,12 +132,9 @@ def _render_connection_and_load_form() -> dict[str, object] | None:
             database = st.text_input("Database", value=settings.database)
             distributed_table = st.text_input("Distributed table name")
             cluster = st.text_input("Cluster", value=settings.cluster)
-            order_by = st.text_input("ORDER BY")
+            order_by = st.selectbox("ORDER BY", options=target_names)
             partition_by = st.text_input("PARTITION BY (optional)")
-            sharding_key = st.text_input(
-                "Distributed sharding key",
-                help="Sharding example: sipHash64(<column>)",
-            )
+            sharding_column = st.selectbox("Distributed sharding key", options=target_names)
             batch_size = st.number_input(
                 "Batch size",
                 min_value=1,
@@ -191,7 +196,7 @@ def _render_connection_and_load_form() -> dict[str, object] | None:
         errors.append("Distributed table name is required")
     if not order_by:
         errors.append("ORDER BY is required")
-    if not sharding_key:
+    if not sharding_column:
         errors.append("Distributed sharding key is required")
 
     if errors:
@@ -210,7 +215,7 @@ def _render_connection_and_load_form() -> dict[str, object] | None:
         "distributed_table": distributed_table,
         "order_by": order_by,
         "partition_by": partition_by or None,
-        "sharding_key": sharding_key,
+        "sharding_key": sharding_column,
         "batch_size": int(batch_size),
         "strict_preflight": strict_preflight,
         "config": config,
@@ -342,7 +347,14 @@ def _render_csv_preview() -> None:
     if preview is None:
         return
     st.subheader("CSV preview")
+    warning = detect_mojibake(preview)
+    if warning is not None:
+        st.warning(warning.message)
     st.dataframe(preview, hide_index=True, use_container_width=True)
+
+
+def _schema_target_names(schema: CsvSchema) -> list[str]:
+    return [column.column_name for column in schema.columns]
 
 
 def _separator_index(separator: str) -> int:
@@ -551,6 +563,42 @@ def _validate_mapping_rows(rows: list[dict[str, object]]) -> None:
         raise CsvSchemaError("Duplicate target column names: " + ", ".join(duplicates))
 
 
+def _append_load_log(log_messages: list[str], message: str) -> None:
+    log_messages.append(f"{time.strftime('%H:%M:%S')} {message}")
+
+
+def _render_load_log(log_container, log_messages: list[str]) -> None:
+    log_container.code("\n".join(log_messages), language="text")
+
+
+def _format_load_error(exc: Exception) -> str:
+    message = str(exc)
+    normalized = message.lower()
+    if "unknown_table" in normalized or "does not exist" in normalized:
+        return (
+            "ClickHouse load failed during load step because the target table is not visible "
+            f"after DDL creation: {message}"
+        )
+    return f"Unexpected load error: {message}"
+
+
+def _cleanup_after_failed_load(
+    client,
+    config: ClickHouseConfig,
+    distributed_table: str,
+    log_callback,
+) -> None:
+    table_names = build_table_names(distributed_table)
+    log_callback("Load failed after table creation. Dropping target tables.")
+    drop_target_tables(
+        client=client,
+        config=config,
+        distributed_table=table_names.distributed,
+        local_table=table_names.local,
+        log_callback=log_callback,
+    )
+
+
 def _create_and_load(
     config: ClickHouseConfig,
     csv_path: str,
@@ -566,20 +614,33 @@ def _create_and_load(
     progress = st.progress(0)
     status = st.empty()
     metrics = st.empty()
+    log_container = st.empty()
+    log_messages: list[str] = []
     start = time.time()
     inserted_rows = 0
+    client = None
+    tables_created = False
+
+    def log(message: str) -> None:
+        _append_load_log(log_messages, message)
+        _render_load_log(log_container, log_messages)
 
     try:
         mappings = mappings_from_editor_rows(st.session_state["type_rows"])
         total_rows = 0
         if strict_preflight:
+            log("Validating CSV chunks against selected types.")
             status.info("Validating CSV chunks against selected types...")
             total_rows = validate_csv_with_pandas_chunks(csv_path, read_options, mappings)
+            log(f"CSV validation finished: {total_rows} rows.")
 
+        log("Connecting to ClickHouse.")
         status.info("Connecting to ClickHouse...")
         client = get_client(config)
         test_connection(client)
+        log("ClickHouse connection OK.")
 
+        log("Checking existing tables and creating DDL.")
         status.info("Checking existing tables and creating DDL...")
         create_tables(
             client=client,
@@ -589,8 +650,12 @@ def _create_and_load(
             order_by=order_by,
             partition_by=partition_by,
             sharding_key=sharding_key,
+            log_callback=log,
         )
+        tables_created = True
+        log("Target tables are created and visible on cluster.")
 
+        log("Loading CSV chunks through JSONEachRow.")
         status.info("Loading CSV chunks through JSONEachRow...")
 
         def on_progress(batch_number: int, batch_rows: int, rows_total: int) -> None:
@@ -600,6 +665,7 @@ def _create_and_load(
                 progress.progress(min(1.0, inserted_rows / total_rows))
             metrics.metric("Inserted rows", inserted_rows)
             status.info(f"Loaded chunk {batch_number}: {batch_rows} rows")
+            log(f"Loaded chunk {batch_number}: {batch_rows} rows, total {rows_total}.")
 
         inserted_rows = load_csv_via_raw_insert(
             client=client,
@@ -613,15 +679,31 @@ def _create_and_load(
 
         progress.progress(1.0)
         elapsed = time.time() - start
+        log(f"Load finished: {inserted_rows} rows in {elapsed:.2f} sec.")
         status.success(f"Load finished: {inserted_rows} rows in {elapsed:.2f} sec")
     except CertificateError as exc:
+        log(f"Certificate error: {exc}")
         status.error(f"Certificate error: {exc}")
     except ExistingTableError as exc:
+        log(f"Existing table error: {exc}")
         status.error(f"Existing table error: {exc}")
     except (CsvSchemaError, ClickHouseConnectionError, CsvClickError) as exc:
+        if tables_created and client is not None:
+            try:
+                _cleanup_after_failed_load(client, config, distributed_table, log)
+            except Exception as cleanup_exc:
+                log(f"Cleanup error: {cleanup_exc}")
+        log(str(exc))
         status.error(str(exc))
     except Exception as exc:
-        status.error(f"Unexpected load error: {exc}")
+        if tables_created and client is not None:
+            try:
+                _cleanup_after_failed_load(client, config, distributed_table, log)
+            except Exception as cleanup_exc:
+                log(f"Cleanup error: {cleanup_exc}")
+        message = _format_load_error(exc)
+        log(message)
+        status.error(message)
 
 
 if __name__ == "__main__":

@@ -31,6 +31,16 @@ class ReadOptions:
     batch_size: int = 1_000_000
 
 
+ENCODING_SUGGESTIONS: tuple[str, ...] = ("utf_8", "utf-8-sig", "cp1251", "windows-1251")
+MOJIBAKE_MARKERS: tuple[str, ...] = ("С‚", "Рµ", "Р°", "Рё", "Рѕ", "РЅ", "�")
+
+
+@dataclass(frozen=True)
+class MojibakeWarning:
+    message: str
+    suggested_encodings: tuple[str, ...]
+
+
 @dataclass(frozen=True)
 class SchemaMapping:
     source_name: str
@@ -80,6 +90,8 @@ def preview_csv_rows(
             sep=read_options.separator,
             encoding=read_options.encoding,
             nrows=nrows,
+            dtype=str,
+            keep_default_na=False,
         )
     except pd.errors.ParserError as exc:
         raise CsvSchemaError(
@@ -93,6 +105,19 @@ def preview_csv_rows(
         ) from exc
     preview.columns = preview.columns.str.strip()
     return preview
+
+
+def detect_mojibake(preview: pd.DataFrame) -> MojibakeWarning | None:
+    for value in preview.astype(str).to_numpy().ravel().tolist():
+        if any(marker in value for marker in MOJIBAKE_MARKERS):
+            return MojibakeWarning(
+                message=(
+                    "CSV preview may contain mojibake. Try another encoding: "
+                    + ", ".join(ENCODING_SUGGESTIONS)
+                ),
+                suggested_encodings=ENCODING_SUGGESTIONS,
+            )
+    return None
 
 
 def analyze_csv_with_pandas_chunks(

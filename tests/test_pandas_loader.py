@@ -6,11 +6,13 @@ import pytest
 
 from csv_click.errors import CsvSchemaError
 from csv_click.pandas_loader import (
+    ENCODING_SUGGESTIONS,
     ReadOptions,
     SchemaMapping,
     analyze_csv_with_pandas_chunks,
     chunk_to_json_each_row_payload,
     convert_chunk_to_schema,
+    detect_mojibake,
     iter_pandas_chunks,
     load_csv_via_raw_insert,
     mappings_from_editor_rows,
@@ -55,7 +57,27 @@ def test_preview_csv_rows_uses_selected_separator_and_encoding(tmp_path: Path) -
     preview = preview_csv_rows(csv_path, options, nrows=20)
 
     assert preview.columns.tolist() == ["ID", "NAME"]
-    assert preview.iloc[0].to_dict() == {"ID": 1, "NAME": "тест"}
+    assert preview.iloc[0].to_dict() == {"ID": "1", "NAME": "тест"}
+
+
+def test_preview_csv_rows_keeps_empty_values_as_strings(tmp_path: Path) -> None:
+    csv_path = tmp_path / "preview_strings.csv"
+    csv_path.write_text("ID;NAME\n001;\n", encoding="utf_8")
+    options = ReadOptions(separator=";", encoding="utf_8", batch_size=1)
+
+    preview = preview_csv_rows(csv_path, options, nrows=20)
+
+    assert preview.iloc[0].to_dict() == {"ID": "001", "NAME": ""}
+
+
+def test_detect_mojibake_suggests_encoding_candidates() -> None:
+    preview = pd.DataFrame({"NAME": ["С‚РµСЃС‚"]})
+
+    warning = detect_mojibake(preview)
+
+    assert warning is not None
+    assert "mojibake" in warning.message
+    assert warning.suggested_encodings == ENCODING_SUGGESTIONS
 
 
 def test_analyze_csv_with_pandas_chunks_strips_and_normalizes_target_names(tmp_path: Path) -> None:
