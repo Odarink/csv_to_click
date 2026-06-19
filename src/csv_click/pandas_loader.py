@@ -107,17 +107,69 @@ def preview_csv_rows(
     return preview
 
 
-def detect_mojibake(preview: pd.DataFrame) -> MojibakeWarning | None:
-    for value in preview.astype(str).to_numpy().ravel().tolist():
-        if any(marker in value for marker in MOJIBAKE_MARKERS):
-            return MojibakeWarning(
-                message=(
-                    "CSV preview may contain mojibake. Try another encoding: "
-                    + ", ".join(ENCODING_SUGGESTIONS)
-                ),
-                suggested_encodings=ENCODING_SUGGESTIONS,
+def choose_read_options_for_preview(
+    csv_path: str | Path,
+    read_options: ReadOptions,
+    nrows: int = 20,
+) -> tuple[ReadOptions, pd.DataFrame, MojibakeWarning | None]:
+    selected_preview = preview_csv_rows(csv_path, read_options, nrows=nrows)
+    selected_score = _mojibake_score(selected_preview)
+    best_options = read_options
+    best_preview = selected_preview
+    best_score = selected_score
+
+    if selected_score:
+        for encoding in ENCODING_SUGGESTIONS:
+            if encoding == read_options.encoding:
+                continue
+            candidate_options = ReadOptions(
+                separator=read_options.separator,
+                encoding=encoding,
+                batch_size=read_options.batch_size,
             )
-    return None
+            try:
+                candidate_preview = preview_csv_rows(csv_path, candidate_options, nrows=nrows)
+            except CsvSchemaError:
+                continue
+            candidate_score = _mojibake_score(candidate_preview)
+            if candidate_score < best_score:
+                best_options = candidate_options
+                best_preview = candidate_preview
+                best_score = candidate_score
+
+    warning = detect_mojibake(best_preview)
+    if best_options.encoding != read_options.encoding:
+        warning = MojibakeWarning(
+            message=(
+                f"Auto-selected encoding {best_options.encoding} because "
+                f"{read_options.encoding} produced mojibake in CSV preview."
+            ),
+            suggested_encodings=ENCODING_SUGGESTIONS,
+        )
+    return best_options, best_preview, warning
+
+
+def detect_mojibake(preview: pd.DataFrame) -> MojibakeWarning | None:
+    if not _mojibake_score(preview):
+        return None
+    return MojibakeWarning(
+        message=(
+            "CSV preview may contain mojibake. Try another encoding: "
+            + ", ".join(ENCODING_SUGGESTIONS)
+        ),
+        suggested_encodings=ENCODING_SUGGESTIONS,
+    )
+
+
+def _mojibake_score(preview: pd.DataFrame) -> int:
+    score = 0
+    for value in preview.astype(str).to_numpy().ravel().tolist():
+        score += value.count("пїЅ") * 10
+        score += value.count("�") * 10
+        for marker in MOJIBAKE_MARKERS:
+            if marker not in {"пїЅ", "�"}:
+                score += value.count(marker)
+    return score
 
 
 def analyze_csv_with_pandas_chunks(

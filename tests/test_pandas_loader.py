@@ -10,6 +10,7 @@ from csv_click.pandas_loader import (
     ReadOptions,
     SchemaMapping,
     analyze_csv_with_pandas_chunks,
+    choose_read_options_for_preview,
     chunk_to_json_each_row_payload,
     convert_chunk_to_schema,
     detect_mojibake,
@@ -78,6 +79,28 @@ def test_detect_mojibake_suggests_encoding_candidates() -> None:
     assert warning is not None
     assert "mojibake" in warning.message
     assert warning.suggested_encodings == ENCODING_SUGGESTIONS
+
+
+def test_detect_mojibake_catches_replacement_character_mojibake() -> None:
+    preview = pd.DataFrame({"NAME": ["пїЅпїЅпїЅпїЅ"]})
+
+    warning = detect_mojibake(preview)
+
+    assert warning is not None
+    assert "mojibake" in warning.message
+
+
+def test_choose_read_options_prefers_encoding_with_lower_mojibake_score(tmp_path: Path) -> None:
+    csv_path = tmp_path / "utf8_with_replacement.csv"
+    csv_path.write_text("ID;NAME\n1;��� тест\n", encoding="utf_8")
+    selected_options = ReadOptions(separator=";", encoding="cp1251", batch_size=1)
+
+    effective_options, preview, warning = choose_read_options_for_preview(csv_path, selected_options)
+
+    assert effective_options.encoding == "utf_8"
+    assert preview.iloc[0].to_dict() == {"ID": "1", "NAME": "��� тест"}
+    assert warning is not None
+    assert "Auto-selected encoding utf_8" in warning.message
 
 
 def test_analyze_csv_with_pandas_chunks_strips_and_normalizes_target_names(tmp_path: Path) -> None:

@@ -105,6 +105,22 @@ def test_create_and_load_renders_progress_and_accumulated_log() -> None:
     assert "_render_load_log" in create_and_load_source
 
 
+def test_create_and_load_rechecks_effective_encoding_before_insert() -> None:
+    source = Path("src/csv_click/app.py").read_text(encoding="utf-8")
+    match = re.search(
+        r"def _create_and_load\(.*?\n(?=if __name__)",
+        source,
+        flags=re.DOTALL,
+    )
+
+    assert match is not None
+    create_and_load_source = match.group(0)
+    assert "choose_read_options_for_preview" in create_and_load_source
+    assert "effective_read_options" in create_and_load_source
+    assert "validate_csv_with_pandas_chunks(csv_path, effective_read_options, mappings)" in create_and_load_source
+    assert "read_options=effective_read_options" in create_and_load_source
+
+
 def test_connection_form_uses_persisted_settings_and_no_table_specific_defaults() -> None:
     source = Path("src/csv_click/app.py").read_text(encoding="utf-8")
     match = re.search(

@@ -31,12 +31,11 @@ from csv_click.errors import (
 from csv_click.pandas_loader import (
     ReadOptions,
     analyze_csv_with_pandas_chunks,
+    choose_read_options_for_preview,
     load_csv_via_raw_insert,
     mappings_from_editor_rows,
     mappings_to_editor_rows,
     mappings_to_schema,
-    preview_csv_rows,
-    detect_mojibake,
     schema_to_mappings,
     validate_csv_with_pandas_chunks,
 )
@@ -347,9 +346,9 @@ def _render_csv_preview() -> None:
     if preview is None:
         return
     st.subheader("CSV preview")
-    warning = detect_mojibake(preview)
-    if warning is not None:
-        st.warning(warning.message)
+    warning = st.session_state.get("csv_preview_warning")
+    if warning:
+        st.warning(str(warning))
     st.dataframe(preview, hide_index=True, use_container_width=True)
 
 
@@ -386,6 +385,7 @@ def _apply_csv_path(csv_path: str, read_options: ReadOptions) -> None:
         "types_confirmed",
         "load_params",
         "csv_preview_rows",
+        "csv_preview_warning",
     ]:
         st.session_state.pop(key, None)
     _analyze_csv(csv_path, read_options)
@@ -414,15 +414,21 @@ def _test_connection(config: ClickHouseConfig) -> None:
 def _analyze_csv(csv_path: str, read_options: ReadOptions) -> None:
     try:
         with st.spinner("Scanning CSV chunks to infer schema..."):
-            schema = analyze_csv_with_pandas_chunks(csv_path, read_options)
-            preview = preview_csv_rows(csv_path, read_options, nrows=20)
+            effective_options, preview, warning = choose_read_options_for_preview(
+                csv_path,
+                read_options,
+                nrows=20,
+            )
+            schema = analyze_csv_with_pandas_chunks(csv_path, effective_options)
     except CsvSchemaError as exc:
         st.error(f"CSV schema error: {exc}")
         return
 
+    st.session_state["csv_read_options"] = effective_options
     st.session_state["schema_rows"] = mappings_to_editor_rows(schema_to_mappings(schema))
     st.session_state["mapping_rows"] = _schema_rows_to_mapping_rows(st.session_state["schema_rows"])
     st.session_state["csv_preview_rows"] = preview
+    st.session_state["csv_preview_warning"] = warning.message if warning else None
     st.success(f"Schema inferred for {len(schema.columns)} columns")
 
 
@@ -627,11 +633,19 @@ def _create_and_load(
 
     try:
         mappings = mappings_from_editor_rows(st.session_state["type_rows"])
+        effective_read_options, _, encoding_warning = choose_read_options_for_preview(
+            csv_path,
+            read_options,
+            nrows=20,
+        )
+        if encoding_warning:
+            log(encoding_warning.message)
+        st.session_state["csv_read_options"] = effective_read_options
         total_rows = 0
         if strict_preflight:
             log("Validating CSV chunks against selected types.")
             status.info("Validating CSV chunks against selected types...")
-            total_rows = validate_csv_with_pandas_chunks(csv_path, read_options, mappings)
+            total_rows = validate_csv_with_pandas_chunks(csv_path, effective_read_options, mappings)
             log(f"CSV validation finished: {total_rows} rows.")
 
         log("Connecting to ClickHouse.")
@@ -670,7 +684,7 @@ def _create_and_load(
         inserted_rows = load_csv_via_raw_insert(
             client=client,
             csv_path=csv_path,
-            read_options=read_options,
+            read_options=effective_read_options,
             database=config.database,
             table=distributed_table,
             mappings=mappings,
