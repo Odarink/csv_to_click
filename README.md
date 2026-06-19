@@ -21,6 +21,29 @@ ClickHouse: локальную `ReplicatedMergeTree` и распределенн
 
 ## Быстрый запуск
 
+Если зависимости уже установлены в активном venv, например `night_3_11`, и
+доступа к PyPI нет или он нестабилен, не запускайте `uv sync`. Запускайте
+приложение напрямую из активного окружения:
+
+```bash
+cd ~/strmlt
+python -c "import streamlit, pandas, clickhouse_connect; print('dependencies OK')"
+export PYTHONPATH="$PWD/src"
+python -m streamlit run src/csv_click/app.py --server.address 0.0.0.0 --server.port 8501
+```
+
+Альтернатива через `uv`, если нужно использовать именно активный venv и не
+синхронизировать `.venv` проекта:
+
+```bash
+cd ~/strmlt
+export PYTHONPATH="$PWD/src"
+uv run --active --no-sync streamlit run src/csv_click/app.py --server.address 0.0.0.0 --server.port 8501
+```
+
+`--active` говорит `uv` использовать текущий активированный venv, а `--no-sync`
+отключает автоматическую синхронизацию зависимостей перед запуском.
+
 Если в Jupyter terminal команда `uv` не найдена:
 
 ```bash
