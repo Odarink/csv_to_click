@@ -69,6 +69,32 @@ def iter_pandas_chunks(
         ) from exc
 
 
+def preview_csv_rows(
+    csv_path: str | Path,
+    read_options: ReadOptions,
+    nrows: int = 20,
+) -> pd.DataFrame:
+    try:
+        preview = pd.read_csv(
+            csv_path,
+            sep=read_options.separator,
+            encoding=read_options.encoding,
+            nrows=nrows,
+        )
+    except pd.errors.ParserError as exc:
+        raise CsvSchemaError(
+            "Cannot parse CSV preview with "
+            f"separator {read_options.separator!r} and encoding {read_options.encoding}: {exc}"
+        ) from exc
+    except UnicodeDecodeError as exc:
+        raise CsvSchemaError(
+            f"Cannot decode CSV preview with encoding {read_options.encoding}: {exc}. "
+            "Try cp1251 or windows-1251 for Windows Cyrillic CSV files."
+        ) from exc
+    preview.columns = preview.columns.str.strip()
+    return preview
+
+
 def analyze_csv_with_pandas_chunks(
     csv_path: str | Path,
     read_options: ReadOptions,

@@ -34,6 +34,7 @@ from csv_click.pandas_loader import (
     mappings_from_editor_rows,
     mappings_to_editor_rows,
     mappings_to_schema,
+    preview_csv_rows,
     schema_to_mappings,
     validate_csv_with_pandas_chunks,
 )
@@ -51,8 +52,6 @@ def main() -> None:
     csv_context = _render_csv_path_step()
     if not csv_context:
         return
-
-    csv_context = _render_csv_read_options_step(csv_context)
 
     mappings = _render_column_mapping_editor()
     if mappings is None:
@@ -158,10 +157,32 @@ def _render_connection_and_load_form() -> dict[str, object] | None:
             client_cert = st.text_input("Client cert path", value=settings.client_cert)
             client_key = st.text_input("Client key path", value=settings.client_key)
 
-        submitted = st.form_submit_button("Apply parameters", use_container_width=True)
+        apply_col, test_col = st.columns(2)
+        with apply_col:
+            submitted = st.form_submit_button("Apply parameters", use_container_width=True)
+        with test_col:
+            test_submitted = st.form_submit_button("Test connection", use_container_width=True)
+
+    config = ClickHouseConfig(
+        database=database,
+        cluster=cluster,
+        host=host,
+        port=int(port),
+        username=username,
+        password=password,
+        secure=secure,
+        verify=verify,
+        client_cert=client_cert,
+        client_key=client_key,
+    )
+
+    if test_submitted:
+        _test_connection(config)
 
     if not submitted and "load_params" not in st.session_state:
         return None
+    if not submitted:
+        return st.session_state["load_params"]
 
     errors = []
     if not database:
@@ -178,18 +199,6 @@ def _render_connection_and_load_form() -> dict[str, object] | None:
             st.error(error)
         return None
 
-    config = ClickHouseConfig(
-        database=database,
-        cluster=cluster,
-        host=host,
-        port=int(port),
-        username=username,
-        password=password,
-        secure=secure,
-        verify=verify,
-        client_cert=client_cert,
-        client_key=client_key,
-    )
     csv_read_options = st.session_state.get("csv_read_options", ReadOptions())
     read_options = ReadOptions(
         separator=csv_read_options.separator,
@@ -243,6 +252,10 @@ def _save_app_settings(settings: AppSettings) -> None:
 
 
 def _render_csv_path_step() -> dict[str, object] | None:
+    current_options = st.session_state.get(
+        "csv_read_options",
+        _read_options_from_settings(_get_app_settings()),
+    )
     with st.form("csv_path_form"):
         csv_col, button_col = st.columns([5, 1])
         with csv_col:
@@ -251,13 +264,46 @@ def _render_csv_path_step() -> dict[str, object] | None:
             st.write("")
             submitted = st.form_submit_button("Read CSV", use_container_width=True)
 
+        st.subheader("CSV read settings")
+        settings_left, settings_right = st.columns(2)
+        with settings_left:
+            separator_choice = st.selectbox(
+                "Separator",
+                options=[",", ";", "\\t", "|", "custom"],
+                index=_separator_index(current_options.separator),
+            )
+            custom_separator = st.text_input(
+                "Custom separator",
+                value="" if current_options.separator in {",", ";", "\t", "|"} else current_options.separator,
+            )
+        with settings_right:
+            encoding_choice = st.selectbox(
+                "Encoding",
+                options=["utf_8", "cp1251", "windows-1251", "utf-8-sig", "custom"],
+                index=_encoding_index(current_options.encoding),
+            )
+            custom_encoding = st.text_input(
+                "Custom encoding",
+                value="" if current_options.encoding in {"utf_8", "cp1251", "windows-1251", "utf-8-sig"} else current_options.encoding,
+            )
+
     if submitted:
-        _apply_csv_path(csv_path)
+        read_options = _read_options_from_form(
+            separator_choice=separator_choice,
+            custom_separator=custom_separator,
+            encoding_choice=encoding_choice,
+            custom_encoding=custom_encoding,
+            current_options=current_options,
+        )
+        if read_options is not None:
+            st.session_state["csv_read_options"] = read_options
+            _apply_csv_path(csv_path, read_options)
 
     if "csv_path" not in st.session_state:
         return None
 
     st.caption(f"CSV path: `{st.session_state['csv_path']}`")
+    _render_csv_preview()
     return {
         "csv_path": st.session_state["csv_path"],
         "read_options": st.session_state.get(
@@ -267,62 +313,36 @@ def _render_csv_path_step() -> dict[str, object] | None:
     }
 
 
-def _render_csv_read_options_step(csv_context: dict[str, object]) -> dict[str, object]:
-    read_options = csv_context["read_options"]
-    with st.expander("CSV read settings"):
-        with st.form("csv_read_options_form"):
-            separator_choice = st.selectbox(
-                "Separator",
-                options=[",", ";", "\\t", "|", "custom"],
-                index=_separator_index(read_options.separator),
-            )
-            custom_separator = st.text_input(
-                "Custom separator",
-                value="" if read_options.separator in {",", ";", "\t", "|"} else read_options.separator,
-            )
-            encoding_choice = st.selectbox(
-                "Encoding",
-                options=["utf_8", "cp1251", "windows-1251", "utf-8-sig", "custom"],
-                index=_encoding_index(read_options.encoding),
-            )
-            custom_encoding = st.text_input(
-                "Custom encoding",
-                value="" if read_options.encoding in {"utf_8", "cp1251", "windows-1251", "utf-8-sig"} else read_options.encoding,
-            )
-            submitted = st.form_submit_button("Re-read CSV", use_container_width=True)
-
-    if not submitted:
-        return csv_context
-
+def _read_options_from_form(
+    *,
+    separator_choice: str,
+    custom_separator: str,
+    encoding_choice: str,
+    custom_encoding: str,
+    current_options: ReadOptions,
+) -> ReadOptions | None:
     separator = custom_separator if separator_choice == "custom" else separator_choice
     separator = "\t" if separator == "\\t" else separator
     encoding = custom_encoding if encoding_choice == "custom" else encoding_choice
     if not separator:
         st.error("Separator is required")
-        return csv_context
+        return None
     if not encoding:
         st.error("Encoding is required")
-        return csv_context
-
-    st.session_state["csv_read_options"] = ReadOptions(
+        return None
+    return ReadOptions(
         separator=separator,
         encoding=encoding,
-        batch_size=read_options.batch_size,
+        batch_size=current_options.batch_size,
     )
-    for key in [
-        "schema_rows",
-        "mapping_rows",
-        "type_rows",
-        "mapping_confirmed",
-        "types_confirmed",
-        "load_params",
-    ]:
-        st.session_state.pop(key, None)
-    _analyze_csv(str(csv_context["csv_path"]), st.session_state["csv_read_options"])
-    return {
-        "csv_path": csv_context["csv_path"],
-        "read_options": st.session_state["csv_read_options"],
-    }
+
+
+def _render_csv_preview() -> None:
+    preview = st.session_state.get("csv_preview_rows")
+    if preview is None:
+        return
+    st.subheader("CSV preview")
+    st.dataframe(preview, hide_index=True, use_container_width=True)
 
 
 def _separator_index(separator: str) -> int:
@@ -336,7 +356,7 @@ def _encoding_index(encoding: str) -> int:
     return options.index(encoding) if encoding in options else options.index("custom")
 
 
-def _apply_csv_path(csv_path: str) -> None:
+def _apply_csv_path(csv_path: str, read_options: ReadOptions) -> None:
     if not csv_path:
         st.error("CSV path is required")
         return
@@ -345,7 +365,7 @@ def _apply_csv_path(csv_path: str) -> None:
         return
 
     st.session_state["csv_path"] = csv_path
-    st.session_state["csv_read_options"] = _read_options_from_settings(_get_app_settings())
+    st.session_state["csv_read_options"] = read_options
     for key in [
         "schema_rows",
         "mapping_rows",
@@ -353,9 +373,10 @@ def _apply_csv_path(csv_path: str) -> None:
         "mapping_confirmed",
         "types_confirmed",
         "load_params",
+        "csv_preview_rows",
     ]:
         st.session_state.pop(key, None)
-    _analyze_csv(csv_path, st.session_state["csv_read_options"])
+    _analyze_csv(csv_path, read_options)
 
 
 def _read_options_from_settings(settings: AppSettings) -> ReadOptions:
@@ -382,12 +403,14 @@ def _analyze_csv(csv_path: str, read_options: ReadOptions) -> None:
     try:
         with st.spinner("Scanning CSV chunks to infer schema..."):
             schema = analyze_csv_with_pandas_chunks(csv_path, read_options)
+            preview = preview_csv_rows(csv_path, read_options, nrows=20)
     except CsvSchemaError as exc:
         st.error(f"CSV schema error: {exc}")
         return
 
     st.session_state["schema_rows"] = mappings_to_editor_rows(schema_to_mappings(schema))
     st.session_state["mapping_rows"] = _schema_rows_to_mapping_rows(st.session_state["schema_rows"])
+    st.session_state["csv_preview_rows"] = preview
     st.success(f"Schema inferred for {len(schema.columns)} columns")
 
 

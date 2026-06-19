@@ -15,6 +15,7 @@ from csv_click.pandas_loader import (
     load_csv_via_raw_insert,
     mappings_from_editor_rows,
     mappings_to_schema,
+    preview_csv_rows,
 )
 
 
@@ -44,6 +45,17 @@ def test_iter_pandas_chunks_uses_selected_separator_and_encoding(tmp_path: Path)
     assert len(chunks) == 1
     assert chunks[0].columns.tolist() == ["ID", "NAME"]
     assert chunks[0].iloc[0].to_dict() == {"ID": 1, "NAME": "тест"}
+
+
+def test_preview_csv_rows_uses_selected_separator_and_encoding(tmp_path: Path) -> None:
+    csv_path = tmp_path / "preview_cp1251.csv"
+    csv_path.write_text("ID;NAME\n1;тест\n", encoding="cp1251")
+    options = ReadOptions(separator=";", encoding="cp1251", batch_size=1)
+
+    preview = preview_csv_rows(csv_path, options, nrows=20)
+
+    assert preview.columns.tolist() == ["ID", "NAME"]
+    assert preview.iloc[0].to_dict() == {"ID": 1, "NAME": "тест"}
 
 
 def test_analyze_csv_with_pandas_chunks_strips_and_normalizes_target_names(tmp_path: Path) -> None:
