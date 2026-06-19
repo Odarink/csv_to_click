@@ -21,6 +21,24 @@ ClickHouse: локальную `ReplicatedMergeTree` и распределенн
 
 ## Быстрый запуск
 
+Если в Jupyter terminal команда `uv` не найдена:
+
+```bash
+curl -LsSf https://astral.sh/uv/install.sh | sh
+export PATH="$HOME/.local/bin:$PATH"
+uv --version
+```
+
+Если `curl` недоступен, используйте `wget`:
+
+```bash
+wget -qO- https://astral.sh/uv/install.sh | sh
+export PATH="$HOME/.local/bin:$PATH"
+uv --version
+```
+
+После установки можно продолжать запуск из директории репозитория.
+
 Установить зависимости:
 
 ```bash
