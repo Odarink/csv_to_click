@@ -1,0 +1,15 @@
+.env
+*.env
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+.vscode/
+.idea/
+.DS_Store
+node_modules/
+.venv/
+venv/
+dist/
+build/
+*.log
+EOF

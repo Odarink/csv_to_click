@@ -1,0 +1,4 @@
+interface:
+  display_name: "ClickHouse Architect"
+  short_description: "Design and tune ClickHouse workloads"
+  default_prompt: "Use $clickhouse-architect to review this ClickHouse schema or query and propose evidence-based improvements."
