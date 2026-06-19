@@ -18,10 +18,8 @@ from csv_click.clickhouse import (
     build_table_names,
     create_tables,
     get_client,
-    insert_batch,
     test_connection,
 )
-from csv_click.csv_reader import iter_csv_batches
 from csv_click.errors import (
     CertificateError,
     ClickHouseConnectionError,
@@ -29,13 +27,19 @@ from csv_click.errors import (
     CsvSchemaError,
     ExistingTableError,
 )
+from csv_click.pandas_loader import (
+    ReadOptions,
+    analyze_csv_with_pandas_chunks,
+    load_csv_via_raw_insert,
+    mappings_from_editor_rows,
+    mappings_to_editor_rows,
+    mappings_to_schema,
+    schema_to_mappings,
+    validate_csv_with_pandas_chunks,
+)
 from csv_click.schema import (
     CLICKHOUSE_TYPE_OPTIONS,
     CsvSchema,
-    analyze_csv_schema,
-    schema_from_editor_rows,
-    schema_to_editor_rows,
-    validate_csv_against_schema,
 )
 
 
@@ -49,7 +53,7 @@ def main() -> None:
 
     config = params["config"]
     csv_path = params["csv_path"]
-    delimiter = params["delimiter"]
+    read_options = params["read_options"]
     distributed_table = params["distributed_table"]
     table_names = build_table_names(distributed_table)
 
@@ -62,7 +66,7 @@ def main() -> None:
 
     with col_analyze:
         if st.button("Analyze CSV", type="primary", use_container_width=True):
-            _analyze_csv(csv_path, delimiter)
+            _analyze_csv(csv_path, read_options)
 
     schema = _render_schema_editor()
     if schema is None:
@@ -81,6 +85,7 @@ def main() -> None:
         distributed_table=table_names.distributed,
         local_table=table_names.local,
         cluster=config.cluster,
+        sharding_key=params["sharding_key"],
     )
 
     if st.button("Preview DDL", use_container_width=True):
@@ -93,12 +98,14 @@ def main() -> None:
         _create_and_load(
             config=config,
             csv_path=csv_path,
-            delimiter=delimiter,
+            read_options=read_options,
             schema=schema,
             distributed_table=distributed_table,
             order_by=params["order_by"],
             partition_by=params["partition_by"],
             batch_size=params["batch_size"],
+            strict_preflight=params["strict_preflight"],
+            sharding_key=params["sharding_key"],
         )
 
 
@@ -113,8 +120,16 @@ def _render_connection_and_load_form() -> dict[str, object] | None:
             cluster = st.text_input("Cluster", value="clickhouse")
             order_by = st.text_input("ORDER BY")
             partition_by = st.text_input("PARTITION BY (optional)")
+            sharding_key = st.text_input("Distributed sharding key", value="rand()")
             batch_size = st.number_input("Batch size", min_value=1, value=1_000_000, step=10_000)
-            delimiter = st.text_input("Delimiter (optional)", value="")
+            separator_choice = st.selectbox("Separator", options=[",", ";", "\\t", "|", "custom"])
+            custom_separator = st.text_input("Custom separator", value="")
+            encoding_choice = st.selectbox(
+                "Encoding",
+                options=["utf_8", "cp1251", "windows-1251", "utf-8-sig", "custom"],
+            )
+            custom_encoding = st.text_input("Custom encoding", value="")
+            strict_preflight = st.checkbox("Strict preflight validation", value=True)
         with right:
             host = st.text_input("Host", value=DEFAULT_HOST)
             port = st.number_input("Port", min_value=1, max_value=65535, value=DEFAULT_PORT)
@@ -163,13 +178,29 @@ def _render_connection_and_load_form() -> dict[str, object] | None:
         client_cert=client_cert,
         client_key=client_key,
     )
+    separator = custom_separator if separator_choice == "custom" else separator_choice
+    separator = "\t" if separator == "\\t" else separator
+    encoding = custom_encoding if encoding_choice == "custom" else encoding_choice
+    if not separator:
+        st.error("Separator is required")
+        return None
+    if not encoding:
+        st.error("Encoding is required")
+        return None
+    read_options = ReadOptions(
+        separator=separator,
+        encoding=encoding,
+        batch_size=int(batch_size),
+    )
     params = {
         "csv_path": csv_path,
-        "delimiter": delimiter or None,
+        "read_options": read_options,
         "distributed_table": distributed_table,
         "order_by": order_by,
         "partition_by": partition_by or None,
+        "sharding_key": sharding_key or "rand()",
         "batch_size": int(batch_size),
+        "strict_preflight": strict_preflight,
         "config": config,
     }
     st.session_state["load_params"] = params
@@ -188,15 +219,15 @@ def _test_connection(config: ClickHouseConfig) -> None:
         st.success("Connection OK")
 
 
-def _analyze_csv(csv_path: str, delimiter: str | None) -> None:
+def _analyze_csv(csv_path: str, read_options: ReadOptions) -> None:
     try:
-        with st.spinner("Scanning full CSV to infer schema..."):
-            schema = analyze_csv_schema(csv_path, delimiter)
+        with st.spinner("Scanning CSV chunks to infer schema..."):
+            schema = analyze_csv_with_pandas_chunks(csv_path, read_options)
     except CsvSchemaError as exc:
         st.error(f"CSV schema error: {exc}")
         return
 
-    st.session_state["schema_rows"] = schema_to_editor_rows(schema)
+    st.session_state["schema_rows"] = mappings_to_editor_rows(schema_to_mappings(schema))
     st.success(f"Schema inferred for {len(schema.columns)} columns")
 
 
@@ -211,8 +242,9 @@ def _render_schema_editor() -> CsvSchema | None:
         pd.DataFrame(rows),
         hide_index=True,
         use_container_width=True,
-        disabled=["column_name", "source_name", "inferred_type", "sample_values", "notes"],
+        disabled=["source_name", "inferred_type", "sample_values", "notes"],
         column_config={
+            "include": st.column_config.CheckboxColumn("include"),
             "final_type": st.column_config.SelectboxColumn(
                 "final_type",
                 options=CLICKHOUSE_TYPE_OPTIONS,
@@ -225,7 +257,7 @@ def _render_schema_editor() -> CsvSchema | None:
     edited_rows = edited.to_dict(orient="records")
     st.session_state["schema_rows"] = edited_rows
     try:
-        return schema_from_editor_rows(edited_rows)
+        return mappings_to_schema(mappings_from_editor_rows(edited_rows))
     except CsvSchemaError as exc:
         st.error(f"Schema editor error: {exc}")
         return None
@@ -234,12 +266,14 @@ def _render_schema_editor() -> CsvSchema | None:
 def _create_and_load(
     config: ClickHouseConfig,
     csv_path: str,
-    delimiter: str | None,
+    read_options: ReadOptions,
     schema: CsvSchema,
     distributed_table: str,
     order_by: str,
     partition_by: str | None,
     batch_size: int,
+    strict_preflight: bool,
+    sharding_key: str,
 ) -> None:
     progress = st.progress(0)
     status = st.empty()
@@ -248,8 +282,11 @@ def _create_and_load(
     inserted_rows = 0
 
     try:
-        status.info("Validating CSV against selected types...")
-        total_rows = validate_csv_against_schema(csv_path, schema, delimiter)
+        mappings = mappings_from_editor_rows(st.session_state["schema_rows"])
+        total_rows = 0
+        if strict_preflight:
+            status.info("Validating CSV chunks against selected types...")
+            total_rows = validate_csv_with_pandas_chunks(csv_path, read_options, mappings)
 
         status.info("Connecting to ClickHouse...")
         client = get_client(config)
@@ -263,17 +300,28 @@ def _create_and_load(
             distributed_table=distributed_table,
             order_by=order_by,
             partition_by=partition_by,
+            sharding_key=sharding_key,
         )
 
-        status.info("Loading CSV batches...")
-        batch_number = 0
-        for batch in iter_csv_batches(csv_path, schema, batch_size, delimiter):
-            batch_number += 1
-            insert_batch(client, config, distributed_table, schema, batch)
-            inserted_rows += len(batch)
-            progress.progress(min(1.0, inserted_rows / total_rows if total_rows else 1.0))
+        status.info("Loading CSV chunks through JSONEachRow...")
+
+        def on_progress(batch_number: int, batch_rows: int, rows_total: int) -> None:
+            nonlocal inserted_rows
+            inserted_rows = rows_total
+            if total_rows:
+                progress.progress(min(1.0, inserted_rows / total_rows))
             metrics.metric("Inserted rows", inserted_rows)
-            status.info(f"Loaded batch {batch_number}: {len(batch)} rows")
+            status.info(f"Loaded chunk {batch_number}: {batch_rows} rows")
+
+        inserted_rows = load_csv_via_raw_insert(
+            client=client,
+            csv_path=csv_path,
+            read_options=read_options,
+            database=config.database,
+            table=distributed_table,
+            mappings=mappings,
+            progress_callback=on_progress,
+        )
 
         progress.progress(1.0)
         elapsed = time.time() - start

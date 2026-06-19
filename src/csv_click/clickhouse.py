@@ -26,6 +26,9 @@ class ClickHouseClient(Protocol):
     def insert(self, table: str, data, column_names: list[str], database: str):
         ...
 
+    def raw_insert(self, **kwargs):
+        ...
+
 
 @dataclass
 class ClickHouseConfig:
@@ -145,14 +148,16 @@ def build_create_distributed_table_sql(
     distributed_table: str,
     local_table: str,
     cluster: str,
+    sharding_key: str = "rand()",
 ) -> str:
     database = quote_identifier(database)
     distributed_table = quote_identifier(distributed_table)
     local_table = quote_identifier(local_table)
     cluster = quote_identifier(cluster)
+    sharding_key = sharding_key.strip() or "rand()"
     return f"""CREATE TABLE {database}.{distributed_table} ON CLUSTER '{cluster}'
 AS {database}.{local_table}
-ENGINE = Distributed('{cluster}', '{database}', '{local_table}', rand())"""
+ENGINE = Distributed('{cluster}', '{database}', '{local_table}', {sharding_key})"""
 
 
 def create_tables(
@@ -162,6 +167,7 @@ def create_tables(
     distributed_table: str,
     order_by: str,
     partition_by: str | None = None,
+    sharding_key: str = "rand()",
 ) -> TableNames:
     names = build_table_names(distributed_table)
     ensure_tables_do_not_exist(client, config, names.distributed, names.local)
@@ -181,6 +187,7 @@ def create_tables(
             distributed_table=names.distributed,
             local_table=names.local,
             cluster=config.cluster,
+            sharding_key=sharding_key,
         )
     )
     return names
@@ -198,6 +205,21 @@ def insert_batch(
         data=rows,
         column_names=schema.column_names,
         database=config.database,
+    )
+
+
+def raw_insert_batch(
+    client: ClickHouseClient,
+    database: str,
+    table: str,
+    column_names: list[str],
+    payload: bytes,
+) -> None:
+    client.raw_insert(
+        table=f"{quote_identifier(database)}.{quote_identifier(table)}",
+        column_names=column_names,
+        insert_block=payload,
+        fmt="JSONEachRow",
     )
 
 

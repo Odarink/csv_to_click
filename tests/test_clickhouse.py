@@ -7,6 +7,7 @@ from csv_click.clickhouse import (
     build_table_names,
     ensure_tables_do_not_exist,
     quote_identifier,
+    raw_insert_batch,
 )
 from csv_click.errors import CertificateError
 from csv_click.schema import CsvColumn, CsvSchema
@@ -20,6 +21,9 @@ class FakeClient:
     def query(self, sql):
         self.queries.append(sql)
         return type("Result", (), {"result_rows": self.rows})()
+
+    def raw_insert(self, **kwargs):
+        self.raw_insert_kwargs = kwargs
 
 
 def sample_schema() -> CsvSchema:
@@ -76,11 +80,12 @@ def test_build_distributed_ddl_uses_local_table() -> None:
         distributed_table="orders",
         local_table="orders_local",
         cluster="clickhouse",
+        sharding_key="sipHash64(ID)",
     )
 
     assert "CREATE TABLE sandbox.orders ON CLUSTER 'clickhouse'" in sql
     assert "AS sandbox.orders_local" in sql
-    assert "Distributed('clickhouse', 'sandbox', 'orders_local', rand())" in sql
+    assert "Distributed('clickhouse', 'sandbox', 'orders_local', sipHash64(ID))" in sql
 
 
 def test_existing_table_check_blocks_create_load() -> None:
@@ -118,3 +123,22 @@ def test_validate_certificate_files_reports_missing_certificates(tmp_path) -> No
         assert str(missing_key) in str(exc)
     else:
         raise AssertionError("Expected CertificateError")
+
+
+def test_raw_insert_batch_uses_json_each_row() -> None:
+    client = FakeClient([])
+
+    raw_insert_batch(
+        client=client,
+        database="sandbox",
+        table="target_table",
+        column_names=["ID"],
+        payload=b'{"ID":1}',
+    )
+
+    assert client.raw_insert_kwargs == {
+        "table": "sandbox.target_table",
+        "column_names": ["ID"],
+        "insert_block": b'{"ID":1}',
+        "fmt": "JSONEachRow",
+    }
