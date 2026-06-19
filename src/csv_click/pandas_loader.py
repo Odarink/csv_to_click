@@ -144,6 +144,12 @@ def choose_read_options_for_preview(
         if first_error is not None:
             raise first_error
         raise CsvSchemaError("Cannot decode CSV preview with configured encodings")
+    if best_score:
+        raise CsvSchemaError(
+            "CSV preview still contains replacement characters or mojibake after trying "
+            + ", ".join(candidates)
+            + ". The source file is likely already corrupted or was exported with a wrong encoding."
+        )
 
     warning = detect_mojibake(best_preview)
     if best_options.encoding != read_options.encoding:

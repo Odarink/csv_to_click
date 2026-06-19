@@ -91,30 +91,24 @@ def test_detect_mojibake_catches_replacement_character_mojibake() -> None:
 
 
 def test_choose_read_options_prefers_encoding_with_lower_mojibake_score(tmp_path: Path) -> None:
-    csv_path = tmp_path / "utf8_with_replacement.csv"
-    csv_path.write_text("ID;NAME\n1;��� тест\n", encoding="utf_8")
+    csv_path = tmp_path / "utf8.csv"
+    csv_path.write_text("ID;NAME\n1;тест\n", encoding="utf_8")
     selected_options = ReadOptions(separator=";", encoding="cp1251", batch_size=1)
 
     effective_options, preview, warning = choose_read_options_for_preview(csv_path, selected_options)
 
     assert effective_options.encoding == "utf_8"
-    assert preview.iloc[0].to_dict() == {"ID": "1", "NAME": "��� тест"}
+    assert preview.iloc[0].to_dict() == {"ID": "1", "NAME": "тест"}
     assert warning is not None
     assert "Auto-selected encoding utf_8" in warning.message
 
 
-def test_choose_read_options_recovers_real_cp1251_csv_from_utf8_default() -> None:
+def test_choose_read_options_rejects_real_csv_with_replacement_characters() -> None:
     csv_path = Path("tests/test_csv.csv")
     selected_options = ReadOptions(separator=";", encoding="utf_8", batch_size=1)
 
-    effective_options, preview, warning = choose_read_options_for_preview(csv_path, selected_options)
-
-    assert effective_options.encoding in {"cp1251", "windows-1251"}
-    assert preview.iloc[0]["C_NAME"] == "Гашение"
-    assert preview.iloc[0]["C_CODE"] == "ГАШЕНИЕ_SALE_DEBT"
-    assert "пїЅ" not in preview.to_string()
-    assert warning is not None
-    assert "Auto-selected encoding" in warning.message
+    with pytest.raises(CsvSchemaError, match="replacement characters"):
+        choose_read_options_for_preview(csv_path, selected_options)
 
 
 def test_analyze_csv_with_pandas_chunks_strips_and_normalizes_target_names(tmp_path: Path) -> None:
