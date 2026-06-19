@@ -1,3 +1,10 @@
+from datetime import datetime, timedelta, timezone
+import sys
+from types import SimpleNamespace
+
+import pytest
+
+import csv_click.clickhouse as clickhouse
 from csv_click.clickhouse import (
     ClickHouseConfig,
     ExistingTableError,
@@ -7,6 +14,7 @@ from csv_click.clickhouse import (
     build_create_local_table_sql,
     build_table_names,
     ensure_tables_do_not_exist,
+    get_client,
     quote_identifier,
     raw_insert_batch,
 )
@@ -148,6 +156,46 @@ def test_validate_certificate_files_reports_missing_certificates(tmp_path) -> No
         assert str(missing_key) in str(exc)
     else:
         raise AssertionError("Expected CertificateError")
+
+
+def test_validate_certificate_files_reports_expired_client_certificate(tmp_path, monkeypatch) -> None:
+    cert = tmp_path / "client.crt"
+    key = tmp_path / "client.key"
+    cert.write_text("expired cert", encoding="utf-8")
+    key.write_text("client key", encoding="utf-8")
+    expires_at = datetime.now(timezone.utc) - timedelta(minutes=1)
+    monkeypatch.setattr(clickhouse, "_certificate_expires_at", lambda path: expires_at)
+    config = ClickHouseConfig(client_cert=str(cert), client_key=str(key))
+
+    with pytest.raises(CertificateError) as exc_info:
+        _validate_certificate_files(config)
+
+    message = str(exc_info.value)
+    assert "client certificate is expired" in message
+    assert str(cert) in message
+    assert str(key) in message
+
+
+def test_get_client_does_not_pass_client_cert_when_connection_is_insecure(monkeypatch) -> None:
+    captured_kwargs = {}
+
+    def fake_get_client(**kwargs):
+        captured_kwargs.update(kwargs)
+        return object()
+
+    fake_module = SimpleNamespace(get_client=fake_get_client)
+    monkeypatch.setitem(sys.modules, "clickhouse_connect", fake_module)
+
+    get_client(
+        ClickHouseConfig(
+            secure=False,
+            client_cert="/tmp/expired.crt",
+            client_key="/tmp/expired.key",
+        )
+    )
+
+    assert "client_cert" not in captured_kwargs
+    assert "client_cert_key" not in captured_kwargs
 
 
 def test_format_connection_error_explains_expired_client_certificate() -> None:

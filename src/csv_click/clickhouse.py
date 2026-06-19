@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import re
+import ssl
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Protocol
 
@@ -66,18 +68,21 @@ def get_client(config: ClickHouseConfig):
     try:
         import clickhouse_connect
 
-        return clickhouse_connect.get_client(
-            host=config.host,
-            port=config.port,
-            username=config.username,
-            password=config.password or None,
-            secure=config.secure,
-            verify=config.verify,
-            client_cert=config.client_cert,
-            client_cert_key=config.client_key,
-            connect_timeout=60,
-            send_receive_timeout=1800,
-        )
+        kwargs = {
+            "host": config.host,
+            "port": config.port,
+            "username": config.username,
+            "password": config.password or None,
+            "secure": config.secure,
+            "verify": config.verify,
+            "connect_timeout": 60,
+            "send_receive_timeout": 1800,
+        }
+        if config.secure:
+            kwargs["client_cert"] = config.client_cert
+            kwargs["client_cert_key"] = config.client_key
+
+        return clickhouse_connect.get_client(**kwargs)
     except CertificateError:
         raise
     except Exception as exc:
@@ -246,6 +251,27 @@ def _validate_certificate_files(config: ClickHouseConfig) -> None:
     ]
     if missing:
         raise CertificateError("ClickHouse certificate file is missing: " + ", ".join(missing))
+    if config.client_cert:
+        expires_at = _certificate_expires_at(config.client_cert)
+        if expires_at <= datetime.now(timezone.utc):
+            raise CertificateError(
+                "ClickHouse client certificate is expired: "
+                f"{config.client_cert} expired at {expires_at.isoformat()}. "
+                f"Current client_key={config.client_key}. "
+                "Update the cert/key paths in the UI or renew the client certificate."
+            )
+
+
+def _certificate_expires_at(cert_path: str) -> datetime:
+    try:
+        decoded = ssl._ssl._test_decode_cert(str(Path(cert_path)))  # noqa: SLF001
+        not_after = decoded["notAfter"]
+        expires_at = ssl.cert_time_to_seconds(not_after)
+    except Exception as exc:
+        raise CertificateError(
+            f"Cannot read ClickHouse client certificate expiration from {cert_path}: {exc}"
+        ) from exc
+    return datetime.fromtimestamp(expires_at, tz=timezone.utc)
 
 
 def _format_connection_error(config: ClickHouseConfig, exc: Exception) -> str:
