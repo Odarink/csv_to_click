@@ -178,6 +178,30 @@ def test_csv_path_step_renders_read_settings_before_first_analysis() -> None:
     assert "st.session_state[\"csv_read_options\"] = read_options" in csv_path_step_source
 
 
+def test_app_renders_inline_help_for_each_ui_step() -> None:
+    source = Path("src/csv_click/app.py").read_text(encoding="utf-8")
+
+    expected_help_texts = [
+        "Как указать CSV файл",
+        r"C:\Users\<user>\Downloads\data.csv",
+        "/home/jovyan/data/data.csv",
+        "Как настроить колонки",
+        "target_name станет именем колонки в ClickHouse",
+        "Как проверить типы",
+        "custom_type переопределяет final_type",
+        "Decimal(18, 2)",
+        "Как заполнить параметры ClickHouse",
+        "для my_table будет создана локальная таблица my_table_local",
+        "ORDER BY = customer_id",
+        "Порядок финальных действий",
+        "Preview DDL только показывает SQL",
+        "если distributed или local таблица уже существует",
+    ]
+
+    for text in expected_help_texts:
+        assert text in source
+
+
 def test_apply_csv_path_does_not_reset_selected_read_options() -> None:
     source = Path("src/csv_click/app.py").read_text(encoding="utf-8")
     match = re.search(

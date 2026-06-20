@@ -99,6 +99,7 @@ def main() -> None:
         st.error(f"DDL parameter error: {exc}")
         return
 
+    _render_final_actions_help()
 
     if st.button("Preview DDL", use_container_width=True):
         st.subheader("Local table DDL")
@@ -121,11 +122,117 @@ def main() -> None:
         )
 
 
+def _render_step_help(title: str, body: str) -> None:
+    with st.expander(title, expanded=False):
+        st.markdown(body)
+
+
+def _render_csv_path_help() -> None:
+    _render_step_help(
+        "Как указать CSV файл",
+        r"""
+Укажите путь к CSV файлу на той машине, где запущен Streamlit. Если приложение
+запущено на сервере или в JupyterHub, путь должен быть серверным, а не путем с
+вашего локального компьютера.
+
+Примеры:
+
+- Windows: `C:\Users\<user>\Downloads\data.csv`
+- Linux/JupyterHub: `/home/jovyan/data/data.csv`
+
+`Separator` задает разделитель колонок: `,`, `;`, `\t`, `|` или свое значение
+через `custom`. `Encoding` задает кодировку файла: обычно `utf_8`, для русских
+CSV из Windows часто подходит `cp1251` или `windows-1251`.
+
+После `Read CSV` приложение прочитает preview, подберет эффективные настройки
+чтения и определит начальную схему колонок.
+""",
+    )
+
+
+def _render_column_mapping_help() -> None:
+    _render_step_help(
+        "Как настроить колонки",
+        """
+Проверьте, какие колонки из CSV попадут в ClickHouse:
+
+- `source_name` - исходное имя колонки в CSV;
+- target_name станет именем колонки в ClickHouse;
+- `include` определяет, загружать колонку или исключить ее.
+
+Пустые `target_name` и дублирующиеся целевые имена не допускаются. После проверки
+нажмите `Apply column mapping`, чтобы перейти к типам.
+""",
+    )
+
+
+def _render_type_review_help() -> None:
+    _render_step_help(
+        "Как проверить типы",
+        """
+Проверьте типы перед созданием таблицы:
+
+- `inferred_type` - тип, который приложение определило по CSV;
+- `final_type` - итоговый тип ClickHouse для загрузки;
+- custom_type переопределяет final_type, если поле заполнено;
+- `nullable` оборачивает тип в `Nullable(...)`;
+- `sample_values` помогает сверить тип с реальными значениями.
+
+Примеры: `Decimal(18, 2)` для денежных сумм, `Nullable(DateTime)` для дат и
+времени с пропусками.
+""",
+    )
+
+
+def _render_clickhouse_params_help() -> None:
+    _render_step_help(
+        "Как заполнить параметры ClickHouse",
+        """
+Заполните параметры целевой таблицы и подключения:
+
+- `Database` - база ClickHouse, куда будет создана таблица;
+- `Distributed table name` - имя распределенной таблицы;
+- `Cluster` - кластер для `ON CLUSTER`;
+- для my_table будет создана локальная таблица my_table_local;
+- `ORDER BY` - ключ сортировки локальной `ReplicatedMergeTree`;
+- `PARTITION BY` - необязательное выражение партиционирования;
+- `Distributed sharding key` - колонка для `sipHash64(...)` в `Distributed`;
+- `Batch size` - размер CSV чанка при проверке и загрузке;
+- `Strict preflight validation` заранее проверяет конвертацию CSV в выбранные
+  типы ClickHouse.
+
+Пример: ORDER BY = customer_id, `PARTITION BY = toYYYYMM(dt)`,
+`sharding key = customer_id`.
+""",
+    )
+
+
+def _render_final_actions_help() -> None:
+    _render_step_help(
+        "Порядок финальных действий",
+        """
+Рекомендуемый порядок:
+
+1. Нажмите `Test connection`, чтобы проверить подключение через `SELECT 1`.
+2. Нажмите `Preview DDL`, если нужно посмотреть SQL перед созданием таблиц.
+3. Нажмите `Create tables and load`, чтобы создать таблицы и загрузить CSV.
+
+Preview DDL только показывает SQL и ничего не создает. `Create tables and load`
+создает local и distributed таблицы, затем загружает CSV чанками через
+`JSONEachRow`.
+
+Загрузка блокируется, если distributed или local таблица уже существует. Для
+`my_table` проверяются `my_table` и `my_table_local`.
+""",
+    )
+
+
 def _render_connection_and_load_form(schema: CsvSchema) -> dict[str, object] | None:
     settings = _get_app_settings()
     target_names = _schema_target_names(schema)
     with st.form("load_params_form"):
         st.subheader("ClickHouse and load parameters")
+        _render_clickhouse_params_help()
         left, right = st.columns(2)
         with left:
             database = st.text_input("Database", value=settings.database)
@@ -260,6 +367,7 @@ def _render_csv_path_step() -> dict[str, object] | None:
         "csv_read_options",
         _read_options_from_settings(_get_app_settings()),
     )
+    _render_csv_path_help()
     with st.form("csv_path_form"):
         csv_col, button_col = st.columns([5, 1])
         with csv_col:
@@ -438,6 +546,7 @@ def _render_column_mapping_editor() -> list[dict[str, object]] | None:
         return None
 
     st.subheader("Column mapping")
+    _render_column_mapping_help()
     mapping_rows = st.session_state.get("mapping_rows") or _schema_rows_to_mapping_rows(schema_rows)
     edited = st.data_editor(
         pd.DataFrame(mapping_rows),
@@ -477,6 +586,7 @@ def _render_type_editor() -> CsvSchema | None:
         return None
 
     st.subheader("Type review")
+    _render_type_review_help()
     edited = st.data_editor(
         pd.DataFrame(rows),
         hide_index=True,
