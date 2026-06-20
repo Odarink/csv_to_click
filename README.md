@@ -27,13 +27,40 @@ ClickHouse: локальную `ReplicatedMergeTree` и распределенн
 
 ```cmd
 cd C:\path\to\csv_to_click
+py -0p
+```
+
+Команда `py -0p` покажет установленные версии Python. Для проекта нужен Python
+3.11 или новее. Создайте venv через установленную подходящую версию, например:
+
+```cmd
+py -3.12 -m venv .venv
+```
+
+Если в списке есть только Python 3.11, используйте:
+
+```cmd
 py -3.11 -m venv .venv
+```
+
+Если `py -0p` не показывает Python 3.11+, установите Python 3.12, заново
+откройте `cmd.exe` и повторите проверку:
+
+```cmd
+winget install -e --id Python.Python.3.12
+py -0p
 ```
 
 Активируйте окружение:
 
 ```cmd
 .venv\Scripts\activate.bat
+```
+
+Проверьте версию Python внутри активированного окружения:
+
+```cmd
+python --version
 ```
 
 Обновите `pip` и установите зависимости:
