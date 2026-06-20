@@ -11,73 +11,80 @@ ClickHouse: локальную `ReplicatedMergeTree` и распределенн
 ## Требования
 
 - Python 3.11+
-- `uv`
 - доступ к ClickHouse
 - CSV-файл должен лежать на той машине, где запущен Streamlit
 - CSV должен содержать строку заголовков
 - для secure-подключения нужны клиентские сертификат и ключ
 
-Зависимости описаны в `pyproject.toml` и фиксируются через `uv.lock`.
+Для локального запуска на Windows runtime-зависимости устанавливаются из
+`requirements.txt`. `pyproject.toml` и `uv.lock` сохранены для разработки и
+альтернативного запуска через `uv`.
 
-## Быстрый запуск
+## Локальный запуск на Windows через cmd
 
-Если зависимости уже установлены в активном venv, например `night_3_11`, и
-доступа к PyPI нет или он нестабилен, не запускайте `uv sync`. Запускайте
-приложение напрямую из активного окружения:
+Откройте `cmd.exe`, перейдите в директорию проекта и создайте виртуальное
+окружение:
 
-```bash
-cd ~/strmlt
+```cmd
+cd C:\path\to\csv_to_click
+py -3.11 -m venv .venv
+```
+
+Активируйте окружение:
+
+```cmd
+.venv\Scripts\activate.bat
+```
+
+Обновите `pip` и установите зависимости:
+
+```cmd
+python -m pip install --upgrade pip
+pip install -r requirements.txt
+```
+
+Проверьте, что основные библиотеки доступны:
+
+```cmd
 python -c "import streamlit, pandas, clickhouse_connect; print('dependencies OK')"
-export PYTHONPATH="$PWD/src"
-python -m streamlit run src/csv_click/app.py --server.address 0.0.0.0 --server.port 8501
 ```
 
-Альтернатива через `uv`, если нужно использовать именно активный venv и не
-синхронизировать `.venv` проекта:
+При необходимости задайте пользователя и пароль ClickHouse:
 
-```bash
-cd ~/strmlt
-export PYTHONPATH="$PWD/src"
-uv run --active --no-sync streamlit run src/csv_click/app.py --server.address 0.0.0.0 --server.port 8501
+```cmd
+set CLICKHOUSE_USER=<user>
+set CLICKHOUSE_PASSWORD=<password>
 ```
 
-`--active` говорит `uv` использовать текущий активированный venv, а `--no-sync`
-отключает автоматическую синхронизацию зависимостей перед запуском.
+Если используется secure-подключение с клиентскими сертификатами, укажите в UI
+Windows-пути к сертификату и ключу, например:
 
-Если в Jupyter terminal команда `uv` не найдена:
-
-```bash
-curl -LsSf https://astral.sh/uv/install.sh | sh
-export PATH="$HOME/.local/bin:$PATH"
-uv --version
+```text
+C:\Users\<username>\tsh\clickhouse-prod.crt
+C:\Users\<username>\tsh\clickhouse-prod.key
 ```
 
-Если `curl` недоступен, используйте `wget`:
+Запустите приложение:
 
-```bash
-wget -qO- https://astral.sh/uv/install.sh | sh
-export PATH="$HOME/.local/bin:$PATH"
-uv --version
+```cmd
+set PYTHONPATH=%CD%\src
+python -m streamlit run src\csv_click\app.py --server.address 127.0.0.1 --server.port 8501
 ```
 
-После установки можно продолжать запуск из директории репозитория.
+Откройте приложение в браузере:
 
-Установить зависимости:
+```text
+http://localhost:8501
+```
+
+## Альтернативный запуск через uv
+
+`uv` не требуется для основного локального запуска на Windows. Его можно
+использовать для разработки, если нужно синхронизировать зависимости из
+`pyproject.toml` и `uv.lock`:
 
 ```bash
 uv sync
-```
-
-При необходимости задать пользователя и пароль ClickHouse:
-
-```bash
-export CLICKHOUSE_USER="<user>"
-export CLICKHOUSE_PASSWORD="<password>"
-```
-
-Запустить приложение:
-
-```bash
 uv run streamlit run src/csv_click/app.py --server.address 0.0.0.0 --server.port 8501
 ```
 
