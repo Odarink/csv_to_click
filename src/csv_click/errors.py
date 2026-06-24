@@ -17,3 +17,7 @@ class ExistingTableError(CsvClickError):
 class CsvSchemaError(CsvClickError):
     """Raised when CSV schema inference or type conversion fails."""
 
+
+class CsvReadCancelled(CsvClickError):
+    """Raised when the user stops CSV schema reading."""
+

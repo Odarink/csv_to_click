@@ -25,6 +25,7 @@ from csv_click.errors import (
     CertificateError,
     ClickHouseConnectionError,
     CsvClickError,
+    CsvReadCancelled,
     CsvSchemaError,
     ExistingTableError,
 )
@@ -51,6 +52,17 @@ from csv_click.settings import AppSettings, load_app_settings, save_app_settings
 SCHEMA_INFERENCE_SAMPLE = "Fast sample, 100000 rows"
 SCHEMA_INFERENCE_FULL_SCAN = "Full scan"
 SCHEMA_INFERENCE_OPTIONS = [SCHEMA_INFERENCE_SAMPLE, SCHEMA_INFERENCE_FULL_SCAN]
+CSV_READ_STATE_KEYS = [
+    "csv_path",
+    "schema_rows",
+    "mapping_rows",
+    "type_rows",
+    "mapping_confirmed",
+    "types_confirmed",
+    "load_params",
+    "csv_preview_rows",
+    "csv_preview_warning",
+]
 
 
 def main() -> None:
@@ -438,6 +450,10 @@ def _render_csv_path_step() -> dict[str, object] | None:
     if "csv_path" not in st.session_state:
         return None
 
+    if st.button("Stop read CSV / choose another file", type="secondary", use_container_width=True):
+        _request_stop_csv_read()
+        st.rerun()
+
     st.caption(f"CSV path: `{st.session_state['csv_path']}`")
     _render_csv_preview()
     return {
@@ -511,21 +527,28 @@ def _apply_csv_path(
         st.error(f"CSV path does not exist: {csv_path}")
         return
 
+    st.session_state["csv_read_cancel_requested"] = False
     st.session_state["csv_path"] = csv_path
     st.session_state["csv_read_options"] = read_options
     st.session_state["schema_analysis_mode"] = schema_analysis_mode
-    for key in [
-        "schema_rows",
-        "mapping_rows",
-        "type_rows",
-        "mapping_confirmed",
-        "types_confirmed",
-        "load_params",
-        "csv_preview_rows",
-        "csv_preview_warning",
-    ]:
-        st.session_state.pop(key, None)
+    _clear_csv_read_state(include_path=False)
     _analyze_csv(csv_path, read_options, schema_analysis_mode)
+
+
+def _clear_csv_read_state(include_path: bool = True) -> None:
+    for key in CSV_READ_STATE_KEYS:
+        if key == "csv_path" and not include_path:
+            continue
+        st.session_state.pop(key, None)
+
+
+def _request_stop_csv_read() -> None:
+    st.session_state["csv_read_cancel_requested"] = True
+    _clear_csv_read_state()
+
+
+def _csv_read_cancel_requested() -> bool:
+    return bool(st.session_state.get("csv_read_cancel_requested", False))
 
 
 def _read_options_from_settings(settings: AppSettings) -> ReadOptions:
@@ -560,19 +583,33 @@ def _analyze_csv(
             else f"Scanning first {DEFAULT_SCHEMA_SAMPLE_ROWS} rows to infer draft schema..."
         )
         with st.spinner(spinner_text):
+            if _csv_read_cancel_requested():
+                raise CsvReadCancelled("CSV read was stopped")
             effective_options, preview, warning = choose_read_options_for_preview(
                 csv_path,
                 read_options,
                 nrows=20,
             )
+            if _csv_read_cancel_requested():
+                raise CsvReadCancelled("CSV read was stopped")
             if schema_analysis_mode == SCHEMA_INFERENCE_FULL_SCAN:
-                schema = analyze_csv_with_pandas_chunks(csv_path, effective_options)
+                schema = analyze_csv_with_pandas_chunks(
+                    csv_path,
+                    effective_options,
+                    cancel_callback=_csv_read_cancel_requested,
+                )
             else:
                 schema = analyze_csv_with_pandas_sample(
                     csv_path,
                     effective_options,
                     nrows=DEFAULT_SCHEMA_SAMPLE_ROWS,
                 )
+            if _csv_read_cancel_requested():
+                raise CsvReadCancelled("CSV read was stopped")
+    except CsvReadCancelled:
+        _clear_csv_read_state()
+        st.warning("CSV read was stopped. Choose another file and press Read CSV.")
+        return
     except CsvSchemaError as exc:
         st.error(f"CSV schema error: {exc}")
         return

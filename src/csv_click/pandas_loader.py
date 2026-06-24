@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Callable
 import json
 from dataclasses import dataclass
 from datetime import date, datetime
@@ -11,7 +12,7 @@ import numpy as np
 import pandas as pd
 
 from csv_click.clickhouse import raw_insert_batch
-from csv_click.errors import CsvSchemaError
+from csv_click.errors import CsvReadCancelled, CsvSchemaError
 from csv_click.schema import (
     CsvColumn,
     CsvSchema,
@@ -212,12 +213,15 @@ def analyze_csv_with_pandas_sample(
 def analyze_csv_with_pandas_chunks(
     csv_path: str | Path,
     read_options: ReadOptions,
+    cancel_callback: Callable[[], bool] | None = None,
 ) -> CsvSchema:
     stats: dict[str, _ColumnStats] = {}
     source_names: list[str] | None = None
 
     try:
         for chunk in iter_pandas_chunks(csv_path, read_options):
+            if cancel_callback and cancel_callback():
+                raise CsvReadCancelled("CSV read was stopped")
             if source_names is None:
                 source_names = list(chunk.columns)
                 stats = _init_column_stats(source_names)
@@ -225,6 +229,8 @@ def analyze_csv_with_pandas_chunks(
             for source_name in source_names:
                 for value in chunk[source_name].tolist():
                     stats[source_name].add_value(_value_to_string(value))
+            if cancel_callback and cancel_callback():
+                raise CsvReadCancelled("CSV read was stopped")
     except pd.errors.EmptyDataError as exc:
         raise CsvSchemaError("CSV header is required") from exc
     except UnicodeDecodeError as exc:

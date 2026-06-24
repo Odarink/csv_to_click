@@ -206,6 +206,49 @@ def test_csv_path_step_defaults_to_sample_schema_inference_with_full_scan_opt_in
     assert "_analyze_csv(csv_path, read_options, schema_analysis_mode)" in apply_source
 
 
+def test_csv_path_step_renders_stop_button_after_csv_is_selected() -> None:
+    source = Path("src/csv_click/app.py").read_text(encoding="utf-8")
+    match = re.search(
+        r"def _render_csv_path_step\(.*?\n(?=def _)",
+        source,
+        flags=re.DOTALL,
+    )
+
+    assert match is not None
+    csv_path_step_source = match.group(0)
+    assert '"Stop read CSV / choose another file"' in csv_path_step_source
+    assert "_request_stop_csv_read()" in csv_path_step_source
+    assert "st.rerun()" in csv_path_step_source
+    assert '"csv_path" not in st.session_state' in csv_path_step_source
+
+
+def test_stop_csv_read_clears_downstream_csv_state() -> None:
+    source = Path("src/csv_click/app.py").read_text(encoding="utf-8")
+    match = re.search(
+        r"def _clear_csv_read_state\(.*?\n(?=def _)",
+        source,
+        flags=re.DOTALL,
+    )
+
+    assert match is not None
+    clear_source = match.group(0)
+    assert "CSV_READ_STATE_KEYS = [" in source
+    for key in [
+        "csv_path",
+        "schema_rows",
+        "mapping_rows",
+        "type_rows",
+        "mapping_confirmed",
+        "types_confirmed",
+        "load_params",
+        "csv_preview_rows",
+        "csv_preview_warning",
+    ]:
+        assert f'"{key}"' in source
+    assert "for key in CSV_READ_STATE_KEYS" in clear_source
+    assert 'st.session_state["csv_read_cancel_requested"] = True' in source
+
+
 def test_analyze_csv_uses_sample_inference_unless_full_scan_is_selected() -> None:
     source = Path("src/csv_click/app.py").read_text(encoding="utf-8")
     match = re.search(
@@ -220,6 +263,8 @@ def test_analyze_csv_uses_sample_inference_unless_full_scan_is_selected() -> Non
     assert "analyze_csv_with_pandas_chunks" in analyze_source
     assert "SCHEMA_INFERENCE_FULL_SCAN" in analyze_source
     assert "st.warning" in analyze_source
+    assert "_csv_read_cancel_requested" in analyze_source
+    assert "cancel_callback=_csv_read_cancel_requested" in analyze_source
 
 
 def test_app_renders_inline_help_for_each_ui_step() -> None:

@@ -4,7 +4,7 @@ from pathlib import Path
 import pandas as pd
 import pytest
 
-from csv_click.errors import CsvSchemaError
+from csv_click.errors import CsvReadCancelled, CsvSchemaError
 from csv_click.pandas_loader import (
     ENCODING_SUGGESTIONS,
     ReadOptions,
@@ -154,6 +154,18 @@ def test_analyze_csv_with_pandas_chunks_still_uses_full_file(tmp_path: Path) -> 
 
     name_column = next(column for column in schema.columns if column.source_name == "NAME")
     assert name_column.final_type == "Nullable(String)"
+
+
+def test_analyze_csv_with_pandas_chunks_can_be_cancelled_between_chunks(tmp_path: Path) -> None:
+    csv_path = tmp_path / "source.csv"
+    csv_path.write_text("ID,NAME\n1,Alice\n2,Bob\n", encoding="utf_8")
+
+    with pytest.raises(CsvReadCancelled, match="CSV read was stopped"):
+        analyze_csv_with_pandas_chunks(
+            csv_path,
+            ReadOptions(batch_size=1),
+            cancel_callback=lambda: True,
+        )
 
 
 def test_iter_pandas_chunks_wraps_parser_errors_with_csv_schema_error(tmp_path: Path) -> None:
