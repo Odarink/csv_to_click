@@ -20,18 +20,58 @@ ClickHouse: локальную `ReplicatedMergeTree` и распределенн
 `requirements.txt`. `pyproject.toml` и `uv.lock` сохранены для разработки и
 альтернативного запуска через `uv`.
 
-## Локальный запуск на Windows через cmd
+## Локальный запуск на Windows
 
-Откройте `cmd.exe`, перейдите в директорию проекта и создайте виртуальное
-окружение:
+Откройте папку проекта и запустите `loader.bat`.
+
+При первом запуске файл сам:
+
+- перейдет в директорию проекта;
+- найдет установленный Python 3.11+;
+- создаст `.venv`, если окружения еще нет;
+- обновит `pip`;
+- установит зависимости из `requirements.txt`;
+- проверит, что доступны `streamlit`, `pandas` и `clickhouse_connect`;
+- запустит приложение на `http://localhost:8501`.
+
+Если Python 3.11+ не установлен, `loader.bat` остановится и покажет команду:
 
 ```cmd
-cd C:\path\to\csv_to_click
+winget install -e --id Python.Python.3.12
+```
+
+После установки Python заново откройте папку проекта и снова запустите
+`loader.bat`.
+
+При необходимости задайте пользователя и пароль ClickHouse перед запуском:
+
+```cmd
+set CLICKHOUSE_USER=<user>
+set CLICKHOUSE_PASSWORD=<password>
+loader.bat
+```
+
+Если используется secure-подключение с клиентскими сертификатами, укажите в UI
+Windows-пути к сертификату и ключу, например:
+
+```text
+C:\Users\<username>\tsh\clickhouse-prod.crt
+C:\Users\<username>\tsh\clickhouse-prod.key
+```
+
+## Ручной запуск и диагностика
+
+Ручные команды нужны только для диагностики, если `loader.bat` завершился с
+ошибкой.
+
+Проверьте установленные версии Python:
+
+```cmd
 py -0p
 ```
 
-Команда `py -0p` покажет установленные версии Python. Для проекта нужен Python
-3.11 или новее. Создайте venv через установленную подходящую версию, например:
+Для проекта нужен Python 3.11 или новее. Создать окружение вручную можно через
+установленную подходящую версию, например:
 
 ```cmd
 py -3.12 -m venv .venv
@@ -41,14 +81,6 @@ py -3.12 -m venv .venv
 
 ```cmd
 py -3.11 -m venv .venv
-```
-
-Если `py -0p` не показывает Python 3.11+, установите Python 3.12, заново
-откройте `cmd.exe` и повторите проверку:
-
-```cmd
-winget install -e --id Python.Python.3.12
-py -0p
 ```
 
 Активируйте окружение:
@@ -67,7 +99,7 @@ python --version
 
 ```cmd
 python -m pip install --upgrade pip
-pip install -r requirements.txt
+python -m pip install -r requirements.txt
 ```
 
 Проверьте, что основные библиотеки доступны:
@@ -76,32 +108,11 @@ pip install -r requirements.txt
 python -c "import streamlit, pandas, clickhouse_connect; print('dependencies OK')"
 ```
 
-При необходимости задайте пользователя и пароль ClickHouse:
-
-```cmd
-set CLICKHOUSE_USER=<user>
-set CLICKHOUSE_PASSWORD=<password>
-```
-
-Если используется secure-подключение с клиентскими сертификатами, укажите в UI
-Windows-пути к сертификату и ключу, например:
-
-```text
-C:\Users\<username>\tsh\clickhouse-prod.crt
-C:\Users\<username>\tsh\clickhouse-prod.key
-```
-
-Запустите приложение:
+Запустите приложение вручную:
 
 ```cmd
 set PYTHONPATH=%CD%\src
 python -m streamlit run src\csv_click\app.py --server.address 127.0.0.1 --server.port 8501
-```
-
-Откройте приложение в браузере:
-
-```text
-http://localhost:8501
 ```
 
 ## Альтернативный запуск через uv
