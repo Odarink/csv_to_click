@@ -31,6 +31,7 @@ class ReadOptions:
     batch_size: int = 1_000_000
 
 
+DEFAULT_SCHEMA_SAMPLE_ROWS = 100_000
 ENCODING_SUGGESTIONS: tuple[str, ...] = ("utf_8", "utf-8-sig", "cp1251", "windows-1251")
 MOJIBAKE_MARKERS: tuple[str, ...] = ("С‚", "Рµ", "Р°", "Рё", "Рѕ", "РЅ", "�")
 
@@ -186,6 +187,28 @@ def _mojibake_score(preview: pd.DataFrame) -> int:
     return score
 
 
+def analyze_csv_with_pandas_sample(
+    csv_path: str | Path,
+    read_options: ReadOptions,
+    nrows: int = DEFAULT_SCHEMA_SAMPLE_ROWS,
+) -> CsvSchema:
+    if nrows <= 0:
+        raise ValueError("nrows must be positive")
+
+    try:
+        sample = preview_csv_rows(csv_path, read_options, nrows=nrows)
+    except pd.errors.EmptyDataError as exc:
+        raise CsvSchemaError("CSV header is required") from exc
+
+    source_names = list(sample.columns)
+    stats = _init_column_stats(source_names)
+    for source_name in source_names:
+        for value in sample[source_name].tolist():
+            stats[source_name].add_value(_value_to_string(value))
+
+    return _schema_from_stats(source_names, stats)
+
+
 def analyze_csv_with_pandas_chunks(
     csv_path: str | Path,
     read_options: ReadOptions,
@@ -197,14 +220,7 @@ def analyze_csv_with_pandas_chunks(
         for chunk in iter_pandas_chunks(csv_path, read_options):
             if source_names is None:
                 source_names = list(chunk.columns)
-                target_names = [normalize_identifier(name) for name in source_names]
-                duplicates = _duplicates(target_names)
-                if duplicates:
-                    raise CsvSchemaError(
-                        "CSV header contains duplicate column names after normalization: "
-                        + ", ".join(sorted(duplicates))
-                    )
-                stats = {name: _ColumnStats() for name in source_names}
+                stats = _init_column_stats(source_names)
 
             for source_name in source_names:
                 for value in chunk[source_name].tolist():
@@ -217,6 +233,21 @@ def analyze_csv_with_pandas_chunks(
     if source_names is None:
         raise CsvSchemaError("CSV header is required")
 
+    return _schema_from_stats(source_names, stats)
+
+
+def _init_column_stats(source_names: list[str]) -> dict[str, _ColumnStats]:
+    target_names = [normalize_identifier(name) for name in source_names]
+    duplicates = _duplicates(target_names)
+    if duplicates:
+        raise CsvSchemaError(
+            "CSV header contains duplicate column names after normalization: "
+            + ", ".join(sorted(duplicates))
+        )
+    return {name: _ColumnStats() for name in source_names}
+
+
+def _schema_from_stats(source_names: list[str], stats: dict[str, _ColumnStats]) -> CsvSchema:
     columns = []
     for source_name in source_names:
         inferred_type, notes = _infer_type(stats[source_name])

@@ -178,6 +178,50 @@ def test_csv_path_step_renders_read_settings_before_first_analysis() -> None:
     assert "st.session_state[\"csv_read_options\"] = read_options" in csv_path_step_source
 
 
+def test_csv_path_step_defaults_to_sample_schema_inference_with_full_scan_opt_in() -> None:
+    source = Path("src/csv_click/app.py").read_text(encoding="utf-8")
+    match = re.search(
+        r"def _render_csv_path_step\(.*?\n(?=def _)",
+        source,
+        flags=re.DOTALL,
+    )
+
+    assert match is not None
+    csv_path_step_source = match.group(0)
+    assert 'SCHEMA_INFERENCE_SAMPLE = "Fast sample, 100000 rows"' in source
+    assert 'SCHEMA_INFERENCE_FULL_SCAN = "Full scan"' in source
+    assert '"Schema inference mode"' in csv_path_step_source
+    assert "SCHEMA_INFERENCE_OPTIONS" in csv_path_step_source
+    assert "index=0" in csv_path_step_source
+    assert "schema_analysis_mode" in csv_path_step_source
+    assert "_apply_csv_path(csv_path, read_options, schema_analysis_mode)" in csv_path_step_source
+
+    apply_match = re.search(
+        r"def _apply_csv_path\(.*?\n(?=def _)",
+        source,
+        flags=re.DOTALL,
+    )
+    assert apply_match is not None
+    apply_source = apply_match.group(0)
+    assert "_analyze_csv(csv_path, read_options, schema_analysis_mode)" in apply_source
+
+
+def test_analyze_csv_uses_sample_inference_unless_full_scan_is_selected() -> None:
+    source = Path("src/csv_click/app.py").read_text(encoding="utf-8")
+    match = re.search(
+        r"def _analyze_csv\(.*?\n(?=def _)",
+        source,
+        flags=re.DOTALL,
+    )
+
+    assert match is not None
+    analyze_source = match.group(0)
+    assert "analyze_csv_with_pandas_sample" in analyze_source
+    assert "analyze_csv_with_pandas_chunks" in analyze_source
+    assert "SCHEMA_INFERENCE_FULL_SCAN" in analyze_source
+    assert "st.warning" in analyze_source
+
+
 def test_app_renders_inline_help_for_each_ui_step() -> None:
     source = Path("src/csv_click/app.py").read_text(encoding="utf-8")
 
