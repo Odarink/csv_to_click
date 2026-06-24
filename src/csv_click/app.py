@@ -66,6 +66,7 @@ CSV_READ_STATE_KEYS = [
 ]
 LARGE_CSV_PRECHECK_THRESHOLD_BYTES = 50 * 1024 * 1024
 SAMPLE_PRECHECK_ROWS = 200_000
+INSERT_PAYLOAD_SAFETY_RATIO = 0.9
 
 
 def main() -> None:
@@ -98,7 +99,12 @@ def main() -> None:
 
     col_test, _ = st.columns(2)
     with col_test:
-        if st.button("Test connection", type="secondary", use_container_width=True):
+        if st.button(
+            "Test connection",
+            type="secondary",
+            use_container_width=True,
+            key="test_connection_final_button",
+        ):
             _test_connection(config)
 
     try:
@@ -255,64 +261,71 @@ Preview DDL только показывает SQL и ничего не созд�
 def _render_connection_and_load_form(schema: CsvSchema) -> dict[str, object] | None:
     settings = _get_app_settings()
     target_names = _schema_target_names(schema)
-    with st.form("load_params_form"):
-        st.subheader("ClickHouse and load parameters")
-        _render_clickhouse_params_help()
-        left, right = st.columns(2)
-        with left:
-            database = st.text_input("Database", value=settings.database)
-            distributed_table = st.text_input("Distributed table name")
-            cluster = st.text_input("Cluster", value=settings.cluster)
-            order_by = st.selectbox("ORDER BY", options=target_names)
-            partition_by = st.text_input("PARTITION BY (optional)")
-            sharding_column = st.selectbox("Distributed sharding key", options=target_names)
-            batch_size = st.number_input(
-                "Batch size",
-                min_value=1,
-                value=settings.batch_size,
-                step=10_000,
-            )
-            max_insert_payload_mb = st.number_input(
-                "Max insert payload, MB",
-                min_value=1,
-                value=settings.max_insert_payload_mb,
-                step=1,
-                help="Upper bound for one HTTP JSONEachRow insert request.",
-            )
-            load_workers = st.number_input(
-                "Load workers",
-                min_value=1,
-                max_value=6,
-                value=settings.load_workers,
-                step=1,
-                help="Parallel HTTP JSONEachRow insert workers. Use 1 for sequential loading.",
-            )
-            strict_preflight = st.checkbox(
-                "Strict preflight validation",
-                value=settings.strict_preflight,
-            )
-        with right:
-            host = st.text_input("Host", value=settings.host)
-            port = st.number_input("Port", min_value=1, max_value=65535, value=settings.port)
-            username = st.text_input(
-                "Username",
-                value=settings.username or os.getenv("CLICKHOUSE_USER", ""),
-            )
-            password = st.text_input(
-                "Password",
-                value=os.getenv("CLICKHOUSE_PASSWORD", ""),
-                type="password",
-            )
-            secure = st.checkbox("Secure", value=settings.secure)
-            verify = st.checkbox("Verify TLS", value=settings.verify)
-            client_cert = st.text_input("Client cert path", value=settings.client_cert)
-            client_key = st.text_input("Client key path", value=settings.client_key)
+    st.subheader("ClickHouse and load parameters")
+    _render_clickhouse_params_help()
+    left, right = st.columns(2)
+    with left:
+        database = st.text_input("Database", value=settings.database)
+        distributed_table = st.text_input("Distributed table name")
+        cluster = st.text_input("Cluster", value=settings.cluster)
+        order_by = st.selectbox("ORDER BY", options=target_names)
+        partition_by = st.text_input("PARTITION BY (optional)")
+        sharding_column = st.selectbox("Distributed sharding key", options=target_names)
+        batch_size = st.number_input(
+            "Batch size",
+            min_value=1,
+            value=settings.batch_size,
+            step=10_000,
+        )
+        max_insert_payload_mb = st.number_input(
+            "Max insert payload, MB",
+            min_value=1,
+            value=settings.max_insert_payload_mb,
+            step=1,
+            help="Upper bound for one HTTP JSONEachRow insert request.",
+        )
+        load_workers = st.number_input(
+            "Load workers",
+            min_value=1,
+            max_value=6,
+            value=settings.load_workers,
+            step=1,
+            help="Parallel HTTP JSONEachRow insert workers. Use 1 for sequential loading.",
+        )
+        strict_preflight = st.checkbox(
+            "Strict preflight validation",
+            value=settings.strict_preflight,
+        )
+    with right:
+        host = st.text_input("Host", value=settings.host)
+        port = st.number_input("Port", min_value=1, max_value=65535, value=settings.port)
+        username = st.text_input(
+            "Username",
+            value=settings.username or os.getenv("CLICKHOUSE_USER", ""),
+        )
+        password = st.text_input(
+            "Password",
+            value=os.getenv("CLICKHOUSE_PASSWORD", ""),
+            type="password",
+        )
+        secure = st.checkbox("Secure", value=settings.secure)
+        verify = st.checkbox("Verify TLS", value=settings.verify)
+        client_cert = st.text_input("Client cert path", value=settings.client_cert)
+        client_key = st.text_input("Client key path", value=settings.client_key)
 
-        apply_col, test_col = st.columns(2)
-        with apply_col:
-            submitted = st.form_submit_button("Apply parameters", use_container_width=True)
-        with test_col:
-            test_submitted = st.form_submit_button("Test connection", use_container_width=True)
+    apply_col, test_col = st.columns(2)
+    with apply_col:
+        submitted = st.button(
+            "Apply parameters",
+            use_container_width=True,
+            key="apply_load_params_button",
+        )
+    with test_col:
+        test_submitted = st.button(
+            "Test connection",
+            use_container_width=True,
+            key="test_load_params_connection_button",
+        )
 
     config = ClickHouseConfig(
         database=database,
@@ -330,11 +343,6 @@ def _render_connection_and_load_form(schema: CsvSchema) -> dict[str, object] | N
     if test_submitted:
         _test_connection(config)
 
-    if not submitted and "load_params" not in st.session_state:
-        return None
-    if not submitted:
-        return st.session_state["load_params"]
-
     errors = []
     if not database:
         errors.append("Database is required")
@@ -346,8 +354,9 @@ def _render_connection_and_load_form(schema: CsvSchema) -> dict[str, object] | N
         errors.append("Distributed sharding key is required")
 
     if errors:
-        for error in errors:
-            st.error(error)
+        if submitted:
+            for error in errors:
+                st.error(error)
         return None
 
     csv_read_options = st.session_state.get("csv_read_options", ReadOptions())
@@ -369,25 +378,26 @@ def _render_connection_and_load_form(schema: CsvSchema) -> dict[str, object] | N
         "config": config,
     }
     st.session_state["load_params"] = params
-    _save_app_settings(
-        AppSettings(
-            host=host,
-            port=int(port),
-            username=username,
-            secure=secure,
-            verify=verify,
-            client_cert=client_cert,
-            client_key=client_key,
-            database=database,
-            cluster=cluster,
-            batch_size=int(batch_size),
-            max_insert_payload_mb=int(max_insert_payload_mb),
-            load_workers=int(load_workers),
-            strict_preflight=strict_preflight,
-            separator=read_options.separator,
-            encoding=read_options.encoding,
+    if submitted:
+        _save_app_settings(
+            AppSettings(
+                host=host,
+                port=int(port),
+                username=username,
+                secure=secure,
+                verify=verify,
+                client_cert=client_cert,
+                client_key=client_key,
+                database=database,
+                cluster=cluster,
+                batch_size=int(batch_size),
+                max_insert_payload_mb=int(max_insert_payload_mb),
+                load_workers=int(load_workers),
+                strict_preflight=strict_preflight,
+                separator=read_options.separator,
+                encoding=read_options.encoding,
+            )
         )
-    )
     return params
 
 
@@ -582,6 +592,11 @@ def _read_options_from_settings(settings: AppSettings) -> ReadOptions:
         encoding=settings.encoding,
         batch_size=settings.batch_size,
     )
+
+
+def _effective_insert_payload_bytes(max_insert_payload_mb: int) -> int:
+    configured_bytes = max_insert_payload_mb * 1024 * 1024
+    return max(1, int(configured_bytes * INSERT_PAYLOAD_SAFETY_RATIO))
 
 
 def _test_connection(config: ClickHouseConfig) -> None:
@@ -866,7 +881,21 @@ def _create_and_load(
             log(encoding_warning.message)
         st.session_state["csv_read_options"] = effective_read_options
         total_rows = 0
-        max_insert_payload_bytes = max_insert_payload_mb * 1024 * 1024
+        configured_insert_payload_bytes = max_insert_payload_mb * 1024 * 1024
+        max_insert_payload_bytes = _effective_insert_payload_bytes(max_insert_payload_mb)
+        configured_insert_payload_mb = configured_insert_payload_bytes / 1024 / 1024
+        effective_insert_payload_mb = max_insert_payload_bytes / 1024 / 1024
+        log(
+            "Load settings: batch size "
+            f"{effective_read_options.batch_size}, load workers {load_workers}, "
+            f"configured max insert payload {configured_insert_payload_mb:.2f} MB, "
+            f"effective insert payload {effective_insert_payload_mb:.2f} MB."
+        )
+        if max_insert_payload_bytes < configured_insert_payload_bytes:
+            log(
+                "Effective insert payload limit is lower than the configured UI value "
+                "to stay below ClickHouse HTTP/proxy read limits."
+            )
         if strict_preflight:
             file_size_bytes = Path(csv_path).stat().st_size
             if file_size_bytes > LARGE_CSV_PRECHECK_THRESHOLD_BYTES:

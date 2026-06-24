@@ -118,7 +118,7 @@ def test_create_and_load_rechecks_effective_encoding_before_insert() -> None:
     assert "choose_read_options_for_preview" in create_and_load_source
     assert "effective_read_options" in create_and_load_source
     assert "validate_csv_with_pandas_chunks(" in create_and_load_source
-    assert "max_insert_payload_bytes = max_insert_payload_mb * 1024 * 1024" in create_and_load_source
+    assert "max_insert_payload_bytes = _effective_insert_payload_bytes(max_insert_payload_mb)" in create_and_load_source
     assert "read_options=effective_read_options" in create_and_load_source
 
 
@@ -194,6 +194,22 @@ def test_connection_form_exposes_bounded_load_workers_setting() -> None:
     assert "settings.load_workers" in form_source
     assert '"load_workers": int(load_workers)' in form_source
     assert "load_workers=int(load_workers)" in form_source
+
+
+def test_connection_form_uses_live_widget_values_without_stale_form_state() -> None:
+    source = Path("src/csv_click/app.py").read_text(encoding="utf-8")
+    match = re.search(
+        r"def _render_connection_and_load_form\(.*?\n(?=def _)",
+        source,
+        flags=re.DOTALL,
+    )
+
+    assert match is not None
+    form_source = match.group(0)
+    assert 'st.form("load_params_form")' not in form_source
+    assert "form_submit_button" not in form_source
+    assert 'return st.session_state["load_params"]' not in form_source
+    assert 'st.session_state["load_params"] = params' in form_source
 
 
 def test_csv_path_step_renders_read_settings_before_first_analysis() -> None:
@@ -314,8 +330,32 @@ def test_create_and_load_passes_max_insert_payload_to_loader() -> None:
     assert match is not None
     create_and_load_source = match.group(0)
     assert "max_insert_payload_mb: int" in create_and_load_source
-    assert "max_insert_payload_bytes = max_insert_payload_mb * 1024 * 1024" in create_and_load_source
+    assert "max_insert_payload_bytes = _effective_insert_payload_bytes(max_insert_payload_mb)" in create_and_load_source
     assert "payload_bytes" in create_and_load_source
+
+
+def test_create_and_load_uses_payload_safety_headroom() -> None:
+    source = Path("src/csv_click/app.py").read_text(encoding="utf-8")
+    match = re.search(
+        r"def _effective_insert_payload_bytes\(.*?\n(?=def _)",
+        source,
+        flags=re.DOTALL,
+    )
+    create_match = re.search(
+        r"def _create_and_load\(.*?\n(?=if __name__)",
+        source,
+        flags=re.DOTALL,
+    )
+
+    assert match is not None
+    assert create_match is not None
+    helper_source = match.group(0)
+    create_and_load_source = create_match.group(0)
+    assert "INSERT_PAYLOAD_SAFETY_RATIO = 0.9" in source
+    assert "max_insert_payload_mb * 1024 * 1024" in helper_source
+    assert "INSERT_PAYLOAD_SAFETY_RATIO" in helper_source
+    assert "Effective insert payload limit" in create_and_load_source
+    assert "Load settings: batch size" in create_and_load_source
 
 
 def test_create_and_load_passes_load_workers_to_loader() -> None:
@@ -409,7 +449,10 @@ def test_connection_form_has_apply_and_test_connection_submit_buttons() -> None:
 
     assert match is not None
     form_source = match.group(0)
-    assert 'form_submit_button("Apply parameters"' in form_source
-    assert 'form_submit_button("Test connection"' in form_source
+    assert "st.button(" in form_source
+    assert '"Apply parameters"' in form_source
+    assert '"Test connection"' in form_source
+    assert 'key="apply_load_params_button"' in form_source
+    assert 'key="test_load_params_connection_button"' in form_source
     assert "if test_submitted:" in form_source
-    assert form_source.index("if test_submitted:") < form_source.index("if not submitted")
+    assert form_source.index("if test_submitted:") < form_source.index("params = {")
