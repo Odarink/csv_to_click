@@ -12,6 +12,8 @@ def test_load_app_settings_uses_notebook_defaults_when_file_is_missing(tmp_path:
     assert settings.host == "tp17.wb-bank.ru"
     assert settings.database == "sandbox"
     assert settings.cluster == "clickhouse"
+    assert settings.batch_size == 100_000
+    assert settings.max_insert_payload_mb == 16
 
 
 def test_save_and_load_app_settings_persists_static_ui_defaults(tmp_path: Path) -> None:
@@ -27,6 +29,7 @@ def test_save_and_load_app_settings_persists_static_ui_defaults(tmp_path: Path) 
         database="analytics",
         cluster="custom_cluster",
         batch_size=5000,
+        max_insert_payload_mb=8,
         strict_preflight=False,
         separator=";",
         encoding="cp1251",
@@ -36,6 +39,16 @@ def test_save_and_load_app_settings_persists_static_ui_defaults(tmp_path: Path) 
     loaded = load_app_settings(settings_path)
 
     assert loaded == settings
+
+
+def test_load_app_settings_migrates_old_default_batch_size(tmp_path: Path) -> None:
+    settings_path = tmp_path / "settings.json"
+    settings_path.write_text('{"batch_size": 1000000}', encoding="utf-8")
+
+    loaded = load_app_settings(settings_path)
+
+    assert loaded.batch_size == 100_000
+    assert loaded.max_insert_payload_mb == 16
 
 
 def test_saved_app_settings_do_not_include_table_specific_fields(tmp_path: Path) -> None:

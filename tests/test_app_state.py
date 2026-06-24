@@ -117,7 +117,8 @@ def test_create_and_load_rechecks_effective_encoding_before_insert() -> None:
     create_and_load_source = match.group(0)
     assert "choose_read_options_for_preview" in create_and_load_source
     assert "effective_read_options" in create_and_load_source
-    assert "validate_csv_with_pandas_chunks(csv_path, effective_read_options, mappings)" in create_and_load_source
+    assert "validate_csv_with_pandas_chunks(" in create_and_load_source
+    assert "max_insert_payload_bytes=max_insert_payload_mb * 1024 * 1024" in create_and_load_source
     assert "read_options=effective_read_options" in create_and_load_source
 
 
@@ -158,6 +159,23 @@ def test_connection_form_uses_schema_target_columns_for_sorting_and_sharding() -
     assert "_schema_target_names(schema)" in form_source
     assert "options=target_names" in form_source
     assert '"sharding_key": sharding_column' in form_source
+
+
+def test_connection_form_exposes_bounded_insert_payload_setting() -> None:
+    source = Path("src/csv_click/app.py").read_text(encoding="utf-8")
+    match = re.search(
+        r"def _render_connection_and_load_form\(.*?\n(?=def _)",
+        source,
+        flags=re.DOTALL,
+    )
+
+    assert match is not None
+    form_source = match.group(0)
+    assert '"Batch size"' in form_source
+    assert '"Max insert payload, MB"' in form_source
+    assert "settings.max_insert_payload_mb" in form_source
+    assert '"max_insert_payload_mb": int(max_insert_payload_mb)' in form_source
+    assert "max_insert_payload_mb=int(max_insert_payload_mb)" in form_source
 
 
 def test_csv_path_step_renders_read_settings_before_first_analysis() -> None:
@@ -265,6 +283,21 @@ def test_analyze_csv_uses_sample_inference_unless_full_scan_is_selected() -> Non
     assert "st.warning" in analyze_source
     assert "_csv_read_cancel_requested" in analyze_source
     assert "cancel_callback=_csv_read_cancel_requested" in analyze_source
+
+
+def test_create_and_load_passes_max_insert_payload_to_loader() -> None:
+    source = Path("src/csv_click/app.py").read_text(encoding="utf-8")
+    match = re.search(
+        r"def _create_and_load\(.*?\n(?=if __name__)",
+        source,
+        flags=re.DOTALL,
+    )
+
+    assert match is not None
+    create_and_load_source = match.group(0)
+    assert "max_insert_payload_mb: int" in create_and_load_source
+    assert "max_insert_payload_bytes=max_insert_payload_mb * 1024 * 1024" in create_and_load_source
+    assert "payload_bytes" in create_and_load_source
 
 
 def test_app_renders_inline_help_for_each_ui_step() -> None:

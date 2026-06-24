@@ -27,7 +27,8 @@ class AppSettings:
     client_key: str = DEFAULT_CLIENT_KEY
     database: str = "sandbox"
     cluster: str = "clickhouse"
-    batch_size: int = 1_000_000
+    batch_size: int = 100_000
+    max_insert_payload_mb: int = 16
     strict_preflight: bool = True
     separator: str = ","
     encoding: str = "utf_8"
@@ -47,6 +48,8 @@ def load_app_settings(settings_path: Path = DEFAULT_SETTINGS_PATH) -> AppSetting
         for key, value in raw.items()
         if key in allowed_fields
     }
+    if "max_insert_payload_mb" not in raw and values.get("batch_size") == 1_000_000:
+        values["batch_size"] = 100_000
     return AppSettings(**values)
 
 

@@ -136,6 +136,7 @@ def main() -> None:
             order_by=params["order_by"],
             partition_by=params["partition_by"],
             batch_size=params["batch_size"],
+            max_insert_payload_mb=params["max_insert_payload_mb"],
             strict_preflight=params["strict_preflight"],
             sharding_key=params["sharding_key"],
         )
@@ -217,6 +218,7 @@ def _render_clickhouse_params_help() -> None:
 - `PARTITION BY` - необязательное выражение партиционирования;
 - `Distributed sharding key` - колонка для `sipHash64(...)` в `Distributed`;
 - `Batch size` - размер CSV чанка при проверке и загрузке;
+- `Max insert payload, MB` - максимальный размер одного HTTP `JSONEachRow` insert request;
 - `Strict preflight validation` заранее проверяет конвертацию CSV в выбранные
   типы ClickHouse.
 
@@ -265,6 +267,13 @@ def _render_connection_and_load_form(schema: CsvSchema) -> dict[str, object] | N
                 min_value=1,
                 value=settings.batch_size,
                 step=10_000,
+            )
+            max_insert_payload_mb = st.number_input(
+                "Max insert payload, MB",
+                min_value=1,
+                value=settings.max_insert_payload_mb,
+                step=1,
+                help="Upper bound for one HTTP JSONEachRow insert request.",
             )
             strict_preflight = st.checkbox(
                 "Strict preflight validation",
@@ -342,6 +351,7 @@ def _render_connection_and_load_form(schema: CsvSchema) -> dict[str, object] | N
         "partition_by": partition_by or None,
         "sharding_key": sharding_column,
         "batch_size": int(batch_size),
+        "max_insert_payload_mb": int(max_insert_payload_mb),
         "strict_preflight": strict_preflight,
         "config": config,
     }
@@ -358,6 +368,7 @@ def _render_connection_and_load_form(schema: CsvSchema) -> dict[str, object] | N
             database=database,
             cluster=cluster,
             batch_size=int(batch_size),
+            max_insert_payload_mb=int(max_insert_payload_mb),
             strict_preflight=strict_preflight,
             separator=read_options.separator,
             encoding=read_options.encoding,
@@ -811,6 +822,7 @@ def _create_and_load(
     order_by: str,
     partition_by: str | None,
     batch_size: int,
+    max_insert_payload_mb: int,
     strict_preflight: bool,
     sharding_key: str,
 ) -> None:
@@ -842,7 +854,12 @@ def _create_and_load(
         if strict_preflight:
             log("Validating CSV chunks against selected types.")
             status.info("Validating CSV chunks against selected types...")
-            total_rows = validate_csv_with_pandas_chunks(csv_path, effective_read_options, mappings)
+            total_rows = validate_csv_with_pandas_chunks(
+                csv_path,
+                effective_read_options,
+                mappings,
+                max_insert_payload_bytes=max_insert_payload_mb * 1024 * 1024,
+            )
             log(f"CSV validation finished: {total_rows} rows.")
 
         log("Connecting to ClickHouse.")
@@ -869,14 +886,24 @@ def _create_and_load(
         log("Loading CSV chunks through JSONEachRow.")
         status.info("Loading CSV chunks through JSONEachRow...")
 
-        def on_progress(batch_number: int, batch_rows: int, rows_total: int) -> None:
+        def on_progress(
+            chunk_number: int,
+            block_number: int,
+            block_rows: int,
+            rows_total: int,
+            payload_bytes: int,
+        ) -> None:
             nonlocal inserted_rows
             inserted_rows = rows_total
             if total_rows:
                 progress.progress(min(1.0, inserted_rows / total_rows))
             metrics.metric("Inserted rows", inserted_rows)
-            status.info(f"Loaded chunk {batch_number}: {batch_rows} rows")
-            log(f"Loaded chunk {batch_number}: {batch_rows} rows, total {rows_total}.")
+            payload_mb = payload_bytes / 1024 / 1024
+            status.info(f"Loaded chunk {chunk_number}, block {block_number}: {block_rows} rows")
+            log(
+                f"Loaded chunk {chunk_number}, block {block_number}: "
+                f"{block_rows} rows, {payload_mb:.2f} MB, total {rows_total}."
+            )
 
         inserted_rows = load_csv_via_raw_insert(
             client=client,
@@ -885,6 +912,7 @@ def _create_and_load(
             database=config.database,
             table=distributed_table,
             mappings=mappings,
+            max_insert_payload_bytes=max_insert_payload_mb * 1024 * 1024,
             progress_callback=on_progress,
         )
 

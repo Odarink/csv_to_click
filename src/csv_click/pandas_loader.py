@@ -12,7 +12,7 @@ import numpy as np
 import pandas as pd
 
 from csv_click.clickhouse import raw_insert_batch
-from csv_click.errors import CsvReadCancelled, CsvSchemaError
+from csv_click.errors import CsvLoadError, CsvReadCancelled, CsvSchemaError
 from csv_click.schema import (
     CsvColumn,
     CsvSchema,
@@ -29,9 +29,10 @@ from csv_click.schema import (
 class ReadOptions:
     separator: str = ","
     encoding: str = "utf_8"
-    batch_size: int = 1_000_000
+    batch_size: int = 100_000
 
 
+DEFAULT_MAX_INSERT_PAYLOAD_BYTES = 16 * 1024 * 1024
 DEFAULT_SCHEMA_SAMPLE_ROWS = 100_000
 ENCODING_SUGGESTIONS: tuple[str, ...] = ("utf_8", "utf-8-sig", "cp1251", "windows-1251")
 MOJIBAKE_MARKERS: tuple[str, ...] = ("С‚", "Рµ", "Р°", "Рё", "Рѕ", "РЅ", "�")
@@ -387,22 +388,62 @@ def validate_csv_with_pandas_chunks(
     csv_path: str | Path,
     read_options: ReadOptions,
     mappings: list[SchemaMapping],
+    max_insert_payload_bytes: int = DEFAULT_MAX_INSERT_PAYLOAD_BYTES,
 ) -> int:
     rows_count = 0
     usecols = [mapping.source_name for mapping in mappings if mapping.include]
     for chunk_number, chunk in enumerate(iter_pandas_chunks(csv_path, read_options, usecols), start=1):
         converted = convert_chunk_to_schema(chunk, mappings, chunk_number)
-        chunk_to_json_each_row_payload(converted, list(converted.columns))
+        for _payload, _payload_rows in iter_json_each_row_payloads(
+            converted,
+            list(converted.columns),
+            max_payload_bytes=max_insert_payload_bytes,
+        ):
+            pass
         rows_count += len(converted)
     return rows_count
 
 
 def chunk_to_json_each_row_payload(chunk: pd.DataFrame, columns: list[str]) -> bytes:
-    lines = []
-    for row in chunk[columns].to_dict(orient="records"):
-        cleaned = {column: _clean_json_value(row[column]) for column in columns}
-        lines.append(json.dumps(cleaned, ensure_ascii=False, allow_nan=False))
-    return "\n".join(lines).encode("utf-8")
+    return b"\n".join(_json_each_row_line(row, columns) for row in _iter_rows(chunk, columns))
+
+
+def iter_json_each_row_payloads(
+    chunk: pd.DataFrame,
+    columns: list[str],
+    max_payload_bytes: int = DEFAULT_MAX_INSERT_PAYLOAD_BYTES,
+) -> Iterator[tuple[bytes, int]]:
+    if max_payload_bytes <= 0:
+        raise ValueError("max_payload_bytes must be positive")
+
+    lines: list[bytes] = []
+    payload_bytes = 0
+    rows_count = 0
+
+    for row in _iter_rows(chunk, columns):
+        line = _json_each_row_line(row, columns)
+        line_size = len(line)
+        if line_size > max_payload_bytes:
+            raise CsvLoadError(
+                "A single JSONEachRow row is "
+                f"{line_size} bytes, which is larger than Max insert payload "
+                f"{max_payload_bytes} bytes. Reduce column width or increase Max insert payload, MB."
+            )
+
+        separator_bytes = 1 if rows_count else 0
+        if rows_count and payload_bytes + separator_bytes + line_size > max_payload_bytes:
+            yield b"\n".join(lines), rows_count
+            lines = []
+            payload_bytes = 0
+            rows_count = 0
+            separator_bytes = 0
+
+        lines.append(line)
+        payload_bytes += separator_bytes + line_size
+        rows_count += 1
+
+    if rows_count:
+        yield b"\n".join(lines), rows_count
 
 
 def load_csv_via_raw_insert(
@@ -412,6 +453,7 @@ def load_csv_via_raw_insert(
     database: str,
     table: str,
     mappings: list[SchemaMapping],
+    max_insert_payload_bytes: int = DEFAULT_MAX_INSERT_PAYLOAD_BYTES,
     progress_callback=None,
 ) -> int:
     rows_count = 0
@@ -419,12 +461,62 @@ def load_csv_via_raw_insert(
     for chunk_number, chunk in enumerate(iter_pandas_chunks(csv_path, read_options, usecols), start=1):
         converted = convert_chunk_to_schema(chunk, mappings, chunk_number)
         columns = list(converted.columns)
-        payload = chunk_to_json_each_row_payload(converted, columns)
-        raw_insert_batch(client, database, table, columns, payload)
-        rows_count += len(converted)
-        if progress_callback:
-            progress_callback(chunk_number, len(converted), rows_count)
+        for block_number, (payload, block_rows) in enumerate(
+            iter_json_each_row_payloads(
+                converted,
+                columns,
+                max_payload_bytes=max_insert_payload_bytes,
+            ),
+            start=1,
+        ):
+            try:
+                raw_insert_batch(client, database, table, columns, payload)
+            except Exception as exc:
+                raise _raw_insert_error(
+                    exc=exc,
+                    database=database,
+                    table=table,
+                    chunk_number=chunk_number,
+                    block_number=block_number,
+                    block_rows=block_rows,
+                    payload_bytes=len(payload),
+                ) from exc
+            rows_count += block_rows
+            if progress_callback:
+                progress_callback(chunk_number, block_number, block_rows, rows_count, len(payload))
     return rows_count
+
+
+def _iter_rows(chunk: pd.DataFrame, columns: list[str]) -> Iterator[dict[str, object]]:
+    for values in chunk[columns].itertuples(index=False, name=None):
+        yield dict(zip(columns, values))
+
+
+def _json_each_row_line(row: dict[str, object], columns: list[str]) -> bytes:
+    cleaned = {column: _clean_json_value(row[column]) for column in columns}
+    return json.dumps(cleaned, ensure_ascii=False, allow_nan=False).encode("utf-8")
+
+
+def _raw_insert_error(
+    *,
+    exc: Exception,
+    database: str,
+    table: str,
+    chunk_number: int,
+    block_number: int,
+    block_rows: int,
+    payload_bytes: int,
+) -> CsvLoadError:
+    message = str(exc)
+    hint = ""
+    if "read limit is reached" in message.lower():
+        hint = " Reduce Max insert payload, MB or Batch size and retry."
+    payload_mb = payload_bytes / 1024 / 1024
+    return CsvLoadError(
+        "ClickHouse raw insert failed for "
+        f"{database}.{table}, chunk {chunk_number}, block {block_number}, "
+        f"{block_rows} rows, {payload_mb:.2f} MB payload.{hint} Original error: {message}"
+    )
 
 
 def _convert_series(series: pd.Series, clickhouse_type: str) -> pd.Series:

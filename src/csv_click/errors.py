@@ -18,6 +18,10 @@ class CsvSchemaError(CsvClickError):
     """Raised when CSV schema inference or type conversion fails."""
 
 
+class CsvLoadError(CsvClickError):
+    """Raised when converted CSV rows cannot be loaded into ClickHouse."""
+
+
 class CsvReadCancelled(CsvClickError):
     """Raised when the user stops CSV schema reading."""
 
