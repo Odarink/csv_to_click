@@ -29,6 +29,7 @@ class AppSettings:
     cluster: str = "clickhouse"
     batch_size: int = 100_000
     max_insert_payload_mb: int = 16
+    load_workers: int = 1
     strict_preflight: bool = True
     separator: str = ","
     encoding: str = "utf_8"

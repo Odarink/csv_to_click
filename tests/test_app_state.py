@@ -118,7 +118,7 @@ def test_create_and_load_rechecks_effective_encoding_before_insert() -> None:
     assert "choose_read_options_for_preview" in create_and_load_source
     assert "effective_read_options" in create_and_load_source
     assert "validate_csv_with_pandas_chunks(" in create_and_load_source
-    assert "max_insert_payload_bytes=max_insert_payload_mb * 1024 * 1024" in create_and_load_source
+    assert "max_insert_payload_bytes = max_insert_payload_mb * 1024 * 1024" in create_and_load_source
     assert "read_options=effective_read_options" in create_and_load_source
 
 
@@ -176,6 +176,24 @@ def test_connection_form_exposes_bounded_insert_payload_setting() -> None:
     assert "settings.max_insert_payload_mb" in form_source
     assert '"max_insert_payload_mb": int(max_insert_payload_mb)' in form_source
     assert "max_insert_payload_mb=int(max_insert_payload_mb)" in form_source
+
+
+def test_connection_form_exposes_bounded_load_workers_setting() -> None:
+    source = Path("src/csv_click/app.py").read_text(encoding="utf-8")
+    match = re.search(
+        r"def _render_connection_and_load_form\(.*?\n(?=def _)",
+        source,
+        flags=re.DOTALL,
+    )
+
+    assert match is not None
+    form_source = match.group(0)
+    assert '"Load workers"' in form_source
+    assert "min_value=1" in form_source
+    assert "max_value=6" in form_source
+    assert "settings.load_workers" in form_source
+    assert '"load_workers": int(load_workers)' in form_source
+    assert "load_workers=int(load_workers)" in form_source
 
 
 def test_csv_path_step_renders_read_settings_before_first_analysis() -> None:
@@ -296,8 +314,51 @@ def test_create_and_load_passes_max_insert_payload_to_loader() -> None:
     assert match is not None
     create_and_load_source = match.group(0)
     assert "max_insert_payload_mb: int" in create_and_load_source
-    assert "max_insert_payload_bytes=max_insert_payload_mb * 1024 * 1024" in create_and_load_source
+    assert "max_insert_payload_bytes = max_insert_payload_mb * 1024 * 1024" in create_and_load_source
     assert "payload_bytes" in create_and_load_source
+
+
+def test_create_and_load_passes_load_workers_to_loader() -> None:
+    source = Path("src/csv_click/app.py").read_text(encoding="utf-8")
+    main_match = re.search(
+        r"def main\(.*?\n(?=def _)",
+        source,
+        flags=re.DOTALL,
+    )
+    create_match = re.search(
+        r"def _create_and_load\(.*?\n(?=if __name__)",
+        source,
+        flags=re.DOTALL,
+    )
+
+    assert main_match is not None
+    assert create_match is not None
+    main_source = main_match.group(0)
+    create_and_load_source = create_match.group(0)
+    assert 'load_workers=params["load_workers"]' in main_source
+    assert "load_workers: int" in create_and_load_source
+    assert "worker_count=load_workers" in create_and_load_source
+    assert "client_factory=lambda: get_client(config)" in create_and_load_source
+
+
+def test_create_and_load_uses_sample_validation_for_large_files() -> None:
+    source = Path("src/csv_click/app.py").read_text(encoding="utf-8")
+    match = re.search(
+        r"def _create_and_load\(.*?\n(?=if __name__)",
+        source,
+        flags=re.DOTALL,
+    )
+
+    assert match is not None
+    create_and_load_source = match.group(0)
+    assert "LARGE_CSV_PRECHECK_THRESHOLD_BYTES = 50 * 1024 * 1024" in source
+    assert "SAMPLE_PRECHECK_ROWS = 200_000" in source
+    assert "Path(csv_path).stat().st_size" in create_and_load_source
+    assert "validate_csv_with_pandas_chunks(" in create_and_load_source
+    assert "validate_csv_sample_with_pandas_chunks(" in create_and_load_source
+    assert "Strict validation finished:" in create_and_load_source
+    assert "Sample validation finished: first" in create_and_load_source
+    assert "File is larger than 50 MB; using sample validation" in create_and_load_source
 
 
 def test_app_renders_inline_help_for_each_ui_step() -> None:

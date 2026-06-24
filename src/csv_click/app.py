@@ -41,6 +41,7 @@ from csv_click.pandas_loader import (
     mappings_to_schema,
     schema_to_mappings,
     validate_csv_with_pandas_chunks,
+    validate_csv_sample_with_pandas_chunks,
 )
 from csv_click.schema import (
     CLICKHOUSE_TYPE_OPTIONS,
@@ -63,6 +64,8 @@ CSV_READ_STATE_KEYS = [
     "csv_preview_rows",
     "csv_preview_warning",
 ]
+LARGE_CSV_PRECHECK_THRESHOLD_BYTES = 50 * 1024 * 1024
+SAMPLE_PRECHECK_ROWS = 200_000
 
 
 def main() -> None:
@@ -137,6 +140,7 @@ def main() -> None:
             partition_by=params["partition_by"],
             batch_size=params["batch_size"],
             max_insert_payload_mb=params["max_insert_payload_mb"],
+            load_workers=params["load_workers"],
             strict_preflight=params["strict_preflight"],
             sharding_key=params["sharding_key"],
         )
@@ -275,6 +279,14 @@ def _render_connection_and_load_form(schema: CsvSchema) -> dict[str, object] | N
                 step=1,
                 help="Upper bound for one HTTP JSONEachRow insert request.",
             )
+            load_workers = st.number_input(
+                "Load workers",
+                min_value=1,
+                max_value=6,
+                value=settings.load_workers,
+                step=1,
+                help="Parallel HTTP JSONEachRow insert workers. Use 1 for sequential loading.",
+            )
             strict_preflight = st.checkbox(
                 "Strict preflight validation",
                 value=settings.strict_preflight,
@@ -352,6 +364,7 @@ def _render_connection_and_load_form(schema: CsvSchema) -> dict[str, object] | N
         "sharding_key": sharding_column,
         "batch_size": int(batch_size),
         "max_insert_payload_mb": int(max_insert_payload_mb),
+        "load_workers": int(load_workers),
         "strict_preflight": strict_preflight,
         "config": config,
     }
@@ -369,6 +382,7 @@ def _render_connection_and_load_form(schema: CsvSchema) -> dict[str, object] | N
             cluster=cluster,
             batch_size=int(batch_size),
             max_insert_payload_mb=int(max_insert_payload_mb),
+            load_workers=int(load_workers),
             strict_preflight=strict_preflight,
             separator=read_options.separator,
             encoding=read_options.encoding,
@@ -823,6 +837,7 @@ def _create_and_load(
     partition_by: str | None,
     batch_size: int,
     max_insert_payload_mb: int,
+    load_workers: int,
     strict_preflight: bool,
     sharding_key: str,
 ) -> None:
@@ -851,16 +866,36 @@ def _create_and_load(
             log(encoding_warning.message)
         st.session_state["csv_read_options"] = effective_read_options
         total_rows = 0
+        max_insert_payload_bytes = max_insert_payload_mb * 1024 * 1024
         if strict_preflight:
-            log("Validating CSV chunks against selected types.")
-            status.info("Validating CSV chunks against selected types...")
-            total_rows = validate_csv_with_pandas_chunks(
-                csv_path,
-                effective_read_options,
-                mappings,
-                max_insert_payload_bytes=max_insert_payload_mb * 1024 * 1024,
-            )
-            log(f"CSV validation finished: {total_rows} rows.")
+            file_size_bytes = Path(csv_path).stat().st_size
+            if file_size_bytes > LARGE_CSV_PRECHECK_THRESHOLD_BYTES:
+                sample_rows = max(SAMPLE_PRECHECK_ROWS, effective_read_options.batch_size)
+                warning_message = (
+                    "File is larger than 50 MB; using sample validation for the first "
+                    f"{sample_rows} rows instead of full strict validation."
+                )
+                st.warning(warning_message)
+                log(warning_message)
+                status.info("Validating first CSV rows against selected types...")
+                validated_rows = validate_csv_sample_with_pandas_chunks(
+                    csv_path,
+                    effective_read_options,
+                    mappings,
+                    max_insert_payload_bytes=max_insert_payload_bytes,
+                    sample_rows=sample_rows,
+                )
+                log(f"Sample validation finished: first {validated_rows} rows only.")
+            else:
+                log("Validating CSV chunks against selected types.")
+                status.info("Validating CSV chunks against selected types...")
+                total_rows = validate_csv_with_pandas_chunks(
+                    csv_path,
+                    effective_read_options,
+                    mappings,
+                    max_insert_payload_bytes=max_insert_payload_bytes,
+                )
+                log(f"Strict validation finished: {total_rows} rows.")
 
         log("Connecting to ClickHouse.")
         status.info("Connecting to ClickHouse...")
@@ -912,7 +947,9 @@ def _create_and_load(
             database=config.database,
             table=distributed_table,
             mappings=mappings,
-            max_insert_payload_bytes=max_insert_payload_mb * 1024 * 1024,
+            max_insert_payload_bytes=max_insert_payload_bytes,
+            worker_count=load_workers,
+            client_factory=lambda: get_client(config),
             progress_callback=on_progress,
         )
 

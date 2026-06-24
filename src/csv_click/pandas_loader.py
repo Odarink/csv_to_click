@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 from collections.abc import Callable
+from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 import json
 from dataclasses import dataclass
 from datetime import date, datetime
 from decimal import Decimal
 from pathlib import Path
+import threading
 from typing import Iterator
 
 import numpy as np
@@ -404,6 +406,36 @@ def validate_csv_with_pandas_chunks(
     return rows_count
 
 
+def validate_csv_sample_with_pandas_chunks(
+    csv_path: str | Path,
+    read_options: ReadOptions,
+    mappings: list[SchemaMapping],
+    max_insert_payload_bytes: int = DEFAULT_MAX_INSERT_PAYLOAD_BYTES,
+    sample_rows: int = 200_000,
+) -> int:
+    if sample_rows <= 0:
+        raise ValueError("sample_rows must be positive")
+
+    rows_count = 0
+    usecols = [mapping.source_name for mapping in mappings if mapping.include]
+    for chunk_number, chunk in enumerate(iter_pandas_chunks(csv_path, read_options, usecols), start=1):
+        remaining_rows = sample_rows - rows_count
+        if remaining_rows <= 0:
+            break
+        sample_chunk = chunk.head(remaining_rows).reset_index(drop=True)
+        converted = convert_chunk_to_schema(sample_chunk, mappings, chunk_number)
+        for _payload, _payload_rows in iter_json_each_row_payloads(
+            converted,
+            list(converted.columns),
+            max_payload_bytes=max_insert_payload_bytes,
+        ):
+            pass
+        rows_count += len(converted)
+        if rows_count >= sample_rows:
+            break
+    return rows_count
+
+
 def chunk_to_json_each_row_payload(chunk: pd.DataFrame, columns: list[str]) -> bytes:
     return b"\n".join(_json_each_row_line(row, columns) for row in _iter_rows(chunk, columns))
 
@@ -454,8 +486,27 @@ def load_csv_via_raw_insert(
     table: str,
     mappings: list[SchemaMapping],
     max_insert_payload_bytes: int = DEFAULT_MAX_INSERT_PAYLOAD_BYTES,
+    worker_count: int = 1,
+    client_factory: Callable[[], object] | None = None,
     progress_callback=None,
 ) -> int:
+    if worker_count <= 0:
+        raise ValueError("worker_count must be positive")
+    if worker_count > 1:
+        if client_factory is None:
+            raise ValueError("client_factory is required when worker_count is greater than 1")
+        return _load_csv_via_raw_insert_parallel(
+            client_factory=client_factory,
+            csv_path=csv_path,
+            read_options=read_options,
+            database=database,
+            table=table,
+            mappings=mappings,
+            max_insert_payload_bytes=max_insert_payload_bytes,
+            worker_count=worker_count,
+            progress_callback=progress_callback,
+        )
+
     rows_count = 0
     usecols = [mapping.source_name for mapping in mappings if mapping.include]
     for chunk_number, chunk in enumerate(iter_pandas_chunks(csv_path, read_options, usecols), start=1):
@@ -487,6 +538,113 @@ def load_csv_via_raw_insert(
     return rows_count
 
 
+def _load_csv_via_raw_insert_parallel(
+    *,
+    client_factory: Callable[[], object],
+    csv_path: str | Path,
+    read_options: ReadOptions,
+    database: str,
+    table: str,
+    mappings: list[SchemaMapping],
+    max_insert_payload_bytes: int,
+    worker_count: int,
+    progress_callback,
+) -> int:
+    rows_count = 0
+    usecols = [mapping.source_name for mapping in mappings if mapping.include]
+    max_pending = worker_count * 2
+    worker_state = threading.local()
+
+    def worker_client():
+        client = getattr(worker_state, "client", None)
+        if client is None:
+            client = client_factory()
+            worker_state.client = client
+        return client
+
+    def insert_payload(
+        *,
+        chunk_number: int,
+        block_number: int,
+        block_rows: int,
+        columns: list[str],
+        payload: bytes,
+    ) -> tuple[int, int, int, int]:
+        try:
+            raw_insert_batch(worker_client(), database, table, columns, payload)
+        except Exception as exc:
+            raise _raw_insert_error(
+                exc=exc,
+                database=database,
+                table=table,
+                chunk_number=chunk_number,
+                block_number=block_number,
+                block_rows=block_rows,
+                payload_bytes=len(payload),
+            ) from exc
+        return chunk_number, block_number, block_rows, len(payload)
+
+    def cancel_pending(pending: set[Future]) -> None:
+        for future in pending:
+            future.cancel()
+        for future in pending:
+            if future.cancelled():
+                continue
+            try:
+                future.result()
+            except Exception:
+                pass
+
+    def collect_completed(pending: set[Future]) -> int:
+        nonlocal rows_count
+        done, _pending = wait(pending, return_when=FIRST_COMPLETED)
+        for future in done:
+            pending.remove(future)
+            try:
+                chunk_number, block_number, block_rows, payload_bytes = future.result()
+            except Exception:
+                cancel_pending(pending)
+                raise
+            rows_count += block_rows
+            if progress_callback:
+                progress_callback(chunk_number, block_number, block_rows, rows_count, payload_bytes)
+        return rows_count
+
+    pending: set[Future] = set()
+    with ThreadPoolExecutor(max_workers=worker_count) as executor:
+        try:
+            for chunk_number, chunk in enumerate(iter_pandas_chunks(csv_path, read_options, usecols), start=1):
+                converted = convert_chunk_to_schema(chunk, mappings, chunk_number)
+                columns = list(converted.columns)
+                for block_number, (payload, block_rows) in enumerate(
+                    iter_json_each_row_payloads(
+                        converted,
+                        columns,
+                        max_payload_bytes=max_insert_payload_bytes,
+                    ),
+                    start=1,
+                ):
+                    pending.add(
+                        executor.submit(
+                            insert_payload,
+                            chunk_number=chunk_number,
+                            block_number=block_number,
+                            block_rows=block_rows,
+                            columns=columns,
+                            payload=payload,
+                        )
+                    )
+                    if len(pending) >= max_pending:
+                        collect_completed(pending)
+
+            while pending:
+                collect_completed(pending)
+        except Exception:
+            cancel_pending(pending)
+            raise
+    return rows_count
+
+
 def _iter_rows(chunk: pd.DataFrame, columns: list[str]) -> Iterator[dict[str, object]]:
     for values in chunk[columns].itertuples(index=False, name=None):
         yield dict(zip(columns, values))
@@ -510,7 +668,10 @@ def _raw_insert_error(
     message = str(exc)
     hint = ""
     if "read limit is reached" in message.lower():
-        hint = " Reduce Max insert payload, MB or Batch size and retry."
+        hint = (
+            " The insert request exceeded the ClickHouse HTTP/proxy read limit. "
+            "Reduce Max insert payload, MB or Batch size and retry."
+        )
     payload_mb = payload_bytes / 1024 / 1024
     return CsvLoadError(
         "ClickHouse raw insert failed for "

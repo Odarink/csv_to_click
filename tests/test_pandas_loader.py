@@ -1,5 +1,6 @@
 import json
 from pathlib import Path
+import time
 
 import pandas as pd
 import pytest
@@ -22,6 +23,7 @@ from csv_click.pandas_loader import (
     mappings_from_editor_rows,
     mappings_to_schema,
     preview_csv_rows,
+    validate_csv_sample_with_pandas_chunks,
 )
 
 
@@ -31,6 +33,12 @@ class FakeRawClient:
 
     def raw_insert(self, **kwargs):
         self.calls.append(kwargs)
+
+
+class SlowRawClient(FakeRawClient):
+    def raw_insert(self, **kwargs):
+        time.sleep(0.02)
+        super().raw_insert(**kwargs)
 
 
 def test_read_options_defaults_to_utf8_and_comma() -> None:
@@ -244,6 +252,39 @@ def test_json_each_row_payload_reports_single_row_larger_than_limit() -> None:
         list(iter_json_each_row_payloads(chunk, ["ID", "VALUE"], max_payload_bytes=10))
 
 
+def test_validate_csv_sample_with_pandas_chunks_reads_only_first_rows(tmp_path: Path) -> None:
+    csv_path = tmp_path / "sample.csv"
+    csv_path.write_text("ID\n1\n2\nbad\n", encoding="utf_8")
+    mappings = [SchemaMapping("ID", "ID", True, "UInt64", False)]
+
+    rows = validate_csv_sample_with_pandas_chunks(
+        csv_path,
+        ReadOptions(batch_size=1),
+        mappings,
+        sample_rows=2,
+    )
+
+    assert rows == 2
+
+
+def test_validate_csv_sample_with_pandas_chunks_validates_types_and_payload(tmp_path: Path) -> None:
+    csv_path = tmp_path / "sample_bad.csv"
+    csv_path.write_text("ID,VALUE\n1,xxxxxxxxxxxxxxxxxxxx\n", encoding="utf_8")
+    mappings = [
+        SchemaMapping("ID", "ID", True, "UInt64", False),
+        SchemaMapping("VALUE", "VALUE", True, "String", False),
+    ]
+
+    with pytest.raises(CsvLoadError, match="single JSONEachRow row"):
+        validate_csv_sample_with_pandas_chunks(
+            csv_path,
+            ReadOptions(batch_size=1),
+            mappings,
+            max_insert_payload_bytes=10,
+            sample_rows=1,
+        )
+
+
 def test_invalid_manual_type_reports_chunk_column_and_value() -> None:
     chunk = pd.DataFrame({"ID": ["abc"]})
     mappings = [SchemaMapping("ID", "ID", True, "UInt64", False)]
@@ -318,6 +359,91 @@ def test_load_csv_via_raw_insert_splits_one_chunk_into_bounded_payloads(tmp_path
     assert all(event[4] <= 30 for event in progress_events)
 
 
+def test_load_csv_via_raw_insert_parallel_uses_client_factory(tmp_path: Path) -> None:
+    csv_path = tmp_path / "parallel.csv"
+    csv_path.write_text("ID,VALUE\n1,a\n2,b\n3,c\n4,d\n", encoding="utf_8")
+    mappings = [
+        SchemaMapping("ID", "ID", True, "UInt64", False),
+        SchemaMapping("VALUE", "VALUE", True, "String", False),
+    ]
+    shared_client = FakeRawClient()
+    worker_clients: list[FakeRawClient] = []
+    progress_events = []
+
+    def client_factory() -> FakeRawClient:
+        client = SlowRawClient()
+        worker_clients.append(client)
+        return client
+
+    rows = load_csv_via_raw_insert(
+        client=shared_client,
+        csv_path=csv_path,
+        read_options=ReadOptions(batch_size=1),
+        database="sandbox",
+        table="target_table",
+        mappings=mappings,
+        worker_count=3,
+        client_factory=client_factory,
+        progress_callback=lambda *args: progress_events.append(args),
+    )
+
+    worker_calls = [call for worker_client in worker_clients for call in worker_client.calls]
+    assert rows == 4
+    assert shared_client.calls == []
+    assert len(worker_calls) == 4
+    assert len(worker_clients) > 1
+    assert sorted(event[3] for event in progress_events) == [1, 2, 3, 4]
+
+
+def test_load_csv_via_raw_insert_parallel_requires_client_factory(tmp_path: Path) -> None:
+    csv_path = tmp_path / "parallel.csv"
+    csv_path.write_text("ID\n1\n", encoding="utf_8")
+    mappings = [SchemaMapping("ID", "ID", True, "UInt64", False)]
+
+    with pytest.raises(ValueError, match="client_factory is required"):
+        load_csv_via_raw_insert(
+            client=FakeRawClient(),
+            csv_path=csv_path,
+            read_options=ReadOptions(batch_size=1),
+            database="sandbox",
+            table="target_table",
+            mappings=mappings,
+            worker_count=2,
+        )
+
+
+def test_load_csv_via_raw_insert_parallel_wraps_insert_error_with_context(tmp_path: Path) -> None:
+    csv_path = tmp_path / "parallel_bad.csv"
+    csv_path.write_text("ID,VALUE\n1,a\n2,b\n", encoding="utf_8")
+    mappings = [
+        SchemaMapping("ID", "ID", True, "UInt64", False),
+        SchemaMapping("VALUE", "VALUE", True, "String", False),
+    ]
+
+    class FailingRawClient(FakeRawClient):
+        def raw_insert(self, **kwargs):
+            if b'"ID": 2' in kwargs["insert_block"]:
+                raise RuntimeError("HTTP status 500: the read limit is reached")
+            super().raw_insert(**kwargs)
+
+    with pytest.raises(CsvLoadError) as exc_info:
+        load_csv_via_raw_insert(
+            client=FakeRawClient(),
+            csv_path=csv_path,
+            read_options=ReadOptions(batch_size=1),
+            database="sandbox",
+            table="target_table",
+            mappings=mappings,
+            worker_count=2,
+            client_factory=FailingRawClient,
+        )
+
+    message = str(exc_info.value)
+    assert "chunk 2" in message
+    assert "block 1" in message
+    assert "HTTP/proxy read limit" in message
+
+
 def test_load_csv_via_raw_insert_uses_default_payload_limit(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     csv_path = tmp_path / "load.csv"
     csv_path.write_text("ID,VALUE\n1,a\n", encoding="utf_8")
@@ -357,7 +483,7 @@ def test_load_csv_via_raw_insert_wraps_read_limit_error_with_payload_context(tmp
         def raw_insert(self, **kwargs):
             raise RuntimeError("HTTP status 500: the read limit is reached")
 
-    with pytest.raises(CsvLoadError, match="Max insert payload"):
+    with pytest.raises(CsvLoadError, match="HTTP/proxy read limit"):
         load_csv_via_raw_insert(
             client=FailingRawClient(),
             csv_path=csv_path,
