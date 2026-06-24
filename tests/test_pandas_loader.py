@@ -9,6 +9,7 @@ from csv_click.pandas_loader import (
     ENCODING_SUGGESTIONS,
     ReadOptions,
     SchemaMapping,
+    analyze_csv_with_pandas_sample,
     analyze_csv_with_pandas_chunks,
     choose_read_options_for_preview,
     chunk_to_json_each_row_payload,
@@ -127,6 +128,32 @@ def test_analyze_csv_with_pandas_chunks_strips_and_normalizes_target_names(tmp_p
         "c_sposob_kvit_0",
         "skip_me",
     ]
+
+
+def test_analyze_csv_with_pandas_sample_infers_schema_from_limited_rows(tmp_path: Path) -> None:
+    csv_path = tmp_path / "source.csv"
+    csv_path.write_text("ID,AMOUNT\n1,10\n2,abc\n", encoding="utf_8")
+
+    schema = analyze_csv_with_pandas_sample(
+        csv_path,
+        ReadOptions(batch_size=1),
+        nrows=1,
+    )
+
+    amount_column = next(column for column in schema.columns if column.source_name == "AMOUNT")
+    assert amount_column.inferred_type == "UInt64"
+    assert amount_column.final_type == "UInt64"
+    assert amount_column.sample_values == ["10"]
+
+
+def test_analyze_csv_with_pandas_chunks_still_uses_full_file(tmp_path: Path) -> None:
+    csv_path = tmp_path / "source.csv"
+    csv_path.write_text("ID,NAME\n1,Alice\n2,\n", encoding="utf_8")
+
+    schema = analyze_csv_with_pandas_chunks(csv_path, ReadOptions(batch_size=1))
+
+    name_column = next(column for column in schema.columns if column.source_name == "NAME")
+    assert name_column.final_type == "Nullable(String)"
 
 
 def test_iter_pandas_chunks_wraps_parser_errors_with_csv_schema_error(tmp_path: Path) -> None:

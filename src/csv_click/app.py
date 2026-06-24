@@ -29,7 +29,9 @@ from csv_click.errors import (
     ExistingTableError,
 )
 from csv_click.pandas_loader import (
+    DEFAULT_SCHEMA_SAMPLE_ROWS,
     ReadOptions,
+    analyze_csv_with_pandas_sample,
     analyze_csv_with_pandas_chunks,
     choose_read_options_for_preview,
     load_csv_via_raw_insert,
@@ -44,6 +46,11 @@ from csv_click.schema import (
     CsvSchema,
 )
 from csv_click.settings import AppSettings, load_app_settings, save_app_settings
+
+
+SCHEMA_INFERENCE_SAMPLE = "Fast sample, 100000 rows"
+SCHEMA_INFERENCE_FULL_SCAN = "Full scan"
+SCHEMA_INFERENCE_OPTIONS = [SCHEMA_INFERENCE_SAMPLE, SCHEMA_INFERENCE_FULL_SCAN]
 
 
 def main() -> None:
@@ -398,6 +405,22 @@ def _render_csv_path_step() -> dict[str, object] | None:
                 "Custom encoding",
                 value="" if current_options.encoding in {"utf_8", "cp1251", "windows-1251", "utf-8-sig"} else current_options.encoding,
             )
+        current_schema_analysis_mode = st.session_state.get(
+            "schema_analysis_mode",
+            SCHEMA_INFERENCE_SAMPLE,
+        )
+        schema_analysis_mode = st.radio(
+            "Schema inference mode",
+            options=SCHEMA_INFERENCE_OPTIONS,
+            index=0
+            if current_schema_analysis_mode not in SCHEMA_INFERENCE_OPTIONS
+            else SCHEMA_INFERENCE_OPTIONS.index(current_schema_analysis_mode),
+            horizontal=True,
+            help=(
+                "Fast sample reads only the first 100000 rows for draft types. "
+                "Full scan reads the entire CSV before type review."
+            ),
+        )
 
     if submitted:
         read_options = _read_options_from_form(
@@ -409,7 +432,8 @@ def _render_csv_path_step() -> dict[str, object] | None:
         )
         if read_options is not None:
             st.session_state["csv_read_options"] = read_options
-            _apply_csv_path(csv_path, read_options)
+            st.session_state["schema_analysis_mode"] = schema_analysis_mode
+            _apply_csv_path(csv_path, read_options, schema_analysis_mode)
 
     if "csv_path" not in st.session_state:
         return None
@@ -475,7 +499,11 @@ def _encoding_index(encoding: str) -> int:
     return options.index(encoding) if encoding in options else options.index("custom")
 
 
-def _apply_csv_path(csv_path: str, read_options: ReadOptions) -> None:
+def _apply_csv_path(
+    csv_path: str,
+    read_options: ReadOptions,
+    schema_analysis_mode: str = SCHEMA_INFERENCE_SAMPLE,
+) -> None:
     if not csv_path:
         st.error("CSV path is required")
         return
@@ -485,6 +513,7 @@ def _apply_csv_path(csv_path: str, read_options: ReadOptions) -> None:
 
     st.session_state["csv_path"] = csv_path
     st.session_state["csv_read_options"] = read_options
+    st.session_state["schema_analysis_mode"] = schema_analysis_mode
     for key in [
         "schema_rows",
         "mapping_rows",
@@ -496,7 +525,7 @@ def _apply_csv_path(csv_path: str, read_options: ReadOptions) -> None:
         "csv_preview_warning",
     ]:
         st.session_state.pop(key, None)
-    _analyze_csv(csv_path, read_options)
+    _analyze_csv(csv_path, read_options, schema_analysis_mode)
 
 
 def _read_options_from_settings(settings: AppSettings) -> ReadOptions:
@@ -519,15 +548,31 @@ def _test_connection(config: ClickHouseConfig) -> None:
         st.success("Connection OK")
 
 
-def _analyze_csv(csv_path: str, read_options: ReadOptions) -> None:
+def _analyze_csv(
+    csv_path: str,
+    read_options: ReadOptions,
+    schema_analysis_mode: str = SCHEMA_INFERENCE_SAMPLE,
+) -> None:
     try:
-        with st.spinner("Scanning CSV chunks to infer schema..."):
+        spinner_text = (
+            "Scanning full CSV chunks to infer schema..."
+            if schema_analysis_mode == SCHEMA_INFERENCE_FULL_SCAN
+            else f"Scanning first {DEFAULT_SCHEMA_SAMPLE_ROWS} rows to infer draft schema..."
+        )
+        with st.spinner(spinner_text):
             effective_options, preview, warning = choose_read_options_for_preview(
                 csv_path,
                 read_options,
                 nrows=20,
             )
-            schema = analyze_csv_with_pandas_chunks(csv_path, effective_options)
+            if schema_analysis_mode == SCHEMA_INFERENCE_FULL_SCAN:
+                schema = analyze_csv_with_pandas_chunks(csv_path, effective_options)
+            else:
+                schema = analyze_csv_with_pandas_sample(
+                    csv_path,
+                    effective_options,
+                    nrows=DEFAULT_SCHEMA_SAMPLE_ROWS,
+                )
     except CsvSchemaError as exc:
         st.error(f"CSV schema error: {exc}")
         return
@@ -537,6 +582,11 @@ def _analyze_csv(csv_path: str, read_options: ReadOptions) -> None:
     st.session_state["mapping_rows"] = _schema_rows_to_mapping_rows(st.session_state["schema_rows"])
     st.session_state["csv_preview_rows"] = preview
     st.session_state["csv_preview_warning"] = warning.message if warning else None
+    if schema_analysis_mode != SCHEMA_INFERENCE_FULL_SCAN:
+        st.warning(
+            "Schema was inferred from the first 100000 rows only. Review Type review carefully; "
+            "use Full scan for exact inference or Strict preflight validation before loading."
+        )
     st.success(f"Schema inferred for {len(schema.columns)} columns")
 
 
