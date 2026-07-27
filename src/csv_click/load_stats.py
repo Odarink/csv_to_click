@@ -110,6 +110,15 @@ class LoadStats:
     insert_wall_s: float = 0.0
     total_s: float = 0.0
     server_ns: int = 0
+    #: Сколько продюсер простоял, ожидая свободного места в очереди вставок.
+    #: Оборачивается ровно ожидание готового блока, не тело цикла: иначе сюда
+    #: попал бы `progress_callback`, который ходит в Streamlit.
+    producer_stall_s: float = 0.0
+    #: Сумма стенных часов вокруг `raw_insert` во ВСЕХ воркерах. Вместе с
+    #: `worker_count` и `insert_wall_s` отвечает на «пул был занят или ждал».
+    insert_busy_s: float = 0.0
+    #: Сумма ожиданий блока в очереди пула: от `submit` до начала отправки.
+    insert_queue_s: float = 0.0
     driver_retries: int = 0
     #: Итератор чанков был исчерпан, то есть продюсер увидел конец CSV.
     #:
@@ -168,6 +177,51 @@ class LoadStats:
         if self.worker_count != 1 or self.insert_wall_s <= 0:
             return None
         return (self.server_ns / 1_000_000_000) / self.insert_wall_s
+
+    @property
+    def server_share_of_insert(self) -> float | None:
+        """Какая доля ВСТАВКИ была серверным временем. Работает при любом числе
+        воркеров, в отличие от :attr:`server_share`.
+
+        Знаменатель — не стенные часы, а ``insert_busy_s``: обе величины суммы
+        по одним и тем же блокам, поэтому одновременность запросов сокращается и
+        доля остаётся долей. Это тот же вопрос, что задаёт ``server_share``, но
+        заданный так, чтобы на него можно было ответить.
+
+        ``None``, когда считать нельзя: блоков не было, вставка не замерена или
+        хотя бы один блок пришёл без ``elapsed_ns``.
+        """
+        if self.blocks == 0 or self.insert_busy_s <= 0:
+            return None
+        if self.blocks_without_server_time:
+            return None
+        return (self.server_ns / 1_000_000_000) / self.insert_busy_s
+
+    @property
+    def worker_occupancy(self) -> float | None:
+        """Насколько пул воркеров был занят: 1,0 — работали непрерывно.
+
+        Отвечает на «кто кого ждал». Заметно ниже единицы — воркеры простаивали,
+        значит узкое место в продюсере. Около единицы вместе с большим
+        ``producer_stall_s`` — наоборот, продюсер ждал провод или сервер.
+        """
+        if self.blocks == 0 or self.insert_wall_s <= 0 or self.worker_count <= 0:
+            return None
+        return self.insert_busy_s / (self.worker_count * self.insert_wall_s)
+
+    @property
+    def producer_unattributed_s(self) -> float | None:
+        """Время потока продюсера, не попавшее ни в одну измеренную стадию.
+
+        Сюда попадают `progress_callback`, отправка задач в пул и работа с
+        набором futures. Величина нужна, чтобы разложение стадий было ПОЛНЫМ:
+        пока такого поля нет, любой незамеренный кусок молча приписывается
+        «ожиданию HTTP» — ровно так прогон 5 и оставил 85% времени без объяснения.
+        """
+        if self.blocks == 0 or self.insert_wall_s <= 0:
+            return None
+        measured = self.read_s + self.convert_s + self.serialize_s + self.producer_stall_s
+        return self.insert_wall_s - measured
 
 
 @dataclass(frozen=True)
@@ -418,6 +472,31 @@ def format_load_stats_lines(stats: LoadStats) -> list[str]:
             f"PyArrow pool high-water: {stats.arrow_bytes / 1024 / 1024:.1f} MB at the end "
             f"against {started_at / 1024 / 1024:.1f} MB before the load. The mark is "
             "monotonic and process-wide, so only the growth is attributable to this run."
+        )
+
+    occupancy = stats.worker_occupancy
+    if occupancy is not None:
+        share = stats.server_share_of_insert
+        share_text = (
+            f"of which the server reported {share * 100:.1f}%"
+            if share is not None
+            else "the server's share is not computable"
+        )
+        lines.append(
+            f"Who waited for whom: producer stalled {stats.producer_stall_s:.2f} s on a full "
+            f"queue, workers were busy {occupancy * 100:.0f}% of the time, one insert took "
+            f"{stats.insert_busy_s / stats.blocks:.2f} s on average and {share_text}. "
+            "Low occupancy means the producer is the limit; high occupancy with a long stall "
+            "means the wire or the server is."
+        )
+
+    unattributed = stats.producer_unattributed_s
+    if unattributed is not None and stats.insert_wall_s > 0:
+        lines.append(
+            f"Unattributed producer time: {unattributed:.2f} s "
+            f"({unattributed / stats.insert_wall_s * 100:.1f}% of insert wall). This is the "
+            "progress callback, submitting tasks and bookkeeping — a large value here means "
+            "the stage breakdown is hiding something."
         )
 
     if stats.driver_retries:

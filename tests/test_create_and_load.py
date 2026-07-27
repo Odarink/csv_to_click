@@ -189,6 +189,28 @@ def test_successful_load_reports_every_clock_and_persists_the_run_record(load_en
     assert record["stats"]["arrow_bytes"] >= record["stats"]["arrow_bytes_at_start"]
 
 
+def test_the_record_answers_who_was_the_bottleneck(load_environment) -> None:
+    """Прогон на 500 млн строк оставил 85% времени необъяснёнными.
+
+    Теперь запись отвечает на это сама: сколько продюсер стоял, сколько длилась
+    вставка и какую долю в ней занял сервер. Занятость считается только здесь —
+    `insert_wall_s` ставит приложение, загрузчик его не знает.
+    """
+    load_environment.run(FakeRawClient())
+
+    record = read_single_record(load_environment.records)
+    stats = record["stats"]
+
+    assert stats["insert_busy_s"] > 0, "время самой вставки не замерено"
+    assert stats["producer_stall_s"] >= 0
+    assert stats["insert_queue_s"] >= 0
+
+    log = load_environment.streamlit.rendered_log
+    assert "Who waited for whom" in log
+    assert "workers were busy" in log
+    assert "Unattributed producer time" in log
+
+
 def test_the_app_arms_the_driver_retry_counter_around_the_load(load_environment) -> None:
     """Ничто иначе не связывает счётчик с настоящей загрузкой: без этого теста
     его можно вообще не вызывать из app.py, и все тесты останутся зелёными."""

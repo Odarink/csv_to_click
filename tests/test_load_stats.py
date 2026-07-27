@@ -126,6 +126,67 @@ def test_server_share_is_none_on_the_parallel_path() -> None:
     assert stats.server_share is None
 
 
+def test_who_was_the_bottleneck_is_readable_from_the_record() -> None:
+    """Прогон 5 оставил 85% времени в графе «прочее» — так больше нельзя.
+
+    Три поля разделяют то, что раньше было слито в `insert_wall_s`: сколько
+    продюсер стоял из-за очереди, сколько длилась вставка в воркере и сколько
+    из неё занял сервер. Числа взяты с прогона 5: 1000 блоков, 5 воркеров,
+    insert_wall 1948,55 с.
+    """
+    stats = LoadStats(
+        insert_wall_s=1948.55,
+        worker_count=5,
+        read_s=123.92,
+        convert_s=59.83,
+        serialize_s=105.35,
+        producer_stall_s=1659.46,
+        insert_busy_s=9743.0,
+    )
+    for index in range(1000):
+        stats.add_block(make_block(block_number=index + 1, rows_total=index + 1, server_ns=215_578_604))
+
+    # Воркеры были заняты почти всё время: простаивал не пул, а провод.
+    assert 0.98 < stats.worker_occupancy < 1.02
+    # Из времени вставки на сервер приходятся считаные проценты.
+    assert 0.02 < stats.server_share_of_insert < 0.03
+    # Продюсерский поток не потерялся: остаток мал и объясним.
+    assert abs(stats.producer_unattributed_s) < 1.0
+
+
+def test_shares_are_none_when_they_cannot_be_computed() -> None:
+    """Ноль вместо «не знаю» уже один раз стоил неверного вывода."""
+    empty = LoadStats(insert_wall_s=10.0, worker_count=5)
+
+    assert empty.worker_occupancy is None, "блоков не было — занятости нет"
+    assert empty.server_share_of_insert is None
+    assert empty.producer_unattributed_s is None
+
+    stripped = LoadStats(insert_wall_s=10.0, worker_count=5, insert_busy_s=40.0)
+    stripped.add_block(make_block(server_ns=0, server_time_reported=False))
+
+    assert stripped.worker_occupancy is not None
+    assert stripped.server_share_of_insert is None, "сервер не сообщил время — доли нет"
+
+
+def test_format_load_stats_lines_names_the_bottleneck() -> None:
+    stats = LoadStats(
+        insert_wall_s=1948.55,
+        worker_count=5,
+        producer_stall_s=1659.46,
+        insert_busy_s=9743.0,
+        insert_queue_s=12.0,
+    )
+    for index in range(1000):
+        stats.add_block(make_block(block_number=index + 1, rows_total=index + 1, server_ns=215_578_604))
+
+    report = " ".join(format_load_stats_lines(stats))
+
+    assert "producer stalled" in report
+    assert "9.74 s" in report, "среднее время вставки на блок — главное число этого прогона"
+    assert "2.2%" in report, "доля сервера внутри вставки"
+
+
 def test_format_load_stats_lines_reports_every_clock_and_byte_count() -> None:
     stats = LoadStats(
         preflight_s=6.0,

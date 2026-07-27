@@ -852,6 +852,115 @@ def test_a_rerun_before_the_producer_finished_says_the_source_is_not_fully_read(
     assert stats.blocks_unconfirmed > 0, "отменённые блоки не посчитаны"
 
 
+def _load_ten_blocks(tmp_path: Path, client_factory, worker_count: int) -> LoadStats:
+    csv_path = tmp_path / "instrumented.csv"
+    csv_path.write_text("ID\n" + "".join(f"{index}\n" for index in range(10)), encoding="utf_8")
+    stats = LoadStats()
+    load_csv_via_raw_insert(
+        client=FakeRawClient(),
+        csv_path=csv_path,
+        read_options=ReadOptions(batch_size=1),
+        database="sandbox",
+        table="target_table",
+        mappings=[SchemaMapping("ID", "ID", True, "UInt64", False)],
+        worker_count=worker_count,
+        client_factory=client_factory,
+        stats=stats,
+    )
+    return stats
+
+
+def test_the_record_says_how_long_the_inserts_themselves_took(tmp_path: Path) -> None:
+    """Прогон на 500 млн строк оставил 85% времени в графе «прочее».
+
+    Стенные часы вокруг самой вставки снимаются в воркере: без них нельзя
+    отличить «провод медленный» от «воркеры простаивали». Вставка тут спит
+    50 мс, десять блоков на двух воркерах — значит суммарно не меньше 0,5 с.
+    """
+
+    class SlowClient(FakeRawClient):
+        def raw_insert(self, **kwargs):
+            time.sleep(0.05)
+            return super().raw_insert(**kwargs)
+
+    stats = _load_ten_blocks(tmp_path, SlowClient, worker_count=2)
+
+    assert stats.blocks == 10
+    assert stats.insert_busy_s >= 0.45, f"суммарная вставка {stats.insert_busy_s:.3f} с"
+    assert stats.insert_busy_s / stats.blocks >= 0.045, "среднее время вставки на блок"
+    # `worker_occupancy` тут намеренно не проверяется: `insert_wall_s` ставит
+    # приложение, а не загрузчик, и свойство честно отдаёт None без него.
+    assert stats.worker_occupancy is None
+
+
+def test_the_record_says_how_long_the_producer_stood_waiting(tmp_path: Path) -> None:
+    """`producer_stall_s` считает БЛОКИРОВАНИЕ, а не число вызовов.
+
+    Медленная вставка: продюсер упирается в очередь и стоит. Мгновенная: он не
+    ждёт почти совсем, хотя вызовов ожидания столько же.
+    """
+
+    class SlowClient(FakeRawClient):
+        def raw_insert(self, **kwargs):
+            time.sleep(0.05)
+            return super().raw_insert(**kwargs)
+
+    slow = _load_ten_blocks(tmp_path, SlowClient, worker_count=2)
+    instant = _load_ten_blocks(tmp_path, FakeRawClient, worker_count=2)
+
+    assert slow.producer_stall_s > 0.1, f"продюсер не стоял: {slow.producer_stall_s:.3f} с"
+    assert instant.producer_stall_s < slow.producer_stall_s / 2, (
+        f"мгновенная вставка: стоянка {instant.producer_stall_s:.3f} с "
+        f"против {slow.producer_stall_s:.3f} с на медленной"
+    )
+
+
+def test_the_record_says_how_long_blocks_waited_in_the_queue(tmp_path: Path) -> None:
+    """Очередь пула — отдельная величина: блок может ждать воркера, а не провод.
+
+    Два воркера при `max_pending` = 4 и медленной вставке: часть блоков лежит в
+    очереди, пока воркеры заняты. На последовательном пути пула нет вовсе, и
+    поле там остаётся нулём — это проверяется отдельно ниже.
+    """
+
+    class SlowClient(FakeRawClient):
+        def raw_insert(self, **kwargs):
+            time.sleep(0.05)
+            return super().raw_insert(**kwargs)
+
+    parallel = _load_ten_blocks(tmp_path, SlowClient, worker_count=2)
+    sequential = _load_ten_blocks(tmp_path, SlowClient, worker_count=1)
+
+    assert parallel.insert_queue_s > 0.02, f"очередь {parallel.insert_queue_s:.3f} с"
+    assert sequential.insert_queue_s == 0.0, "на последовательном пути очереди пула нет"
+
+
+def test_a_failed_insert_still_counts_the_time_it_burned(tmp_path: Path) -> None:
+    """Последовательный путь: упавшая вставка тоже занимала провод."""
+    csv_path = tmp_path / "failing.csv"
+    csv_path.write_text("ID\n1\n", encoding="utf_8")
+    stats = LoadStats()
+
+    class SlowFailingClient(FakeRawClient):
+        def raw_insert(self, **kwargs):
+            time.sleep(0.05)
+            raise RuntimeError("HTTP status 500")
+
+    with pytest.raises(CsvLoadError):
+        load_csv_via_raw_insert(
+            client=SlowFailingClient(),
+            csv_path=csv_path,
+            read_options=ReadOptions(batch_size=1),
+            database="sandbox",
+            table="target_table",
+            mappings=[SchemaMapping("ID", "ID", True, "UInt64", False)],
+            stats=stats,
+        )
+
+    assert stats.insert_busy_s >= 0.045, "время упавшей вставки потеряно"
+    assert stats.blocks_unconfirmed == 1
+
+
 def test_mappings_from_editor_rows_prefers_custom_type_override() -> None:
     rows = [
         {

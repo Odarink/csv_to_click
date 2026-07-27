@@ -891,10 +891,12 @@ def load_csv_via_raw_insert(
         )
         for block_number, ((payload, block_rows), serialize_s) in enumerate(payloads, start=1):
             stats.serialize_s += serialize_s
+            insert_started = time.perf_counter()
             try:
                 summary = raw_insert_batch(client, database, table, columns, payload)
             except Exception as exc:
                 # Тот же учёт, что на параллельном пути: блок не подтверждён.
+                stats.insert_busy_s += time.perf_counter() - insert_started
                 stats.blocks_unconfirmed += 1
                 raise _raw_insert_error(
                     exc=exc,
@@ -905,6 +907,7 @@ def load_csv_via_raw_insert(
                     block_rows=block_rows,
                     payload_bytes=len(payload),
                 ) from exc
+            stats.insert_busy_s += time.perf_counter() - insert_started
             progress = _block_progress(
                 chunk_number=chunk_number,
                 block_number=block_number,
@@ -952,7 +955,12 @@ def _load_csv_via_raw_insert_parallel(
         block_rows: int,
         columns: list[str],
         payload: bytes,
+        submitted_at: float,
     ) -> _InsertedBlock:
+        # Часы снимаются ЗДЕСЬ, в воркере: только так видно, сколько длится сама
+        # вставка. Складывает эти числа главный поток, поэтому лок не нужен —
+        # воркер трогает лишь свои локальные float.
+        started = time.perf_counter()
         try:
             summary = raw_insert_batch(worker_client(), database, table, columns, payload)
         except Exception as exc:
@@ -971,6 +979,10 @@ def _load_csv_via_raw_insert_parallel(
             block_rows=block_rows,
             payload_bytes=len(payload),
             summary=summary,
+            # Разность отметок из РАЗНЫХ потоков законна: perf_counter на Windows
+            # это QueryPerformanceCounter, он общесистемный, а не потоковый.
+            queue_s=started - submitted_at,
+            insert_s=time.perf_counter() - started,
         )
 
     def block_progress_for(inserted: _InsertedBlock) -> BlockProgress:
@@ -978,6 +990,11 @@ def _load_csv_via_raw_insert_parallel(
         # блока», а не порядковый номер отправки: блоки завершаются в любом
         # порядке, а накопление идёт в порядке завершения и в одном потоке,
         # поэтому итог от порядка не зависит.
+        #
+        # Часы воркера складываются ЗДЕСЬ, в главном потоке: сами воркеры
+        # общих счётчиков не трогают, поэтому лок не нужен.
+        stats.insert_busy_s += inserted.insert_s
+        stats.insert_queue_s += inserted.queue_s
         return _block_progress(
             chunk_number=inserted.chunk_number,
             block_number=inserted.block_number,
@@ -1019,7 +1036,15 @@ def _load_csv_via_raw_insert_parallel(
 
     def collect_completed(pending: set[Future]) -> None:
         # Вызывается только из главного потока, поэтому stats мутируется без лока.
+        #
+        # Замеряется РОВНО ожидание готового блока, а не тело функции: дальше
+        # идут `future.result()`, учёт и `progress_callback`, который ходит в
+        # Streamlit и стоянкой на очереди не является. Если блок уже готов,
+        # `wait` возвращается сразу и прибавляет почти ноль — поле считает
+        # настоящее блокирование, а не число вызовов.
+        stall_started = time.perf_counter()
         done, _pending = wait(pending, return_when=FIRST_COMPLETED)
+        stats.producer_stall_s += time.perf_counter() - stall_started
         for future in done:
             pending.remove(future)
             try:
@@ -1064,6 +1089,7 @@ def _load_csv_via_raw_insert_parallel(
                             block_rows=block_rows,
                             columns=columns,
                             payload=payload,
+                            submitted_at=time.perf_counter(),
                         )
                     )
                     if len(pending) >= max_pending:
@@ -1094,6 +1120,10 @@ class _InsertedBlock:
     block_rows: int
     payload_bytes: int
     summary: dict[str, str]
+    #: Сколько блок пролежал в очереди пула: от `submit` до начала отправки.
+    queue_s: float = 0.0
+    #: Сколько длилась сама вставка в воркере, стенные часы.
+    insert_s: float = 0.0
 
 
 _TimedItem = TypeVar("_TimedItem")
