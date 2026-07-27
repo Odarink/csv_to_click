@@ -732,6 +732,57 @@ def test_the_arrow_path_survives_a_seeded_differential_fuzz() -> None:
     assert fast_taken > 100, f"быстрый путь брался всего {fast_taken} раз — перебор ничего не проверил"
 
 
+COMPRESSION_CODECS = ["zstd", "lz4", "gzip"]
+
+
+@pytest.mark.parametrize("codec", COMPRESSION_CODECS)
+def test_compressed_payload_round_trips_to_the_same_bytes(codec: str) -> None:
+    """Сжатие обязано быть обратимым: сервер распакует то же, что мы собрали.
+
+    Провод стал узким местом — на прогоне в 500 млн строк 85% времени ушло в
+    ожидание HTTP при загруженном на 15% продюсере. Сжатие бьёт ровно туда,
+    но только если распаковка даёт исходные байты до последнего.
+    """
+    payload = chunk_to_json_lines(
+        pd.DataFrame({"nmid": pd.array([1, 2, 18446744073709551615], dtype="UInt64")}), ["nmid"]
+    )
+
+    compressed = pandas_loader.compress_payload(payload, codec)
+
+    assert compressed != payload
+    assert pandas_loader._decompress_for_tests(compressed, codec) == payload
+
+
+def test_compression_off_returns_the_payload_untouched() -> None:
+    payload = b'{"nmid":1}'
+
+    assert pandas_loader.compress_payload(payload, None) is payload
+    assert pandas_loader.compress_payload(payload, "off") is payload
+
+
+def test_an_unknown_codec_fails_loudly_instead_of_sending_raw_bytes() -> None:
+    """Молча отправить несжатое, когда просили сжать, — это тихая потеря
+    настройки: оператор увидит прежнюю скорость и не поймёт почему."""
+    with pytest.raises(CsvSchemaError, match="compression"):
+        pandas_loader.compress_payload(b"{}", "brotli-9000")
+
+
+def test_lz4_compressor_is_not_shared_between_calls() -> None:
+    """`Lz4Compressor` помечен в драйвере как НЕ потокобезопасный.
+
+    Пять воркеров жмут одновременно; общий экземпляр перемешал бы кадры.
+    Признак разделяемого состояния — расхождение между первым и вторым сжатием
+    одного и того же блока.
+    """
+    payload = b'{"nmid":1}\n{"nmid":2}'
+
+    first = pandas_loader.compress_payload(payload, "lz4")
+    second = pandas_loader.compress_payload(payload, "lz4")
+
+    assert first == second
+    assert pandas_loader._decompress_for_tests(second, "lz4") == payload
+
+
 def test_a_chunked_arrow_column_falls_back_instead_of_crashing() -> None:
     """Строковая колонка больше 2 ГиБ приезжает `ChunkedArray`, а не `Array`.
 

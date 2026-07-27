@@ -7,11 +7,15 @@ from pathlib import Path
 import threading
 import time
 from typing import Iterator, TypeVar
+import zlib
 
+import lz4.frame
 import numpy as np
 import pandas as pd
 import pyarrow as pa
 import pyarrow.compute as pc
+import zstandard
+from clickhouse_connect.driver.compression import get_compressor
 
 from csv_click.clickhouse import raw_insert_batch, summary_elapsed_ns
 from csv_click.errors import CsvLoadError, CsvReadCancelled, CsvSchemaError
@@ -553,6 +557,68 @@ def validate_csv_sample_with_pandas_chunks(
     return rows_count
 
 
+#: Кодеки, которые умеет и драйвер, и ClickHouse на `Content-Encoding`.
+#: Замерено на профиле выгрузки (блок 9,49 МБ, одна колонка UInt64):
+#:   zstd  3,76x, 493 МБ/с — 19 с процессора на весь файл в 9,5 ГБ
+#:   gzip  3,32x,  34 МБ/с — 283 с, слишком дорого
+#:   lz4   1,93x, 878 МБ/с — на цифровом JSON жмёт вдвое хуже zstd
+COMPRESSION_CODECS: tuple[str, ...] = ("zstd", "lz4", "gzip")
+COMPRESSION_OFF = "off"
+
+
+def compress_payload(payload: bytes, codec: str | None) -> bytes:
+    """Сжимает тело блока перед отправкой. `None`/`off` — вернуть как есть.
+
+    Тело сжимает ВЫЗЫВАЮЩИЙ: `raw_insert` только ставит `Content-Encoding` и
+    переносит сам запрос в параметры URL (`httpclient.py:417-427`).
+
+    Компрессор создаётся на каждый вызов намеренно: `Lz4Compressor` и
+    `GzipCompressor` помечены в драйвере как НЕ потокобезопасные
+    (`compression.py`, `thread_safe=False`), а жмут пять воркеров сразу.
+    """
+    if not codec or codec == COMPRESSION_OFF:
+        return payload
+    if codec not in COMPRESSION_CODECS:
+        raise CsvSchemaError(
+            f"Unknown insert compression {codec!r}. "
+            f"Supported: {COMPRESSION_OFF}, {', '.join(COMPRESSION_CODECS)}."
+        )
+    compressor = get_compressor(codec)
+    compressed = compressor.compress_block(payload)
+    tail = compressor.flush()
+    return bytes(compressed + tail) if tail else bytes(compressed)
+
+
+def _compress_block(payload: bytes, compression: str | None, stats: LoadStats) -> bytes:
+    """Сжимает тело блока и записывает потраченное время в счётчики.
+
+    Жмёт ПРОДЮСЕР, а не воркер: после перехода на Arrow продюсер простаивает
+    85% времени, а у воркера время — это провод, и мешать в него процессор
+    значило бы испортить единственный измеритель узкого места.
+    """
+    if not compression or compression == COMPRESSION_OFF:
+        return payload
+    started = time.perf_counter()
+    body = compress_payload(payload, compression)
+    stats.compress_s += time.perf_counter() - started
+    return body
+
+
+def _decompress_for_tests(payload: bytes, codec: str) -> bytes:
+    """Обратная сторона :func:`compress_payload`, нужна только проверкам.
+
+    Живёт здесь, а не в тестах, чтобы кодеки распаковывались тем же списком,
+    каким сжимаются: разъехавшись, они дали бы зелёный тест на битых байтах.
+    """
+    if codec == "zstd":
+        return zstandard.decompress(payload)
+    if codec == "lz4":
+        return lz4.frame.decompress(payload)
+    if codec == "gzip":
+        return zlib.decompress(payload, wbits=31)
+    raise CsvSchemaError(f"Unknown insert compression {codec!r}")
+
+
 def chunk_to_json_lines(chunk: pd.DataFrame, columns: list[str]) -> bytes:
     """Весь чанк в JSONEachRow: сначала Arrow, при отказе — `to_json`.
 
@@ -841,6 +907,7 @@ def load_csv_via_raw_insert(
     worker_count: int = 1,
     client_factory: Callable[[], object] | None = None,
     progress_callback=None,
+    compression: str | None = None,
     stats: LoadStats | None = None,
 ) -> LoadStats:
     """Грузит CSV блоками JSONEachRow и возвращает счётчики прогона.
@@ -869,6 +936,7 @@ def load_csv_via_raw_insert(
             max_insert_payload_bytes=max_insert_payload_bytes,
             worker_count=worker_count,
             progress_callback=progress_callback,
+            compression=compression,
             stats=stats,
         )
 
@@ -891,10 +959,13 @@ def load_csv_via_raw_insert(
         )
         for block_number, ((payload, block_rows), serialize_s) in enumerate(payloads, start=1):
             stats.serialize_s += serialize_s
+            body = _compress_block(payload, compression, stats)
+            insert_started = time.perf_counter()
             try:
-                summary = raw_insert_batch(client, database, table, columns, payload)
+                summary = raw_insert_batch(client, database, table, columns, body, compression)
             except Exception as exc:
                 # Тот же учёт, что на параллельном пути: блок не подтверждён.
+                stats.insert_busy_s += time.perf_counter() - insert_started
                 stats.blocks_unconfirmed += 1
                 raise _raw_insert_error(
                     exc=exc,
@@ -905,12 +976,14 @@ def load_csv_via_raw_insert(
                     block_rows=block_rows,
                     payload_bytes=len(payload),
                 ) from exc
+            stats.insert_busy_s += time.perf_counter() - insert_started
             progress = _block_progress(
                 chunk_number=chunk_number,
                 block_number=block_number,
                 block_rows=block_rows,
                 rows_total=stats.rows + block_rows,
                 payload_bytes=len(payload),
+                wire_bytes=len(body),
                 summary=summary,
             )
             stats.add_block(progress)
@@ -932,6 +1005,7 @@ def _load_csv_via_raw_insert_parallel(
     max_insert_payload_bytes: int,
     worker_count: int,
     progress_callback,
+    compression: str | None,
     stats: LoadStats,
 ) -> LoadStats:
     usecols = [mapping.source_name for mapping in mappings if mapping.include]
@@ -952,9 +1026,17 @@ def _load_csv_via_raw_insert_parallel(
         block_rows: int,
         columns: list[str],
         payload: bytes,
+        raw_bytes: int,
+        submitted_at: float,
     ) -> _InsertedBlock:
+        # Часы снимаются ЗДЕСЬ, в воркере: только так видно, сколько длится сама
+        # вставка. Складывает эти числа главный поток, поэтому лок не нужен —
+        # воркер трогает лишь свои локальные float.
+        started = time.perf_counter()
         try:
-            summary = raw_insert_batch(worker_client(), database, table, columns, payload)
+            summary = raw_insert_batch(
+                worker_client(), database, table, columns, payload, compression
+            )
         except Exception as exc:
             raise _raw_insert_error(
                 exc=exc,
@@ -969,8 +1051,13 @@ def _load_csv_via_raw_insert_parallel(
             chunk_number=chunk_number,
             block_number=block_number,
             block_rows=block_rows,
-            payload_bytes=len(payload),
+            payload_bytes=raw_bytes,
+            wire_bytes=len(payload),
             summary=summary,
+            # Разность отметок из РАЗНЫХ потоков законна: perf_counter на Windows
+            # это QueryPerformanceCounter, он общесистемный, а не потоковый.
+            queue_s=started - submitted_at,
+            insert_s=time.perf_counter() - started,
         )
 
     def block_progress_for(inserted: _InsertedBlock) -> BlockProgress:
@@ -978,12 +1065,18 @@ def _load_csv_via_raw_insert_parallel(
         # блока», а не порядковый номер отправки: блоки завершаются в любом
         # порядке, а накопление идёт в порядке завершения и в одном потоке,
         # поэтому итог от порядка не зависит.
+        #
+        # Часы воркера складываются ЗДЕСЬ, в главном потоке: сами воркеры
+        # общих счётчиков не трогают, поэтому лок не нужен.
+        stats.insert_busy_s += inserted.insert_s
+        stats.insert_queue_s += inserted.queue_s
         return _block_progress(
             chunk_number=inserted.chunk_number,
             block_number=inserted.block_number,
             block_rows=inserted.block_rows,
             rows_total=stats.rows + inserted.block_rows,
             payload_bytes=inserted.payload_bytes,
+            wire_bytes=inserted.wire_bytes,
             summary=inserted.summary,
         )
 
@@ -1019,7 +1112,15 @@ def _load_csv_via_raw_insert_parallel(
 
     def collect_completed(pending: set[Future]) -> None:
         # Вызывается только из главного потока, поэтому stats мутируется без лока.
+        #
+        # Замеряется РОВНО ожидание готового блока, а не тело функции: дальше
+        # идут `future.result()`, учёт и `progress_callback`, который ходит в
+        # Streamlit и стоянкой на очереди не является. Если блок уже готов,
+        # `wait` возвращается сразу и прибавляет почти ноль — поле считает
+        # настоящее блокирование, а не число вызовов.
+        stall_started = time.perf_counter()
         done, _pending = wait(pending, return_when=FIRST_COMPLETED)
+        stats.producer_stall_s += time.perf_counter() - stall_started
         for future in done:
             pending.remove(future)
             try:
@@ -1063,7 +1164,9 @@ def _load_csv_via_raw_insert_parallel(
                             block_number=block_number,
                             block_rows=block_rows,
                             columns=columns,
-                            payload=payload,
+                            payload=_compress_block(payload, compression, stats),
+                            raw_bytes=len(payload),
+                            submitted_at=time.perf_counter(),
                         )
                     )
                     if len(pending) >= max_pending:
@@ -1093,7 +1196,13 @@ class _InsertedBlock:
     block_number: int
     block_rows: int
     payload_bytes: int
+    #: Сколько байт реально ушло в провод: после сжатия меньше `payload_bytes`.
+    wire_bytes: int
     summary: dict[str, str]
+    #: Сколько блок пролежал в очереди пула: от `submit` до начала отправки.
+    queue_s: float = 0.0
+    #: Сколько длилась сама вставка в воркере, стенные часы.
+    insert_s: float = 0.0
 
 
 _TimedItem = TypeVar("_TimedItem")
@@ -1118,8 +1227,10 @@ def _block_progress(
     rows_total: int,
     payload_bytes: int,
     summary: dict[str, str],
+    wire_bytes: int | None = None,
 ) -> BlockProgress:
-    # raw_bytes == wire_bytes, пока тело не сжимается: сжатие приходит в фазе 2.
+    # `raw_bytes` — размер ДО сжатия, `wire_bytes` — то, что реально ушло. Без
+    # сжатия они равны; коэффициент читается как их отношение.
     #
     # Признак «сервер сообщил своё время» берётся из наличия elapsed_ns, а НЕ из
     # непустоты сводки: драйвер всегда дописывает в неё query_id
@@ -1132,7 +1243,7 @@ def _block_progress(
         block_rows=block_rows,
         rows_total=rows_total,
         raw_bytes=payload_bytes,
-        wire_bytes=payload_bytes,
+        wire_bytes=payload_bytes if wire_bytes is None else wire_bytes,
         server_ns=elapsed_ns or 0,
         server_time_reported=elapsed_ns is not None,
     )

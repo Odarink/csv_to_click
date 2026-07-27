@@ -129,9 +129,10 @@ def load_environment(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
 
     monkeypatch.setattr(app, "write_run_record", write_run_record_to_tmp)
 
-    def run(client) -> None:
+    def run(client, insert_compression: str = "off") -> None:
         monkeypatch.setattr(app, "get_client", lambda config: client)
         app._create_and_load(
+            insert_compression=insert_compression,
             config=ClickHouseConfig(database="sandbox", cluster="clickhouse"),
             csv_path=str(csv_path),
             read_options=ReadOptions(batch_size=2),
@@ -187,6 +188,66 @@ def test_successful_load_reports_every_clock_and_persists_the_run_record(load_en
     assert isinstance(record["stats"]["arrow_bytes_at_start"], int)
     assert isinstance(record["stats"]["arrow_bytes"], int)
     assert record["stats"]["arrow_bytes"] >= record["stats"]["arrow_bytes_at_start"]
+
+
+def test_the_chosen_codec_reaches_the_wire_and_the_record(load_environment, monkeypatch) -> None:
+    """Настройка, которая не доезжает до провода, — это ложное ускорение.
+
+    Оператор увидит `zstd` в записи, прежнюю скорость и не поймёт, почему.
+    Поэтому проверяется и то, что уехало в клиент, и то, что записано.
+    """
+    sent: list[str | None] = []
+    original = app.load_csv_via_raw_insert
+
+    def spy(**kwargs):
+        sent.append(kwargs.get("compression"))
+        return original(**kwargs)
+
+    monkeypatch.setattr(app, "load_csv_via_raw_insert", spy)
+    load_environment.run(FakeRawClient(), insert_compression="zstd")
+
+    record = read_single_record(load_environment.records)
+    assert sent == ["zstd"], "кодек не доехал до загрузчика"
+    assert record["config"]["insert_compression"] == "zstd"
+    # Тело обязано отличаться от исходного. МЕНЬШЕ оно тут не будет: три строки
+    # в 61 байт дают 71 из-за заголовка кадра zstd. Выигрыш появляется на
+    # мегабайтных блоках (замерено 3,76x на 9,5 МБ), а порога по размеру нет
+    # намеренно: десяток лишних байт на блок против 3,76x — не та цена, за
+    # которую стоит заводить ещё одну ручку.
+    assert record["stats"]["wire_bytes"] != record["stats"]["raw_bytes"]
+    assert record["stats"]["compress_s"] > 0
+    assert "compressed" in load_environment.streamlit.rendered_log
+
+
+def test_without_compression_the_wire_carries_the_raw_payload(load_environment) -> None:
+    load_environment.run(FakeRawClient())
+
+    record = read_single_record(load_environment.records)
+    assert record["config"]["insert_compression"] == "off"
+    assert record["stats"]["wire_bytes"] == record["stats"]["raw_bytes"]
+    assert record["stats"]["compress_s"] == 0.0
+
+
+def test_the_record_answers_who_was_the_bottleneck(load_environment) -> None:
+    """Прогон на 500 млн строк оставил 85% времени необъяснёнными.
+
+    Теперь запись отвечает на это сама: сколько продюсер стоял, сколько длилась
+    вставка и какую долю в ней занял сервер. Занятость считается только здесь —
+    `insert_wall_s` ставит приложение, загрузчик его не знает.
+    """
+    load_environment.run(FakeRawClient())
+
+    record = read_single_record(load_environment.records)
+    stats = record["stats"]
+
+    assert stats["insert_busy_s"] > 0, "время самой вставки не замерено"
+    assert stats["producer_stall_s"] >= 0
+    assert stats["insert_queue_s"] >= 0
+
+    log = load_environment.streamlit.rendered_log
+    assert "Who waited for whom" in log
+    assert "workers were busy" in log
+    assert "Unattributed producer time" in log
 
 
 def test_the_app_arms_the_driver_retry_counter_around_the_load(load_environment) -> None:
