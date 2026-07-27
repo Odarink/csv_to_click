@@ -2,19 +2,18 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
-import json
 from dataclasses import dataclass
-from datetime import date, datetime
-from decimal import Decimal
 from pathlib import Path
 import threading
-from typing import Iterator
+import time
+from typing import Iterator, TypeVar
 
 import numpy as np
 import pandas as pd
 
-from csv_click.clickhouse import raw_insert_batch
+from csv_click.clickhouse import raw_insert_batch, summary_elapsed_ns
 from csv_click.errors import CsvLoadError, CsvReadCancelled, CsvSchemaError
+from csv_click.load_stats import BlockProgress, LoadStats
 from csv_click.schema import (
     CsvColumn,
     CsvSchema,
@@ -35,6 +34,12 @@ class ReadOptions:
 
 
 DEFAULT_MAX_INSERT_PAYLOAD_BYTES = 16 * 1024 * 1024
+#: Сколько строк сериализовать, чтобы оценить размер строки перед нарезкой.
+_BLOCK_ESTIMATE_SAMPLE_ROWS = 1024
+#: Во сколько раз оценка строк-на-блок может вырасти за один блок. Ограничение
+#: нужно, чтобы после одного маленького блока не сериализовать заведомо
+#: огромный срез только ради того, чтобы его обрезать.
+_BLOCK_ESTIMATE_GROWTH_LIMIT = 16
 DEFAULT_SCHEMA_SAMPLE_ROWS = 100_000
 ENCODING_SUGGESTIONS: tuple[str, ...] = ("utf_8", "utf-8-sig", "cp1251", "windows-1251")
 MOJIBAKE_MARKERS: tuple[str, ...] = ("С‚", "Рµ", "Р°", "Рё", "Рѕ", "РЅ", "�")
@@ -436,8 +441,26 @@ def validate_csv_sample_with_pandas_chunks(
     return rows_count
 
 
-def chunk_to_json_each_row_payload(chunk: pd.DataFrame, columns: list[str]) -> bytes:
-    return b"\n".join(_json_each_row_line(row, columns) for row in _iter_rows(chunk, columns))
+def chunk_to_json_lines(chunk: pd.DataFrame, columns: list[str]) -> bytes:
+    """Весь чанк в JSONEachRow одним векторным вызовом.
+
+    Заменяет построчный цикл с `json.dumps`: на замеренном профиле (одна
+    колонка, 107 млн строк) он занимал 90,1% времени вставки и держал пять
+    HTTP-воркеров голодными. `to_json` уходит в C и снимает постоянные расходы
+    на строку, которые на узком файле и составляют почти всё.
+
+    Все значения к этому моменту уже приведены `convert_chunk_to_schema` к
+    типам, которые `to_json` кодирует напрямую: str, int, float, bool, None и
+    Decimal — последний он кодирует строкой, ровно как это делал `str()` в
+    построчном пути. Временные колонки приведены к строкам там же, вектором.
+    """
+    payload = chunk[columns].to_json(
+        orient="records",
+        lines=True,
+        force_ascii=False,
+        double_precision=15,
+    )
+    return payload.rstrip("\n").encode("utf-8")
 
 
 def iter_json_each_row_payloads(
@@ -447,35 +470,69 @@ def iter_json_each_row_payloads(
 ) -> Iterator[tuple[bytes, int]]:
     if max_payload_bytes <= 0:
         raise ValueError("max_payload_bytes must be positive")
+    total_rows = len(chunk)
+    if total_rows == 0:
+        return
 
-    lines: list[bytes] = []
-    payload_bytes = 0
-    rows_count = 0
+    # Размер строки оценивается по ОГРАНИЧЕННОЙ головной выборке, а не по всему
+    # чанку. Сериализовать чанк целиком только чтобы узнать его длину - значит
+    # платить лишний полный проход и держать весь payload в памяти на каждом
+    # чанке, который в лимит не влез, а это любая таблица шире ~150 байт/строку
+    # при настройках по умолчанию.
+    sample_rows = min(_BLOCK_ESTIMATE_SAMPLE_ROWS, total_rows)
+    sample = chunk_to_json_lines(chunk.iloc[:sample_rows], columns)
+    if sample_rows == total_rows and len(sample) <= max_payload_bytes:
+        yield sample, total_rows
+        return
 
-    for row in _iter_rows(chunk, columns):
-        line = _json_each_row_line(row, columns)
-        line_size = len(line)
-        if line_size > max_payload_bytes:
+    bytes_per_row = max(1.0, len(sample) / sample_rows)
+    rows_per_block = max(1, int(max_payload_bytes / bytes_per_row))
+
+    # Уже сериализованные, но ещё не отправленные строки. Благодаря буферу
+    # перебравший срез не выбрасывается: лишние строки уходят в следующий блок,
+    # и каждая строка сериализуется РОВНО ОДИН раз. Без него нарезка на
+    # разнородных данных проигрывала построчному упаковщику вдвое.
+    # Разбиение по b"\n" корректно: JSON экранирует переводы строк в значениях.
+    pending: list[bytes] = []
+    pending_bytes = 0
+    start = 0
+    while pending or start < total_rows:
+        while start < total_rows and pending_bytes + max(0, len(pending) - 1) <= max_payload_bytes:
+            stop = min(start + rows_per_block, total_rows)
+            more = chunk_to_json_lines(chunk.iloc[start:stop], columns).split(b"\n")
+            pending.extend(more)
+            read_bytes = sum(map(len, more))
+            pending_bytes += read_bytes
+            start = stop
+            # Оценка растёт и здесь, а не только после отправки блока: иначе
+            # после пачки толстых строк дозаполнение читало бы тонкие такими же
+            # мелкими порциями и делало бы тысячи вызовов to_json на один блок.
+            # Сверху всё равно ограничено остатком чанка.
+            if read_bytes:
+                grown = int(len(more) * max_payload_bytes / read_bytes)
+                rows_per_block = max(
+                    rows_per_block,
+                    min(grown, len(more) * _BLOCK_ESTIMATE_GROWTH_LIMIT),
+                )
+
+        taken = 0
+        used = 0
+        for line in pending:
+            extra = len(line) + (1 if taken else 0)
+            if used + extra > max_payload_bytes:
+                break
+            used += extra
+            taken += 1
+        if taken == 0:
             raise CsvLoadError(
                 "A single JSONEachRow row is "
-                f"{line_size} bytes, which is larger than Max insert payload "
+                f"{len(pending[0])} bytes, which is larger than Max insert payload "
                 f"{max_payload_bytes} bytes. Reduce column width or increase Max insert payload, MB."
             )
 
-        separator_bytes = 1 if rows_count else 0
-        if rows_count and payload_bytes + separator_bytes + line_size > max_payload_bytes:
-            yield b"\n".join(lines), rows_count
-            lines = []
-            payload_bytes = 0
-            rows_count = 0
-            separator_bytes = 0
-
-        lines.append(line)
-        payload_bytes += separator_bytes + line_size
-        rows_count += 1
-
-    if rows_count:
-        yield b"\n".join(lines), rows_count
+        yield b"\n".join(pending[:taken]), taken
+        pending_bytes -= sum(map(len, pending[:taken]))
+        del pending[:taken]
 
 
 def load_csv_via_raw_insert(
@@ -489,9 +546,21 @@ def load_csv_via_raw_insert(
     worker_count: int = 1,
     client_factory: Callable[[], object] | None = None,
     progress_callback=None,
-) -> int:
+    stats: LoadStats | None = None,
+) -> LoadStats:
+    """Грузит CSV блоками JSONEachRow и возвращает счётчики прогона.
+
+    ``stats`` можно передать снаружи, чтобы частичные счётчики уцелели, если
+    загрузка упадёт на середине: исключение уносит возвращаемое значение, но не
+    переданный объект.
+    """
     if worker_count <= 0:
         raise ValueError("worker_count must be positive")
+    if stats is None:
+        stats = LoadStats()
+    # Нужен самой статистике: при worker_count > 1 запросы идут одновременно, и
+    # сумма серверных времён перестаёт быть долей стенных часов.
+    stats.worker_count = worker_count
     if worker_count > 1:
         if client_factory is None:
             raise ValueError("client_factory is required when worker_count is greater than 1")
@@ -505,23 +574,28 @@ def load_csv_via_raw_insert(
             max_insert_payload_bytes=max_insert_payload_bytes,
             worker_count=worker_count,
             progress_callback=progress_callback,
+            stats=stats,
         )
 
-    rows_count = 0
     usecols = [mapping.source_name for mapping in mappings if mapping.include]
-    for chunk_number, chunk in enumerate(iter_pandas_chunks(csv_path, read_options, usecols), start=1):
+    chunks = _iter_timed(iter_pandas_chunks(csv_path, read_options, usecols))
+    for chunk_number, (chunk, read_s) in enumerate(chunks, start=1):
+        stats.read_s += read_s
+        convert_started = time.perf_counter()
         converted = convert_chunk_to_schema(chunk, mappings, chunk_number)
+        stats.convert_s += time.perf_counter() - convert_started
         columns = list(converted.columns)
-        for block_number, (payload, block_rows) in enumerate(
+        payloads = _iter_timed(
             iter_json_each_row_payloads(
                 converted,
                 columns,
                 max_payload_bytes=max_insert_payload_bytes,
-            ),
-            start=1,
-        ):
+            )
+        )
+        for block_number, ((payload, block_rows), serialize_s) in enumerate(payloads, start=1):
+            stats.serialize_s += serialize_s
             try:
-                raw_insert_batch(client, database, table, columns, payload)
+                summary = raw_insert_batch(client, database, table, columns, payload)
             except Exception as exc:
                 raise _raw_insert_error(
                     exc=exc,
@@ -532,10 +606,18 @@ def load_csv_via_raw_insert(
                     block_rows=block_rows,
                     payload_bytes=len(payload),
                 ) from exc
-            rows_count += block_rows
+            progress = _block_progress(
+                chunk_number=chunk_number,
+                block_number=block_number,
+                block_rows=block_rows,
+                rows_total=stats.rows + block_rows,
+                payload_bytes=len(payload),
+                summary=summary,
+            )
+            stats.add_block(progress)
             if progress_callback:
-                progress_callback(chunk_number, block_number, block_rows, rows_count, len(payload))
-    return rows_count
+                progress_callback(progress)
+    return stats
 
 
 def _load_csv_via_raw_insert_parallel(
@@ -549,8 +631,8 @@ def _load_csv_via_raw_insert_parallel(
     max_insert_payload_bytes: int,
     worker_count: int,
     progress_callback,
-) -> int:
-    rows_count = 0
+    stats: LoadStats,
+) -> LoadStats:
     usecols = [mapping.source_name for mapping in mappings if mapping.include]
     max_pending = worker_count * 2
     worker_state = threading.local()
@@ -569,9 +651,9 @@ def _load_csv_via_raw_insert_parallel(
         block_rows: int,
         columns: list[str],
         payload: bytes,
-    ) -> tuple[int, int, int, int]:
+    ) -> _InsertedBlock:
         try:
-            raw_insert_batch(worker_client(), database, table, columns, payload)
+            summary = raw_insert_batch(worker_client(), database, table, columns, payload)
         except Exception as exc:
             raise _raw_insert_error(
                 exc=exc,
@@ -582,48 +664,89 @@ def _load_csv_via_raw_insert_parallel(
                 block_rows=block_rows,
                 payload_bytes=len(payload),
             ) from exc
-        return chunk_number, block_number, block_rows, len(payload)
+        return _InsertedBlock(
+            chunk_number=chunk_number,
+            block_number=block_number,
+            block_rows=block_rows,
+            payload_bytes=len(payload),
+            summary=summary,
+        )
+
+    def block_progress_for(inserted: _InsertedBlock) -> BlockProgress:
+        # rows_total — это «сколько строк принято на момент завершения ЭТОГО
+        # блока», а не порядковый номер отправки: блоки завершаются в любом
+        # порядке, а накопление идёт в порядке завершения и в одном потоке,
+        # поэтому итог от порядка не зависит.
+        return _block_progress(
+            chunk_number=inserted.chunk_number,
+            block_number=inserted.block_number,
+            block_rows=inserted.block_rows,
+            rows_total=stats.rows + inserted.block_rows,
+            payload_bytes=inserted.payload_bytes,
+            summary=inserted.summary,
+        )
 
     def cancel_pending(pending: set[Future]) -> None:
+        """Гасит оставшиеся задачи после сбоя.
+
+        Блоки, которые всё-таки успели дойти до сервера, засчитываются в stats:
+        эти строки уже лежат в ClickHouse, и запись о падении обязана их
+        показывать — иначе диагностика фазы 4 пойдёт по заниженным числам.
+        Progress callback при этом не дёргается: загрузка уже падает, а он
+        ходит в Streamlit и может подменить исходную ошибку своей.
+
+        Обработанные задачи вынимаются из набора: эту функцию зовут дважды на
+        одном и том же наборе — из collect_completed и из внешнего except, — и
+        без изъятия каждый успевший блок засчитался бы по два раза.
+        """
         for future in pending:
             future.cancel()
-        for future in pending:
+        while pending:
+            future = pending.pop()
             if future.cancelled():
                 continue
             try:
-                future.result()
+                inserted = future.result()
             except Exception:
-                pass
+                # Ошибку упавшего блока поднимает collect_completed; остальные
+                # производны от того же сбоя и контекста не добавляют.
+                continue
+            stats.add_block(block_progress_for(inserted))
 
-    def collect_completed(pending: set[Future]) -> int:
-        nonlocal rows_count
+    def collect_completed(pending: set[Future]) -> None:
+        # Вызывается только из главного потока, поэтому stats мутируется без лока.
         done, _pending = wait(pending, return_when=FIRST_COMPLETED)
         for future in done:
             pending.remove(future)
             try:
-                chunk_number, block_number, block_rows, payload_bytes = future.result()
-            except Exception:
+                inserted = future.result()
+            except BaseException:
                 cancel_pending(pending)
                 raise
-            rows_count += block_rows
+            progress = block_progress_for(inserted)
+            stats.add_block(progress)
             if progress_callback:
-                progress_callback(chunk_number, block_number, block_rows, rows_count, payload_bytes)
-        return rows_count
+                progress_callback(progress)
 
     pending: set[Future] = set()
     with ThreadPoolExecutor(max_workers=worker_count) as executor:
         try:
-            for chunk_number, chunk in enumerate(iter_pandas_chunks(csv_path, read_options, usecols), start=1):
+            chunks = _iter_timed(iter_pandas_chunks(csv_path, read_options, usecols))
+            for chunk_number, (chunk, read_s) in enumerate(chunks, start=1):
+                stats.read_s += read_s
+                convert_started = time.perf_counter()
                 converted = convert_chunk_to_schema(chunk, mappings, chunk_number)
+                stats.convert_s += time.perf_counter() - convert_started
                 columns = list(converted.columns)
-                for block_number, (payload, block_rows) in enumerate(
+                payloads = _iter_timed(
                     iter_json_each_row_payloads(
                         converted,
                         columns,
                         max_payload_bytes=max_insert_payload_bytes,
-                    ),
-                    start=1,
-                ):
+                    )
+                )
+                for block_number, ((payload, block_rows), serialize_s) in enumerate(payloads, start=1):
+                    stats.serialize_s += serialize_s
                     pending.add(
                         executor.submit(
                             insert_payload,
@@ -639,20 +762,68 @@ def _load_csv_via_raw_insert_parallel(
 
             while pending:
                 collect_completed(pending)
-        except Exception:
+        except BaseException:
+            # Именно BaseException: RerunException и StopException в Streamlit
+            # наследуются от него, а бросить их может любой st.*-вызов внутри
+            # progress_callback. При except Exception отмена не срабатывала, но
+            # ThreadPoolExecutor.__exit__ всё равно дожидался уже отправленных
+            # блоков — сервер их принимал, а запись о прогоне их теряла.
             cancel_pending(pending)
             raise
-    return rows_count
+    return stats
 
 
-def _iter_rows(chunk: pd.DataFrame, columns: list[str]) -> Iterator[dict[str, object]]:
-    for values in chunk[columns].itertuples(index=False, name=None):
-        yield dict(zip(columns, values))
+@dataclass(frozen=True)
+class _InsertedBlock:
+    """Результат одной вставки, возвращаемый воркером в главный поток."""
+
+    chunk_number: int
+    block_number: int
+    block_rows: int
+    payload_bytes: int
+    summary: dict[str, str]
 
 
-def _json_each_row_line(row: dict[str, object], columns: list[str]) -> bytes:
-    cleaned = {column: _clean_json_value(row[column]) for column in columns}
-    return json.dumps(cleaned, ensure_ascii=False, allow_nan=False).encode("utf-8")
+_TimedItem = TypeVar("_TimedItem")
+
+
+def _iter_timed(iterator: Iterator[_TimedItem]) -> Iterator[tuple[_TimedItem, float]]:
+    """Отдаёт элементы вместе со временем, потраченным на получение каждого."""
+    while True:
+        started = time.perf_counter()
+        try:
+            item = next(iterator)
+        except StopIteration:
+            return
+        yield item, time.perf_counter() - started
+
+
+def _block_progress(
+    *,
+    chunk_number: int,
+    block_number: int,
+    block_rows: int,
+    rows_total: int,
+    payload_bytes: int,
+    summary: dict[str, str],
+) -> BlockProgress:
+    # raw_bytes == wire_bytes, пока тело не сжимается: сжатие приходит в фазе 2.
+    #
+    # Признак «сервер сообщил своё время» берётся из наличия elapsed_ns, а НЕ из
+    # непустоты сводки: драйвер всегда дописывает в неё query_id
+    # (httpclient.py:444), поэтому пустой она не бывает даже когда прокси срезал
+    # заголовок целиком, и проверка на пустоту была бы мёртвой.
+    elapsed_ns = summary_elapsed_ns(summary)
+    return BlockProgress(
+        chunk_number=chunk_number,
+        block_number=block_number,
+        block_rows=block_rows,
+        rows_total=rows_total,
+        raw_bytes=payload_bytes,
+        wire_bytes=payload_bytes,
+        server_ns=elapsed_ns or 0,
+        server_time_reported=elapsed_ns is not None,
+    )
 
 
 def _raw_insert_error(
@@ -697,29 +868,73 @@ def _convert_series(series: pd.Series, clickhouse_type: str) -> pd.Series:
         converted = pd.to_numeric(series, errors="raise")
         if not nullable and converted.isna().any():
             raise CsvSchemaError("empty value is not allowed for non-nullable float")
+        # Построчный путь звал json.dumps(allow_nan=False) и падал на inf.
+        # У to_json такого рычага нет, он молча пишет null - переполнившее
+        # double значение тихо легло бы пустым, а прогон отчитался бы успехом.
+        if converted.abs().eq(float("inf")).any():
+            raise CsvSchemaError(
+                "value does not fit into Float64 and became infinity; "
+                "use String or Decimal for this column"
+            )
         return pd.Series(
             [None if pd.isna(value) else float(value) for value in converted.tolist()],
             index=series.index,
             dtype="object",
         )
     if inner_type.startswith("Decimal("):
+        # Decimal остаётся Decimal: to_json кодирует его как строку "1.50", то
+        # есть ровно так же, как это делал построчный путь через str().
         return series.map(lambda value: convert_value(_value_to_string(value), clickhouse_type)).astype("object")
     if inner_type == "Date":
-        converted = pd.to_datetime(series, errors="raise").dt.date
-        if not nullable and converted.isna().any():
-            raise CsvSchemaError("empty value is not allowed for non-nullable date")
-        return converted.map(lambda value: None if pd.isna(value) else value).astype("object")
+        return _format_temporal(series, nullable, "D", "T", "date")
     if inner_type == "DateTime":
-        converted = pd.to_datetime(series, errors="raise")
-        if not nullable and converted.isna().any():
-            raise CsvSchemaError("empty value is not allowed for non-nullable datetime")
-        return converted.map(lambda value: None if pd.isna(value) else value.to_pydatetime()).astype("object")
+        # Разделитель пробел, а не 'T', и без дробных секунд: это канонический
+        # basic-формат ClickHouse. Драйвер сейчас навязывает каждому запросу
+        # date_time_input_format=best_effort, который в 2-5 раз дороже basic на
+        # значение; отдавать basic-совместимые строки - предпосылка к переходу.
+        return _format_temporal(series, nullable, "s", " ", "datetime")
     if inner_type == "Bool":
         return series.map(lambda value: convert_value(_value_to_string(value), clickhouse_type)).astype("object")
     validate_clickhouse_type_expression(clickhouse_type)
     if not nullable and series.isna().any():
         raise CsvSchemaError(f"empty value is not allowed for non-nullable {clickhouse_type}")
     return series.map(lambda value: None if pd.isna(value) else _value_to_string(value)).astype("object")
+
+
+def _format_temporal(
+    series: pd.Series,
+    nullable: bool,
+    numpy_unit: str,
+    separator: str,
+    what: str,
+) -> pd.Series:
+    """Приводит временную колонку к строкам ОДНИМ векторным вызовом.
+
+    Строки, а не объекты `date`/`datetime`, потому что дальше их сериализует
+    `DataFrame.to_json`, а он временные типы кодирует по-своему. Заодно это
+    убирает построчный `.isoformat()` из горячего пути.
+    """
+    converted = pd.to_datetime(series, errors="raise")
+    if not nullable and converted.isna().any():
+        raise CsvSchemaError(f"empty value is not allowed for non-nullable {what}")
+    if isinstance(converted.dtype, pd.DatetimeTZDtype):
+        # Форматирование напечатало бы локальное время стены и молча потеряло
+        # офсет, сдвинув КАЖДУЮ строку. Выбрать интерпретацию за пользователя
+        # нельзя: целевая колонка DateTime таймзоны не несёт.
+        raise CsvSchemaError(
+            "value carries a timezone offset, and the target DateTime column has no timezone; "
+            "strip the offset in the source or convert the column to UTC first"
+        )
+    # np.datetime_as_string, а не .dt.strftime: последний не дополняет год
+    # нулями, и 1-й год уехал бы как "1-01-01".
+    formatted = pd.Series(
+        np.datetime_as_string(converted.to_numpy(), unit=numpy_unit),
+        index=series.index,
+        dtype="object",
+    )
+    if separator != "T":
+        formatted = formatted.str.replace("T", separator, n=1, regex=False)
+    return formatted.where(converted.notna(), None).astype("object")
 
 
 def _first_bad_value(series: pd.Series, clickhouse_type: str) -> object:
@@ -729,23 +944,6 @@ def _first_bad_value(series: pd.Series, clickhouse_type: str) -> object:
         except CsvSchemaError:
             return value
     return series.iloc[0] if len(series) else ""
-
-
-def _clean_json_value(value):
-    if pd.isna(value):
-        return None
-    if isinstance(value, np.integer):
-        return int(value)
-    if isinstance(value, np.floating):
-        as_float = float(value)
-        return int(as_float) if as_float.is_integer() else as_float
-    if isinstance(value, (pd.Timestamp, datetime)):
-        return value.isoformat()
-    if isinstance(value, date):
-        return value.isoformat()
-    if isinstance(value, Decimal):
-        return str(value)
-    return value
 
 
 def _value_to_string(value) -> str:

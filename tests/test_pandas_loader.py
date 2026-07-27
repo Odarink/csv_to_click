@@ -1,11 +1,14 @@
 import json
 from pathlib import Path
+import threading
 import time
+from types import SimpleNamespace
 
 import pandas as pd
 import pytest
 
 from csv_click.errors import CsvLoadError, CsvReadCancelled, CsvSchemaError
+from csv_click.load_stats import LoadStats
 from csv_click.pandas_loader import (
     ENCODING_SUGGESTIONS,
     DEFAULT_MAX_INSERT_PAYLOAD_BYTES,
@@ -14,7 +17,7 @@ from csv_click.pandas_loader import (
     analyze_csv_with_pandas_sample,
     analyze_csv_with_pandas_chunks,
     choose_read_options_for_preview,
-    chunk_to_json_each_row_payload,
+    chunk_to_json_lines,
     convert_chunk_to_schema,
     detect_mojibake,
     iter_pandas_chunks,
@@ -27,18 +30,35 @@ from csv_click.pandas_loader import (
 )
 
 
+BLOCK_SERVER_NS = 1_000_000
+
+
 class FakeRawClient:
     def __init__(self) -> None:
         self.calls = []
 
     def raw_insert(self, **kwargs):
         self.calls.append(kwargs)
+        return SimpleNamespace(summary={"elapsed_ns": str(BLOCK_SERVER_NS)})
 
 
 class SlowRawClient(FakeRawClient):
     def raw_insert(self, **kwargs):
         time.sleep(0.02)
+        return super().raw_insert(**kwargs)
+
+
+class StrippedSummaryRawClient(FakeRawClient):
+    """Прокси срезал X-ClickHouse-Summary.
+
+    Драйвер при этом возвращает НЕ пустую сводку, а сводку с одним query_id:
+    httpclient.py:444 дописывает его безусловно. Фейк обязан повторять именно
+    эту форму, иначе тест зеленит проверку, которой в бою не существует.
+    """
+
+    def raw_insert(self, **kwargs):
         super().raw_insert(**kwargs)
+        return SimpleNamespace(summary={"query_id": "01234567-89ab-cdef"})
 
 
 def test_read_options_defaults_to_utf8_and_comma() -> None:
@@ -213,10 +233,10 @@ def test_convert_chunk_supports_include_rename_and_nullable_int() -> None:
     ]
 
 
-def test_chunk_to_json_each_row_payload_has_no_nan() -> None:
+def test_chunk_to_json_lines_has_no_nan() -> None:
     chunk = pd.DataFrame({"ID": [1], "VALUE": [None]})
 
-    payload = chunk_to_json_each_row_payload(chunk, ["ID", "VALUE"])
+    payload = chunk_to_json_lines(chunk, ["ID", "VALUE"])
 
     decoded = payload.decode("utf-8").strip()
     assert "NaN" not in decoded
@@ -230,7 +250,7 @@ def test_json_each_row_payloads_are_split_by_byte_limit() -> None:
             "VALUE": ["a" * 20, "b" * 20, "c" * 20],
         }
     )
-    first_row_payload = chunk_to_json_each_row_payload(chunk.iloc[:1].reset_index(drop=True), ["ID", "VALUE"])
+    first_row_payload = chunk_to_json_lines(chunk.iloc[:1].reset_index(drop=True), ["ID", "VALUE"])
     max_payload_bytes = len(first_row_payload) + 1
 
     payloads = list(iter_json_each_row_payloads(chunk, ["ID", "VALUE"], max_payload_bytes=max_payload_bytes))
@@ -308,22 +328,26 @@ def test_load_csv_via_raw_insert_uses_json_each_row_chunks(tmp_path: Path) -> No
     client = FakeRawClient()
     progress_events = []
 
-    rows = load_csv_via_raw_insert(
+    stats = load_csv_via_raw_insert(
         client=client,
         csv_path=csv_path,
         read_options=ReadOptions(batch_size=2),
         database="sandbox",
         table="target_table",
         mappings=mappings,
-        progress_callback=lambda *args: progress_events.append(args),
+        progress_callback=progress_events.append,
     )
 
-    assert rows == 3
+    assert stats.rows == 3
+    assert stats.blocks == 2
     assert len(client.calls) == 2
     assert client.calls[0]["table"] == "sandbox.target_table"
     assert client.calls[0]["column_names"] == ["ID", "VALUE"]
     assert client.calls[0]["fmt"] == "JSONEachRow"
-    assert progress_events[0] == (1, 1, 2, 2, len(client.calls[0]["insert_block"]))
+    first = progress_events[0]
+    assert (first.chunk_number, first.block_number, first.block_rows, first.rows_total) == (1, 1, 2, 2)
+    assert first.raw_bytes == len(client.calls[0]["insert_block"])
+    assert first.wire_bytes == first.raw_bytes
 
 
 def test_load_csv_via_raw_insert_splits_one_chunk_into_bounded_payloads(tmp_path: Path) -> None:
@@ -336,7 +360,7 @@ def test_load_csv_via_raw_insert_splits_one_chunk_into_bounded_payloads(tmp_path
     client = FakeRawClient()
     progress_events = []
 
-    rows = load_csv_via_raw_insert(
+    stats = load_csv_via_raw_insert(
         client=client,
         csv_path=csv_path,
         read_options=ReadOptions(batch_size=4),
@@ -344,19 +368,22 @@ def test_load_csv_via_raw_insert_splits_one_chunk_into_bounded_payloads(tmp_path
         table="target_table",
         mappings=mappings,
         max_insert_payload_bytes=30,
-        progress_callback=lambda *args: progress_events.append(args),
+        progress_callback=progress_events.append,
     )
 
-    assert rows == 4
+    assert stats.rows == 4
     assert len(client.calls) == 4
     assert all(len(call["insert_block"]) <= 30 for call in client.calls)
-    assert [event[:4] for event in progress_events] == [
+    assert [
+        (event.chunk_number, event.block_number, event.block_rows, event.rows_total)
+        for event in progress_events
+    ] == [
         (1, 1, 1, 1),
         (1, 2, 1, 2),
         (1, 3, 1, 3),
         (1, 4, 1, 4),
     ]
-    assert all(event[4] <= 30 for event in progress_events)
+    assert all(event.wire_bytes <= 30 for event in progress_events)
 
 
 def test_load_csv_via_raw_insert_parallel_uses_client_factory(tmp_path: Path) -> None:
@@ -375,7 +402,7 @@ def test_load_csv_via_raw_insert_parallel_uses_client_factory(tmp_path: Path) ->
         worker_clients.append(client)
         return client
 
-    rows = load_csv_via_raw_insert(
+    stats = load_csv_via_raw_insert(
         client=shared_client,
         csv_path=csv_path,
         read_options=ReadOptions(batch_size=1),
@@ -384,15 +411,17 @@ def test_load_csv_via_raw_insert_parallel_uses_client_factory(tmp_path: Path) ->
         mappings=mappings,
         worker_count=3,
         client_factory=client_factory,
-        progress_callback=lambda *args: progress_events.append(args),
+        progress_callback=progress_events.append,
     )
 
     worker_calls = [call for worker_client in worker_clients for call in worker_client.calls]
-    assert rows == 4
+    assert stats.rows == 4
+    assert stats.blocks == 4
+    assert stats.server_ns == 4 * BLOCK_SERVER_NS
     assert shared_client.calls == []
     assert len(worker_calls) == 4
     assert len(worker_clients) > 1
-    assert sorted(event[3] for event in progress_events) == [1, 2, 3, 4]
+    assert sorted(event.rows_total for event in progress_events) == [1, 2, 3, 4]
 
 
 def test_load_csv_via_raw_insert_parallel_requires_client_factory(tmp_path: Path) -> None:
@@ -422,7 +451,7 @@ def test_load_csv_via_raw_insert_parallel_wraps_insert_error_with_context(tmp_pa
 
     class FailingRawClient(FakeRawClient):
         def raw_insert(self, **kwargs):
-            if b'"ID": 2' in kwargs["insert_block"]:
+            if b'"ID":2' in kwargs["insert_block"]:
                 raise RuntimeError("HTTP status 500: the read limit is reached")
             super().raw_insert(**kwargs)
 
@@ -492,6 +521,240 @@ def test_load_csv_via_raw_insert_wraps_read_limit_error_with_payload_context(tmp
             table="target_table",
             mappings=mappings,
         )
+
+
+def test_load_csv_via_raw_insert_records_server_time_and_stage_clocks(tmp_path: Path) -> None:
+    csv_path = tmp_path / "load.csv"
+    csv_path.write_text("ID,VALUE\n1,a\n2,b\n3,c\n", encoding="utf_8")
+    mappings = [
+        SchemaMapping("ID", "ID", True, "UInt64", False),
+        SchemaMapping("VALUE", "VALUE", True, "String", False),
+    ]
+
+    stats = load_csv_via_raw_insert(
+        client=FakeRawClient(),
+        csv_path=csv_path,
+        read_options=ReadOptions(batch_size=2),
+        database="sandbox",
+        table="target_table",
+        mappings=mappings,
+    )
+
+    assert stats.blocks == 2
+    assert stats.server_ns == 2 * BLOCK_SERVER_NS
+    assert stats.blocks_without_server_time == 0
+    assert stats.worker_count == 1
+    assert stats.raw_bytes > 0
+    assert stats.wire_bytes == stats.raw_bytes
+    assert stats.read_s > 0
+    assert stats.convert_s > 0
+    assert stats.serialize_s > 0
+
+
+def test_load_csv_via_raw_insert_counts_blocks_with_a_stripped_summary_header(tmp_path: Path) -> None:
+    csv_path = tmp_path / "load.csv"
+    csv_path.write_text("ID,VALUE\n1,a\n2,b\n3,c\n", encoding="utf_8")
+    mappings = [
+        SchemaMapping("ID", "ID", True, "UInt64", False),
+        SchemaMapping("VALUE", "VALUE", True, "String", False),
+    ]
+
+    stats = load_csv_via_raw_insert(
+        client=StrippedSummaryRawClient(),
+        csv_path=csv_path,
+        read_options=ReadOptions(batch_size=2),
+        database="sandbox",
+        table="target_table",
+        mappings=mappings,
+    )
+    stats.insert_wall_s = 5.0
+
+    assert stats.blocks == 2
+    assert stats.blocks_without_server_time == 2
+    assert stats.server_ns == 0
+    assert stats.server_share is None
+
+
+def test_load_csv_via_raw_insert_keeps_partial_stats_of_a_failed_load(tmp_path: Path) -> None:
+    csv_path = tmp_path / "load.csv"
+    csv_path.write_text("ID,VALUE\n1,a\n2,b\n3,c\n", encoding="utf_8")
+    mappings = [
+        SchemaMapping("ID", "ID", True, "UInt64", False),
+        SchemaMapping("VALUE", "VALUE", True, "String", False),
+    ]
+    stats = LoadStats()
+
+    class FailingOnSecondBlock(FakeRawClient):
+        def raw_insert(self, **kwargs):
+            if b'"ID":2' in kwargs["insert_block"]:
+                raise RuntimeError("HTTP status 500: the read limit is reached")
+            return super().raw_insert(**kwargs)
+
+    with pytest.raises(CsvLoadError):
+        load_csv_via_raw_insert(
+            client=FailingOnSecondBlock(),
+            csv_path=csv_path,
+            read_options=ReadOptions(batch_size=1),
+            database="sandbox",
+            table="target_table",
+            mappings=mappings,
+            stats=stats,
+        )
+
+    assert stats.rows == 1
+    assert stats.blocks == 1
+    assert stats.server_ns == BLOCK_SERVER_NS
+
+
+def test_parallel_load_accumulates_correctly_when_blocks_finish_out_of_order(tmp_path: Path) -> None:
+    """Блоки завершаются в любом порядке, а накопление идёт в порядке завершения
+    и в одном потоке. Здесь порядок завершения принудительно обратный порядку
+    отправки — итог от этого зависеть не должен."""
+    csv_path = tmp_path / "reverse.csv"
+    csv_path.write_text("ID,VALUE\n1,a\n2,b\n3,c\n4,d\n5,e\n6,f\n", encoding="utf_8")
+    mappings = [
+        SchemaMapping("ID", "ID", True, "UInt64", False),
+        SchemaMapping("VALUE", "VALUE", True, "String", False),
+    ]
+    order_lock = threading.Lock()
+    submitted: list[bytes] = []
+    completed: list[bytes] = []
+
+    class ReverseOrderClient(FakeRawClient):
+        def raw_insert(self, **kwargs):
+            with order_lock:
+                index = len(submitted)
+                submitted.append(kwargs["insert_block"])
+            time.sleep(0.30 - index * 0.04)
+            with order_lock:
+                completed.append(kwargs["insert_block"])
+            return super().raw_insert(**kwargs)
+
+    events: list = []
+    stats = load_csv_via_raw_insert(
+        client=FakeRawClient(),
+        csv_path=csv_path,
+        read_options=ReadOptions(batch_size=1),
+        database="sandbox",
+        table="target_table",
+        mappings=mappings,
+        worker_count=6,
+        client_factory=ReverseOrderClient,
+        progress_callback=events.append,
+    )
+
+    assert completed != submitted, "порядок завершения не отличался — тест ничего не проверил"
+    assert stats.rows == 6
+    assert stats.blocks == 6
+    assert stats.server_ns == 6 * BLOCK_SERVER_NS
+    assert stats.worker_count == 6
+    assert sorted(event.rows_total for event in events) == [1, 2, 3, 4, 5, 6]
+    # Сумма серверных времён по одновременным запросам долей стенных часов не является.
+    stats.insert_wall_s = 1.0
+    assert stats.server_share is None
+
+
+def test_failed_parallel_load_still_counts_blocks_the_server_already_accepted(tmp_path: Path) -> None:
+    """При сбое остальные задачи гасятся, но те, что успели дойти до сервера,
+    уже лежат в ClickHouse. Если их не засчитать, запись о падении покажет
+    меньше строк, чем реально загружено, и фаза 4 будет считать по заниженным."""
+    csv_path = tmp_path / "partial.csv"
+    csv_path.write_text("ID,VALUE\n1,a\n2,b\n3,c\n4,d\n", encoding="utf_8")
+    mappings = [
+        SchemaMapping("ID", "ID", True, "UInt64", False),
+        SchemaMapping("VALUE", "VALUE", True, "String", False),
+    ]
+    stats = LoadStats()
+    # Барьер вместо sleep: он ГАРАНТИРУЕТ, что к моменту падения все четыре
+    # блока уже внутри raw_insert. Со sleep тест проверял бы скорость запуска
+    # потоков пула — на загруженной машине часть задач ещё не стартовала бы,
+    # cancel_pending успешно их отменял, и счёт падал ниже трёх при полностью
+    # исправном коде.
+    all_blocks_in_flight = threading.Barrier(4, timeout=10)
+
+    class FailsOnceEveryBlockIsInFlight(FakeRawClient):
+        def raw_insert(self, **kwargs):
+            all_blocks_in_flight.wait()
+            if b'"ID":1' in kwargs["insert_block"]:
+                raise RuntimeError("HTTP status 500: the read limit is reached")
+            # Пауза ПОСЛЕ барьера: гонки со стартом потоков она уже не создаёт,
+            # но задаёт порядок — упавший блок завершается первым, поэтому все
+            # успешные достижимы только через cancel_pending.
+            time.sleep(0.2)
+            return super().raw_insert(**kwargs)
+
+    events: list = []
+
+    with pytest.raises(CsvLoadError):
+        load_csv_via_raw_insert(
+            client=FakeRawClient(),
+            csv_path=csv_path,
+            read_options=ReadOptions(batch_size=1),
+            database="sandbox",
+            table="target_table",
+            mappings=mappings,
+            worker_count=4,
+            client_factory=FailsOnceEveryBlockIsInFlight,
+            progress_callback=events.append,
+            stats=stats,
+        )
+
+    assert stats.blocks == 3, "успешные блоки потеряны при отмене оставшихся задач"
+    assert stats.rows == 3
+    assert stats.server_ns == 3 * BLOCK_SERVER_NS
+    # Засчитаны, но НЕ отправлены в progress_callback: загрузка уже падает, а
+    # callback ходит в Streamlit и может подменить исходную ошибку своей.
+    assert events == []
+
+
+def test_a_streamlit_rerun_mid_load_still_counts_what_the_server_accepted(tmp_path: Path) -> None:
+    """RerunException наследуется от BaseException и может прилететь из любого
+    st.*-вызова внутри progress_callback. `except Exception` её не ловил, отмена
+    не срабатывала, но пул всё равно дожидался отправленных блоков — сервер их
+    принимал, а запись о прогоне их теряла."""
+    csv_path = tmp_path / "rerun.csv"
+    csv_path.write_text("ID,VALUE\n1,a\n2,b\n3,c\n4,d\n", encoding="utf_8")
+    mappings = [
+        SchemaMapping("ID", "ID", True, "UInt64", False),
+        SchemaMapping("VALUE", "VALUE", True, "String", False),
+    ]
+    stats = LoadStats()
+    accepted = []
+    accepted_lock = threading.Lock()
+    all_blocks_in_flight = threading.Barrier(4, timeout=10)
+
+    class RerunException(BaseException):
+        pass
+
+    class CountingClient(FakeRawClient):
+        def raw_insert(self, **kwargs):
+            all_blocks_in_flight.wait()
+            with accepted_lock:
+                accepted.append(kwargs["insert_block"])
+            return super().raw_insert(**kwargs)
+
+    def rerun_on_first_progress(block) -> None:
+        raise RerunException("streamlit rerun")
+
+    with pytest.raises(RerunException):
+        load_csv_via_raw_insert(
+            client=FakeRawClient(),
+            csv_path=csv_path,
+            read_options=ReadOptions(batch_size=1),
+            database="sandbox",
+            table="target_table",
+            mappings=mappings,
+            worker_count=4,
+            client_factory=CountingClient,
+            progress_callback=rerun_on_first_progress,
+            stats=stats,
+        )
+
+    assert len(accepted) == 4, "фейковый сервер должен был принять все четыре блока"
+    assert stats.blocks == len(accepted), (
+        f"сервер принял {len(accepted)} блоков, а записано {stats.blocks}"
+    )
+    assert stats.rows == 4
 
 
 def test_mappings_from_editor_rows_prefers_custom_type_override() -> None:

@@ -3,6 +3,8 @@ from __future__ import annotations
 import os
 import sys
 import time
+from dataclasses import replace
+from datetime import datetime, timezone
 from pathlib import Path
 
 if __package__ in {None, ""}:
@@ -46,6 +48,16 @@ from csv_click.pandas_loader import (
 from csv_click.schema import (
     CLICKHOUSE_TYPE_OPTIONS,
     CsvSchema,
+)
+from csv_click.load_stats import (
+    BlockProgress,
+    DriverRetryCounter,
+    LoadStats,
+    RunConfig,
+    arrow_pool_high_water_bytes,
+    describe_connection_path,
+    format_load_stats_lines,
+    write_run_record,
 )
 from csv_click.settings import AppSettings, load_app_settings, save_app_settings
 
@@ -865,6 +877,32 @@ def _create_and_load(
     inserted_rows = 0
     client = None
     tables_created = False
+    max_insert_payload_bytes = _effective_insert_payload_bytes(max_insert_payload_mb)
+    # Отметка пула PyArrow монотонна и живёт весь процесс Streamlit, поэтому
+    # снимаем её и до, и после: этой загрузке принадлежит только прирост.
+    stats = LoadStats(arrow_bytes_at_start=arrow_pool_high_water_bytes())
+    # Собирается до try, чтобы запись о прогоне уцелела при любом раннем падении.
+    run_config = RunConfig(
+        batch_size=read_options.batch_size,
+        max_insert_payload_mb=max_insert_payload_mb,
+        effective_insert_payload_bytes=max_insert_payload_bytes,
+        load_workers=load_workers,
+        strict_preflight=strict_preflight,
+        schema_inference_mode=st.session_state.get(
+            "schema_analysis_mode",
+            SCHEMA_INFERENCE_SAMPLE,
+        ),
+        separator=read_options.separator,
+        encoding=read_options.encoding,
+        database=config.database,
+        table=distributed_table,
+        cluster=config.cluster,
+        order_by=order_by,
+        partition_by=partition_by,
+        sharding_key=sharding_key,
+    )
+    outcome = "failed"
+    error_message: str | None = None
 
     def log(message: str) -> None:
         _append_load_log(log_messages, message)
@@ -880,9 +918,15 @@ def _create_and_load(
         if encoding_warning:
             log(encoding_warning.message)
         st.session_state["csv_read_options"] = effective_read_options
+        run_config = replace(
+            run_config,
+            batch_size=effective_read_options.batch_size,
+            separator=effective_read_options.separator,
+            encoding=effective_read_options.encoding,
+        )
         total_rows = 0
+        stats.src_bytes = Path(csv_path).stat().st_size
         configured_insert_payload_bytes = max_insert_payload_mb * 1024 * 1024
-        max_insert_payload_bytes = _effective_insert_payload_bytes(max_insert_payload_mb)
         configured_insert_payload_mb = configured_insert_payload_bytes / 1024 / 1024
         effective_insert_payload_mb = max_insert_payload_bytes / 1024 / 1024
         log(
@@ -896,8 +940,9 @@ def _create_and_load(
                 "Effective insert payload limit is lower than the configured UI value "
                 "to stay below ClickHouse HTTP/proxy read limits."
             )
+        preflight_started = time.perf_counter()
         if strict_preflight:
-            file_size_bytes = Path(csv_path).stat().st_size
+            file_size_bytes = stats.src_bytes
             if file_size_bytes > LARGE_CSV_PRECHECK_THRESHOLD_BYTES:
                 sample_rows = max(SAMPLE_PRECHECK_ROWS, effective_read_options.batch_size)
                 warning_message = (
@@ -925,15 +970,23 @@ def _create_and_load(
                     max_insert_payload_bytes=max_insert_payload_bytes,
                 )
                 log(f"Strict validation finished: {total_rows} rows.")
+        stats.preflight_s = time.perf_counter() - preflight_started
 
         log("Connecting to ClickHouse.")
         status.info("Connecting to ClickHouse...")
+        connect_started = time.perf_counter()
         client = get_client(config)
         test_connection(client)
+        stats.connect_s = time.perf_counter() - connect_started
+        # Соединение сейчас простаивает в пуле — единственный момент, когда из
+        # него можно достать адреса. Отвечает на вопрос «прогон шёл через
+        # туннель или напрямую», без которого сравнение «до/после» бессмысленно.
+        stats.connection_path = describe_connection_path(client)
         log("ClickHouse connection OK.")
 
         log("Checking existing tables and creating DDL.")
         status.info("Checking existing tables and creating DDL...")
+        ddl_started = time.perf_counter()
         create_tables(
             client=client,
             config=config,
@@ -944,71 +997,110 @@ def _create_and_load(
             sharding_key=sharding_key,
             log_callback=log,
         )
+        stats.ddl_s = time.perf_counter() - ddl_started
         tables_created = True
         log("Target tables are created and visible on cluster.")
 
         log("Loading CSV chunks through JSONEachRow.")
         status.info("Loading CSV chunks through JSONEachRow...")
 
-        def on_progress(
-            chunk_number: int,
-            block_number: int,
-            block_rows: int,
-            rows_total: int,
-            payload_bytes: int,
-        ) -> None:
+        def on_progress(block: BlockProgress) -> None:
             nonlocal inserted_rows
-            inserted_rows = rows_total
+            inserted_rows = block.rows_total
             if total_rows:
                 progress.progress(min(1.0, inserted_rows / total_rows))
             metrics.metric("Inserted rows", inserted_rows)
-            payload_mb = payload_bytes / 1024 / 1024
-            status.info(f"Loaded chunk {chunk_number}, block {block_number}: {block_rows} rows")
+            payload_mb = block.wire_bytes / 1024 / 1024
+            status.info(
+                f"Loaded chunk {block.chunk_number}, block {block.block_number}: "
+                f"{block.block_rows} rows"
+            )
             log(
-                f"Loaded chunk {chunk_number}, block {block_number}: "
-                f"{block_rows} rows, {payload_mb:.2f} MB, total {rows_total}."
+                f"Loaded chunk {block.chunk_number}, block {block.block_number}: "
+                f"{block.block_rows} rows, {payload_mb:.2f} MB, total {block.rows_total}."
             )
 
-        inserted_rows = load_csv_via_raw_insert(
-            client=client,
-            csv_path=csv_path,
-            read_options=effective_read_options,
-            database=config.database,
-            table=distributed_table,
-            mappings=mappings,
-            max_insert_payload_bytes=max_insert_payload_bytes,
-            worker_count=load_workers,
-            client_factory=lambda: get_client(config),
-            progress_callback=on_progress,
-        )
+        driver_retries = DriverRetryCounter()
+        insert_started = time.perf_counter()
+        try:
+            with driver_retries:
+                load_csv_via_raw_insert(
+                    client=client,
+                    csv_path=csv_path,
+                    read_options=effective_read_options,
+                    database=config.database,
+                    table=distributed_table,
+                    mappings=mappings,
+                    max_insert_payload_bytes=max_insert_payload_bytes,
+                    worker_count=load_workers,
+                    client_factory=lambda: get_client(config),
+                    progress_callback=on_progress,
+                    stats=stats,
+                )
+        finally:
+            # insert_wall_s замеряется строго вокруг загрузки: preflight, connect
+            # и DDL в него не входят, иначе server % считался бы от чужого времени.
+            stats.insert_wall_s = time.perf_counter() - insert_started
+            stats.driver_retries = driver_retries.count
 
+        inserted_rows = stats.rows
         progress.progress(1.0)
         elapsed = time.time() - start
         log(f"Load finished: {inserted_rows} rows in {elapsed:.2f} sec.")
+        for line in format_load_stats_lines(stats):
+            log(line)
         status.success(f"Load finished: {inserted_rows} rows in {elapsed:.2f} sec")
+        outcome = "ok"
     except CertificateError as exc:
-        log(f"Certificate error: {exc}")
-        status.error(f"Certificate error: {exc}")
+        error_message = f"Certificate error: {exc}"
+        log(error_message)
+        status.error(error_message)
     except ExistingTableError as exc:
-        log(f"Existing table error: {exc}")
-        status.error(f"Existing table error: {exc}")
+        error_message = f"Existing table error: {exc}"
+        log(error_message)
+        status.error(error_message)
     except (CsvSchemaError, ClickHouseConnectionError, CsvClickError) as exc:
         if tables_created and client is not None:
             try:
                 _cleanup_after_failed_load(client, config, distributed_table, log)
             except Exception as cleanup_exc:
                 log(f"Cleanup error: {cleanup_exc}")
-        log(str(exc))
-        status.error(str(exc))
+        error_message = str(exc)
+        log(error_message)
+        status.error(error_message)
     except Exception as exc:
         if tables_created and client is not None:
             try:
                 _cleanup_after_failed_load(client, config, distributed_table, log)
             except Exception as cleanup_exc:
                 log(f"Cleanup error: {cleanup_exc}")
-        message = _format_load_error(exc)
-        log(message)
-        status.error(message)
+        error_message = _format_load_error(exc)
+        log(error_message)
+        status.error(error_message)
+    finally:
+        stats.total_s = time.time() - start
+        stats.arrow_bytes = arrow_pool_high_water_bytes()
+        if outcome == "failed" and error_message is None:
+            # Сюда попадает BaseException мимо except Exception — прежде всего
+            # RerunException и StopException Streamlit, которые может бросить
+            # любой st.*-вызов внутри on_progress или log. Без этой ветки запись
+            # утверждала бы «failed» с пустой причиной.
+            outcome = "interrupted"
+            error_message = (
+                "the Streamlit script was interrupted (rerun or stop) before the load finished"
+            )
+        try:
+            record_path = write_run_record(
+                config=run_config,
+                stats=stats,
+                csv_path=Path(csv_path),
+                outcome=outcome,
+                error=error_message,
+                timestamp=datetime.now(timezone.utc),
+            )
+            log(f"Run record saved to {record_path}")
+        except OSError as write_exc:
+            log(f"Could not save the run record: {write_exc}")
 
 
 if __name__ == "__main__":

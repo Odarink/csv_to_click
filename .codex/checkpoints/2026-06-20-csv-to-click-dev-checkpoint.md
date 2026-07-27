@@ -1,7 +1,7 @@
-# CSV to ClickHouse: development checkpoint
+﻿# CSV to ClickHouse: development checkpoint
 
 Date: 2026-06-20 09:42:53 +03:00
-Repository: `C:\Users\odar\Downloads\codex\projects\csv_to_click`
+Repository: `<HOME>\Downloads\codex\projects\csv_to_click`
 Branch at checkpoint: `main`
 Remote state before checkpoint file: `main...origin/main`
 

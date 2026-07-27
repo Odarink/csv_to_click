@@ -331,7 +331,21 @@ def test_create_and_load_passes_max_insert_payload_to_loader() -> None:
     create_and_load_source = match.group(0)
     assert "max_insert_payload_mb: int" in create_and_load_source
     assert "max_insert_payload_bytes = _effective_insert_payload_bytes(max_insert_payload_mb)" in create_and_load_source
-    assert "payload_bytes" in create_and_load_source
+    assert "block.wire_bytes" in create_and_load_source
+
+    # Именно аргументы вызова загрузчика: тот же kwarg передаётся и в две
+    # функции preflight-валидации, поэтому пин на подстроку по всей функции
+    # оставался бы зелёным даже после его пропажи из вызова загрузчика.
+    loader_call = re.search(
+        r"load_csv_via_raw_insert\(\n(.*?)\n\s*\)\n",
+        create_and_load_source,
+        flags=re.DOTALL,
+    )
+    assert loader_call is not None
+    loader_arguments = loader_call.group(1)
+    assert "max_insert_payload_bytes=max_insert_payload_bytes" in loader_arguments
+    assert "progress_callback=on_progress" in loader_arguments
+    assert "stats=stats" in loader_arguments
 
 
 def test_create_and_load_uses_payload_safety_headroom() -> None:
@@ -356,6 +370,47 @@ def test_create_and_load_uses_payload_safety_headroom() -> None:
     assert "INSERT_PAYLOAD_SAFETY_RATIO" in helper_source
     assert "Effective insert payload limit" in create_and_load_source
     assert "Load settings: batch size" in create_and_load_source
+
+
+def test_create_and_load_times_preflight_connect_ddl_and_insert_separately() -> None:
+    source = Path("src/csv_click/app.py").read_text(encoding="utf-8")
+    match = re.search(
+        r"def _create_and_load\(.*?\n(?=if __name__)",
+        source,
+        flags=re.DOTALL,
+    )
+
+    assert match is not None
+    create_and_load_source = match.group(0)
+    assert "stats.preflight_s = " in create_and_load_source
+    assert "stats.connect_s = " in create_and_load_source
+    assert "stats.ddl_s = " in create_and_load_source
+    assert "stats.insert_wall_s = time.perf_counter() - insert_started" in create_and_load_source
+    assert "stats.driver_retries = driver_retries.count" in create_and_load_source
+    # insert_started ставится строго перед загрузкой, иначе server % считался бы
+    # от времени, в которое входят preflight, connect и DDL.
+    assert create_and_load_source.index("insert_started = time.perf_counter()") > create_and_load_source.index(
+        "stats.ddl_s = "
+    )
+
+
+def test_create_and_load_persists_the_run_record_even_when_the_load_fails() -> None:
+    source = Path("src/csv_click/app.py").read_text(encoding="utf-8")
+    match = re.search(
+        r"def _create_and_load\(.*?\n(?=if __name__)",
+        source,
+        flags=re.DOTALL,
+    )
+
+    assert match is not None
+    create_and_load_source = match.group(0)
+    assert "run_config = RunConfig(" in create_and_load_source
+    assert "write_run_record(" in create_and_load_source
+    # Запись обязана уходить из finally самой функции (отступ ровно 4 пробела,
+    # в отличие от внутреннего finally вокруг вставки): конфигурация упавшего
+    # прогона нужна именно для диагностики падения.
+    finally_index = create_and_load_source.index("\n    finally:")
+    assert create_and_load_source.index("write_run_record(") > finally_index
 
 
 def test_create_and_load_passes_load_workers_to_loader() -> None:
