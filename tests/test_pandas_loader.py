@@ -811,6 +811,11 @@ def test_a_rerun_before_the_producer_finished_says_the_source_is_not_fully_read(
 
     Отменённые блоки обязаны быть посчитаны: сервер их не видел, и без счётчика
     запись утверждала бы, что отправлено всё прочитанное.
+
+    Вставка НАМЕРЕННО медленная. С мгновенным фейком к моменту гашения все
+    отданные блоки успевали завершиться, отменять было нечего, и утверждение про
+    счётчик проходило по случайности: ускорение сериализации в фазе 3c сдвинуло
+    тайминг, и тест упал. Пауза делает окно детерминированным.
     """
     csv_path = tmp_path / "rerun_midfile.csv"
     csv_path.write_text("ID\n" + "".join(f"{index}\n" for index in range(10)), encoding="utf_8")
@@ -819,6 +824,11 @@ def test_a_rerun_before_the_producer_finished_says_the_source_is_not_fully_read(
 
     class RerunException(BaseException):
         pass
+
+    class SlowClient(FakeRawClient):
+        def raw_insert(self, **kwargs):
+            time.sleep(0.05)
+            return super().raw_insert(**kwargs)
 
     def rerun_on_first_progress(block) -> None:
         raise RerunException("streamlit rerun")
@@ -832,7 +842,7 @@ def test_a_rerun_before_the_producer_finished_says_the_source_is_not_fully_read(
             table="target_table",
             mappings=mappings,
             worker_count=2,
-            client_factory=FakeRawClient,
+            client_factory=SlowClient,
             progress_callback=rerun_on_first_progress,
             stats=stats,
         )
