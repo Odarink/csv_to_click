@@ -238,6 +238,7 @@ class RunConfig:
     max_insert_payload_mb: int
     effective_insert_payload_bytes: int
     load_workers: int
+    insert_compression: str
     strict_preflight: bool
     schema_inference_mode: str
     separator: str
@@ -462,7 +463,12 @@ def format_load_stats_lines(stats: LoadStats) -> list[str]:
         ),
         f"Bytes: source {stats.src_bytes / 1024 / 1024:.1f} MB, raw payload "
         f"{stats.raw_bytes / 1024 / 1024:.1f} MB, on wire "
-        f"{stats.wire_bytes / 1024 / 1024:.1f} MB in {stats.blocks} blocks.",
+        f"{stats.wire_bytes / 1024 / 1024:.1f} MB in {stats.blocks} blocks"
+        + (
+            f", compressed {stats.raw_bytes / stats.wire_bytes:.2f}x."
+            if stats.wire_bytes and stats.wire_bytes != stats.raw_bytes
+            else "."
+        ),
         _server_time_line(stats),
     ]
 

@@ -7,6 +7,7 @@ from types import SimpleNamespace
 import pandas as pd
 import pytest
 
+import csv_click.pandas_loader as pandas_loader
 from csv_click.errors import CsvLoadError, CsvReadCancelled, CsvSchemaError
 from csv_click.load_stats import LoadStats
 from csv_click.pandas_loader import (
@@ -850,6 +851,106 @@ def test_a_rerun_before_the_producer_finished_says_the_source_is_not_fully_read(
     assert stats.source_fully_read is False
     assert stats.rows < 10, "префикс файла, а не весь файл"
     assert stats.blocks_unconfirmed > 0, "отменённые блоки не посчитаны"
+
+
+class CompressionAwareClient(FakeRawClient):
+    """Фейк, который РАСПАКОВЫВАЕТ полученное и проверяет заголовок.
+
+    Проверять только длину байтов бессмысленно: сжатый мусор тоже короче.
+    Сервер распакует тело по `Content-Encoding`, поэтому фейк делает то же.
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.decoded: list[bytes] = []
+        self.codecs: list[str | None] = []
+
+    def raw_insert(self, **kwargs):
+        codec = kwargs.get("compression")
+        self.codecs.append(codec)
+        block = kwargs["insert_block"]
+        self.decoded.append(
+            pandas_loader._decompress_for_tests(block, codec) if codec else block
+        )
+        return super().raw_insert(**kwargs)
+
+
+@pytest.mark.parametrize("codec", ["zstd", "lz4", "gzip"])
+def test_the_load_sends_compressed_bytes_the_server_can_read_back(tmp_path: Path, codec: str) -> None:
+    """Провод стал узким местом, и сжатие бьёт именно туда.
+
+    Тест держит три вещи разом: в клиент уходит СЖАТОЕ тело, кодек объявлен
+    заголовком, а распакованное совпадает с тем, что дал бы путь без сжатия.
+    """
+    csv_path = tmp_path / "compressed.csv"
+    csv_path.write_text("ID\n" + "".join(f"{index}\n" for index in range(200)), encoding="utf_8")
+    mappings = [SchemaMapping("ID", "ID", True, "UInt64", False)]
+    stats = LoadStats()
+    client = CompressionAwareClient()
+
+    load_csv_via_raw_insert(
+        client=client,
+        csv_path=csv_path,
+        read_options=ReadOptions(batch_size=200),
+        database="sandbox",
+        table="target_table",
+        mappings=mappings,
+        compression=codec,
+        stats=stats,
+    )
+
+    plain = LoadStats()
+    plain_client = CompressionAwareClient()
+    load_csv_via_raw_insert(
+        client=plain_client,
+        csv_path=csv_path,
+        read_options=ReadOptions(batch_size=200),
+        database="sandbox",
+        table="target_table",
+        mappings=mappings,
+        stats=plain,
+    )
+
+    assert client.codecs == [codec], "кодек обязан быть объявлен заголовком"
+    assert client.decoded == plain_client.decoded, "распакованное не совпало с несжатым путём"
+    assert stats.wire_bytes < stats.raw_bytes, "в провод ушло не меньше, чем было"
+    assert stats.raw_bytes == plain.raw_bytes, "raw_bytes обязан остаться размером ДО сжатия"
+    assert stats.compress_s > 0, "время сжатия не замерено"
+    assert plain.wire_bytes == plain.raw_bytes
+    assert plain.compress_s == 0.0
+    assert plain_client.codecs == [None]
+
+
+def test_compression_works_on_the_parallel_path_too(tmp_path: Path) -> None:
+    """Оператор грузит пятью воркерами — путь с пулом обязан жать так же."""
+    csv_path = tmp_path / "compressed_parallel.csv"
+    csv_path.write_text("ID\n" + "".join(f"{index}\n" for index in range(10)), encoding="utf_8")
+    stats = LoadStats()
+    clients: list[CompressionAwareClient] = []
+
+    def client_factory():
+        client = CompressionAwareClient()
+        clients.append(client)
+        return client
+
+    load_csv_via_raw_insert(
+        client=FakeRawClient(),
+        csv_path=csv_path,
+        read_options=ReadOptions(batch_size=1),
+        database="sandbox",
+        table="target_table",
+        mappings=[SchemaMapping("ID", "ID", True, "UInt64", False)],
+        worker_count=2,
+        client_factory=client_factory,
+        compression="zstd",
+        stats=stats,
+    )
+
+    sent = [codec for client in clients for codec in client.codecs]
+    assert sent == ["zstd"] * 10
+    assert stats.blocks == 10
+    assert stats.wire_bytes != stats.raw_bytes
+    assert stats.compress_s > 0
 
 
 def _load_ten_blocks(tmp_path: Path, client_factory, worker_count: int) -> LoadStats:

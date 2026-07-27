@@ -45,6 +45,7 @@ def make_run_config() -> RunConfig:
         max_insert_payload_mb=16,
         effective_insert_payload_bytes=15_099_494,
         load_workers=4,
+        insert_compression="zstd",
         strict_preflight=True,
         schema_inference_mode="Fast sample, 100000 rows",
         separator=",",
@@ -124,6 +125,33 @@ def test_server_share_is_none_on_the_parallel_path() -> None:
     naive_ratio = (stats.server_ns / 1_000_000_000) / stats.insert_wall_s
     assert naive_ratio > 1.0, "тест не воспроизвёл перекрытие запросов"
     assert stats.server_share is None
+
+
+def test_the_report_states_the_compression_ratio_it_actually_got() -> None:
+    """Коэффициент — единственное число, по которому судят о новой настройке.
+
+    Без него оператор видит два размера и считает в уме, а решение «оставить
+    сжатие или нет» упирается ровно в это отношение.
+    """
+    stats = LoadStats(insert_wall_s=10.0, compress_s=1.5)
+    stats.add_block(make_block(raw_bytes=9_500_000, wire_bytes=2_520_000))
+
+    report = " ".join(format_load_stats_lines(stats))
+
+    assert "compressed 3.77x" in report
+    assert "compress 1.50 s" in report
+
+
+def test_the_report_says_nothing_about_a_ratio_when_nothing_was_compressed() -> None:
+    stats = LoadStats(insert_wall_s=10.0)
+    stats.add_block(make_block(raw_bytes=1000, wire_bytes=1000))
+
+    report = " ".join(format_load_stats_lines(stats))
+
+    # Именно коэффициента быть не должно; фраза «not compressed on this path»
+    # рядом законна, поэтому проверяется шаблон, а не слово.
+    assert re.search(r"compressed \d", report) is None, report
+    assert "not compressed on this path" in report
 
 
 def test_who_was_the_bottleneck_is_readable_from_the_record() -> None:

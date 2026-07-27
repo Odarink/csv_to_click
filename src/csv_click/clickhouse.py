@@ -354,6 +354,7 @@ def raw_insert_batch(
     table: str,
     column_names: list[str],
     payload: bytes,
+    compression: str | None = None,
 ) -> dict[str, str]:
     """Отправляет блок и возвращает разобранный заголовок ``X-ClickHouse-Summary``.
 
@@ -373,6 +374,10 @@ def raw_insert_batch(
         column_names=column_names,
         insert_block=payload,
         fmt="JSONEachRow",
+        # Тело уже сжато вызывающим. Драйвер по этому аргументу ставит
+        # `Content-Encoding` и переносит сам INSERT в параметры URL, потому что
+        # приписать его к сжатому телу нельзя (`httpclient.py:417-427`).
+        compression=compression,
     )
     return getattr(result, "summary", None) or {}
 

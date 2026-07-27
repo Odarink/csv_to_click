@@ -327,7 +327,30 @@ def test_raw_insert_batch_uses_json_each_row() -> None:
         "column_names": ["ID"],
         "insert_block": b'{"ID":1}',
         "fmt": "JSONEachRow",
+        # None, а не отсутствие ключа: драйвер по этому аргументу решает, ставить
+        # ли `Content-Encoding` и переносить ли INSERT в параметры URL.
+        "compression": None,
     }
+
+
+def test_raw_insert_batch_declares_the_codec_when_the_body_is_compressed() -> None:
+    """Тело сжимает вызывающий; драйвер обязан объявить кодек заголовком.
+
+    Без этого сервер получит сжатые байты как JSONEachRow и отвергнет их.
+    """
+    client = FakeClient([])
+
+    raw_insert_batch(
+        client=client,
+        database="sandbox",
+        table="target_table",
+        column_names=["ID"],
+        payload=b"\x28\xb5\x2f\xfd",
+        compression="zstd",
+    )
+
+    assert client.raw_insert_kwargs["compression"] == "zstd"
+    assert client.raw_insert_kwargs["insert_block"] == b"\x28\xb5\x2f\xfd"
 
 
 def test_raw_insert_batch_returns_server_summary() -> None:

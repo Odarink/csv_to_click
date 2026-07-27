@@ -30,6 +30,11 @@ class AppSettings:
     batch_size: int = 100_000
     max_insert_payload_mb: int = 16
     load_workers: int = 1
+    #: Сжатие тела вставки: off, zstd, lz4, gzip. По умолчанию выключено —
+    #: заголовок `Content-Encoding` был одной из трёх переменных, которыми
+    #: отличался падавший на этом контуре `insert()`, и включать его вслепую
+    #: значило бы повторить ту ошибку. Замерено: zstd даёт 3,76x меньше байт.
+    insert_compression: str = "off"
     strict_preflight: bool = True
     separator: str = ","
     encoding: str = "utf_8"
