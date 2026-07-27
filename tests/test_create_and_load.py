@@ -240,7 +240,7 @@ def test_failed_load_still_persists_the_run_record_with_partial_counters(
 
     class FailsOnSecondBlock(FakeRawClient):
         def raw_insert(self, **kwargs):
-            if b'"ID": 3' in kwargs["insert_block"]:
+            if b'"ID":3' in kwargs["insert_block"]:
                 raise RuntimeError("HTTP status 500: the read limit is reached")
             return super().raw_insert(**kwargs)
 

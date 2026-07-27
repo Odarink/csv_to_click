@@ -2,10 +2,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
-import json
 from dataclasses import dataclass
-from datetime import date, datetime
-from decimal import Decimal
 from pathlib import Path
 import threading
 import time
@@ -37,6 +34,12 @@ class ReadOptions:
 
 
 DEFAULT_MAX_INSERT_PAYLOAD_BYTES = 16 * 1024 * 1024
+#: Сколько строк сериализовать, чтобы оценить размер строки перед нарезкой.
+_BLOCK_ESTIMATE_SAMPLE_ROWS = 1024
+#: Во сколько раз оценка строк-на-блок может вырасти за один блок. Ограничение
+#: нужно, чтобы после одного маленького блока не сериализовать заведомо
+#: огромный срез только ради того, чтобы его обрезать.
+_BLOCK_ESTIMATE_GROWTH_LIMIT = 16
 DEFAULT_SCHEMA_SAMPLE_ROWS = 100_000
 ENCODING_SUGGESTIONS: tuple[str, ...] = ("utf_8", "utf-8-sig", "cp1251", "windows-1251")
 MOJIBAKE_MARKERS: tuple[str, ...] = ("С‚", "Рµ", "Р°", "Рё", "Рѕ", "РЅ", "�")
@@ -438,8 +441,26 @@ def validate_csv_sample_with_pandas_chunks(
     return rows_count
 
 
-def chunk_to_json_each_row_payload(chunk: pd.DataFrame, columns: list[str]) -> bytes:
-    return b"\n".join(_json_each_row_line(row, columns) for row in _iter_rows(chunk, columns))
+def chunk_to_json_lines(chunk: pd.DataFrame, columns: list[str]) -> bytes:
+    """Весь чанк в JSONEachRow одним векторным вызовом.
+
+    Заменяет построчный цикл с `json.dumps`: на замеренном профиле (одна
+    колонка, 107 млн строк) он занимал 90,1% времени вставки и держал пять
+    HTTP-воркеров голодными. `to_json` уходит в C и снимает постоянные расходы
+    на строку, которые на узком файле и составляют почти всё.
+
+    Все значения к этому моменту уже приведены `convert_chunk_to_schema` к
+    типам, которые `to_json` кодирует напрямую: str, int, float, bool, None и
+    Decimal — последний он кодирует строкой, ровно как это делал `str()` в
+    построчном пути. Временные колонки приведены к строкам там же, вектором.
+    """
+    payload = chunk[columns].to_json(
+        orient="records",
+        lines=True,
+        force_ascii=False,
+        double_precision=15,
+    )
+    return payload.rstrip("\n").encode("utf-8")
 
 
 def iter_json_each_row_payloads(
@@ -449,35 +470,69 @@ def iter_json_each_row_payloads(
 ) -> Iterator[tuple[bytes, int]]:
     if max_payload_bytes <= 0:
         raise ValueError("max_payload_bytes must be positive")
+    total_rows = len(chunk)
+    if total_rows == 0:
+        return
 
-    lines: list[bytes] = []
-    payload_bytes = 0
-    rows_count = 0
+    # Размер строки оценивается по ОГРАНИЧЕННОЙ головной выборке, а не по всему
+    # чанку. Сериализовать чанк целиком только чтобы узнать его длину - значит
+    # платить лишний полный проход и держать весь payload в памяти на каждом
+    # чанке, который в лимит не влез, а это любая таблица шире ~150 байт/строку
+    # при настройках по умолчанию.
+    sample_rows = min(_BLOCK_ESTIMATE_SAMPLE_ROWS, total_rows)
+    sample = chunk_to_json_lines(chunk.iloc[:sample_rows], columns)
+    if sample_rows == total_rows and len(sample) <= max_payload_bytes:
+        yield sample, total_rows
+        return
 
-    for row in _iter_rows(chunk, columns):
-        line = _json_each_row_line(row, columns)
-        line_size = len(line)
-        if line_size > max_payload_bytes:
+    bytes_per_row = max(1.0, len(sample) / sample_rows)
+    rows_per_block = max(1, int(max_payload_bytes / bytes_per_row))
+
+    # Уже сериализованные, но ещё не отправленные строки. Благодаря буферу
+    # перебравший срез не выбрасывается: лишние строки уходят в следующий блок,
+    # и каждая строка сериализуется РОВНО ОДИН раз. Без него нарезка на
+    # разнородных данных проигрывала построчному упаковщику вдвое.
+    # Разбиение по b"\n" корректно: JSON экранирует переводы строк в значениях.
+    pending: list[bytes] = []
+    pending_bytes = 0
+    start = 0
+    while pending or start < total_rows:
+        while start < total_rows and pending_bytes + max(0, len(pending) - 1) <= max_payload_bytes:
+            stop = min(start + rows_per_block, total_rows)
+            more = chunk_to_json_lines(chunk.iloc[start:stop], columns).split(b"\n")
+            pending.extend(more)
+            read_bytes = sum(map(len, more))
+            pending_bytes += read_bytes
+            start = stop
+            # Оценка растёт и здесь, а не только после отправки блока: иначе
+            # после пачки толстых строк дозаполнение читало бы тонкие такими же
+            # мелкими порциями и делало бы тысячи вызовов to_json на один блок.
+            # Сверху всё равно ограничено остатком чанка.
+            if read_bytes:
+                grown = int(len(more) * max_payload_bytes / read_bytes)
+                rows_per_block = max(
+                    rows_per_block,
+                    min(grown, len(more) * _BLOCK_ESTIMATE_GROWTH_LIMIT),
+                )
+
+        taken = 0
+        used = 0
+        for line in pending:
+            extra = len(line) + (1 if taken else 0)
+            if used + extra > max_payload_bytes:
+                break
+            used += extra
+            taken += 1
+        if taken == 0:
             raise CsvLoadError(
                 "A single JSONEachRow row is "
-                f"{line_size} bytes, which is larger than Max insert payload "
+                f"{len(pending[0])} bytes, which is larger than Max insert payload "
                 f"{max_payload_bytes} bytes. Reduce column width or increase Max insert payload, MB."
             )
 
-        separator_bytes = 1 if rows_count else 0
-        if rows_count and payload_bytes + separator_bytes + line_size > max_payload_bytes:
-            yield b"\n".join(lines), rows_count
-            lines = []
-            payload_bytes = 0
-            rows_count = 0
-            separator_bytes = 0
-
-        lines.append(line)
-        payload_bytes += separator_bytes + line_size
-        rows_count += 1
-
-    if rows_count:
-        yield b"\n".join(lines), rows_count
+        yield b"\n".join(pending[:taken]), taken
+        pending_bytes -= sum(map(len, pending[:taken]))
+        del pending[:taken]
 
 
 def load_csv_via_raw_insert(
@@ -771,16 +826,6 @@ def _block_progress(
     )
 
 
-def _iter_rows(chunk: pd.DataFrame, columns: list[str]) -> Iterator[dict[str, object]]:
-    for values in chunk[columns].itertuples(index=False, name=None):
-        yield dict(zip(columns, values))
-
-
-def _json_each_row_line(row: dict[str, object], columns: list[str]) -> bytes:
-    cleaned = {column: _clean_json_value(row[column]) for column in columns}
-    return json.dumps(cleaned, ensure_ascii=False, allow_nan=False).encode("utf-8")
-
-
 def _raw_insert_error(
     *,
     exc: Exception,
@@ -823,29 +868,73 @@ def _convert_series(series: pd.Series, clickhouse_type: str) -> pd.Series:
         converted = pd.to_numeric(series, errors="raise")
         if not nullable and converted.isna().any():
             raise CsvSchemaError("empty value is not allowed for non-nullable float")
+        # Построчный путь звал json.dumps(allow_nan=False) и падал на inf.
+        # У to_json такого рычага нет, он молча пишет null - переполнившее
+        # double значение тихо легло бы пустым, а прогон отчитался бы успехом.
+        if converted.abs().eq(float("inf")).any():
+            raise CsvSchemaError(
+                "value does not fit into Float64 and became infinity; "
+                "use String or Decimal for this column"
+            )
         return pd.Series(
             [None if pd.isna(value) else float(value) for value in converted.tolist()],
             index=series.index,
             dtype="object",
         )
     if inner_type.startswith("Decimal("):
+        # Decimal остаётся Decimal: to_json кодирует его как строку "1.50", то
+        # есть ровно так же, как это делал построчный путь через str().
         return series.map(lambda value: convert_value(_value_to_string(value), clickhouse_type)).astype("object")
     if inner_type == "Date":
-        converted = pd.to_datetime(series, errors="raise").dt.date
-        if not nullable and converted.isna().any():
-            raise CsvSchemaError("empty value is not allowed for non-nullable date")
-        return converted.map(lambda value: None if pd.isna(value) else value).astype("object")
+        return _format_temporal(series, nullable, "D", "T", "date")
     if inner_type == "DateTime":
-        converted = pd.to_datetime(series, errors="raise")
-        if not nullable and converted.isna().any():
-            raise CsvSchemaError("empty value is not allowed for non-nullable datetime")
-        return converted.map(lambda value: None if pd.isna(value) else value.to_pydatetime()).astype("object")
+        # Разделитель пробел, а не 'T', и без дробных секунд: это канонический
+        # basic-формат ClickHouse. Драйвер сейчас навязывает каждому запросу
+        # date_time_input_format=best_effort, который в 2-5 раз дороже basic на
+        # значение; отдавать basic-совместимые строки - предпосылка к переходу.
+        return _format_temporal(series, nullable, "s", " ", "datetime")
     if inner_type == "Bool":
         return series.map(lambda value: convert_value(_value_to_string(value), clickhouse_type)).astype("object")
     validate_clickhouse_type_expression(clickhouse_type)
     if not nullable and series.isna().any():
         raise CsvSchemaError(f"empty value is not allowed for non-nullable {clickhouse_type}")
     return series.map(lambda value: None if pd.isna(value) else _value_to_string(value)).astype("object")
+
+
+def _format_temporal(
+    series: pd.Series,
+    nullable: bool,
+    numpy_unit: str,
+    separator: str,
+    what: str,
+) -> pd.Series:
+    """Приводит временную колонку к строкам ОДНИМ векторным вызовом.
+
+    Строки, а не объекты `date`/`datetime`, потому что дальше их сериализует
+    `DataFrame.to_json`, а он временные типы кодирует по-своему. Заодно это
+    убирает построчный `.isoformat()` из горячего пути.
+    """
+    converted = pd.to_datetime(series, errors="raise")
+    if not nullable and converted.isna().any():
+        raise CsvSchemaError(f"empty value is not allowed for non-nullable {what}")
+    if isinstance(converted.dtype, pd.DatetimeTZDtype):
+        # Форматирование напечатало бы локальное время стены и молча потеряло
+        # офсет, сдвинув КАЖДУЮ строку. Выбрать интерпретацию за пользователя
+        # нельзя: целевая колонка DateTime таймзоны не несёт.
+        raise CsvSchemaError(
+            "value carries a timezone offset, and the target DateTime column has no timezone; "
+            "strip the offset in the source or convert the column to UTC first"
+        )
+    # np.datetime_as_string, а не .dt.strftime: последний не дополняет год
+    # нулями, и 1-й год уехал бы как "1-01-01".
+    formatted = pd.Series(
+        np.datetime_as_string(converted.to_numpy(), unit=numpy_unit),
+        index=series.index,
+        dtype="object",
+    )
+    if separator != "T":
+        formatted = formatted.str.replace("T", separator, n=1, regex=False)
+    return formatted.where(converted.notna(), None).astype("object")
 
 
 def _first_bad_value(series: pd.Series, clickhouse_type: str) -> object:
@@ -855,23 +944,6 @@ def _first_bad_value(series: pd.Series, clickhouse_type: str) -> object:
         except CsvSchemaError:
             return value
     return series.iloc[0] if len(series) else ""
-
-
-def _clean_json_value(value):
-    if pd.isna(value):
-        return None
-    if isinstance(value, np.integer):
-        return int(value)
-    if isinstance(value, np.floating):
-        as_float = float(value)
-        return int(as_float) if as_float.is_integer() else as_float
-    if isinstance(value, (pd.Timestamp, datetime)):
-        return value.isoformat()
-    if isinstance(value, date):
-        return value.isoformat()
-    if isinstance(value, Decimal):
-        return str(value)
-    return value
 
 
 def _value_to_string(value) -> str:

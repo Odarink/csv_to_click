@@ -17,7 +17,7 @@ from csv_click.pandas_loader import (
     analyze_csv_with_pandas_sample,
     analyze_csv_with_pandas_chunks,
     choose_read_options_for_preview,
-    chunk_to_json_each_row_payload,
+    chunk_to_json_lines,
     convert_chunk_to_schema,
     detect_mojibake,
     iter_pandas_chunks,
@@ -233,10 +233,10 @@ def test_convert_chunk_supports_include_rename_and_nullable_int() -> None:
     ]
 
 
-def test_chunk_to_json_each_row_payload_has_no_nan() -> None:
+def test_chunk_to_json_lines_has_no_nan() -> None:
     chunk = pd.DataFrame({"ID": [1], "VALUE": [None]})
 
-    payload = chunk_to_json_each_row_payload(chunk, ["ID", "VALUE"])
+    payload = chunk_to_json_lines(chunk, ["ID", "VALUE"])
 
     decoded = payload.decode("utf-8").strip()
     assert "NaN" not in decoded
@@ -250,7 +250,7 @@ def test_json_each_row_payloads_are_split_by_byte_limit() -> None:
             "VALUE": ["a" * 20, "b" * 20, "c" * 20],
         }
     )
-    first_row_payload = chunk_to_json_each_row_payload(chunk.iloc[:1].reset_index(drop=True), ["ID", "VALUE"])
+    first_row_payload = chunk_to_json_lines(chunk.iloc[:1].reset_index(drop=True), ["ID", "VALUE"])
     max_payload_bytes = len(first_row_payload) + 1
 
     payloads = list(iter_json_each_row_payloads(chunk, ["ID", "VALUE"], max_payload_bytes=max_payload_bytes))
@@ -451,7 +451,7 @@ def test_load_csv_via_raw_insert_parallel_wraps_insert_error_with_context(tmp_pa
 
     class FailingRawClient(FakeRawClient):
         def raw_insert(self, **kwargs):
-            if b'"ID": 2' in kwargs["insert_block"]:
+            if b'"ID":2' in kwargs["insert_block"]:
                 raise RuntimeError("HTTP status 500: the read limit is reached")
             super().raw_insert(**kwargs)
 
@@ -586,7 +586,7 @@ def test_load_csv_via_raw_insert_keeps_partial_stats_of_a_failed_load(tmp_path: 
 
     class FailingOnSecondBlock(FakeRawClient):
         def raw_insert(self, **kwargs):
-            if b'"ID": 2' in kwargs["insert_block"]:
+            if b'"ID":2' in kwargs["insert_block"]:
                 raise RuntimeError("HTTP status 500: the read limit is reached")
             return super().raw_insert(**kwargs)
 
@@ -675,7 +675,7 @@ def test_failed_parallel_load_still_counts_blocks_the_server_already_accepted(tm
     class FailsOnceEveryBlockIsInFlight(FakeRawClient):
         def raw_insert(self, **kwargs):
             all_blocks_in_flight.wait()
-            if b'"ID": 1' in kwargs["insert_block"]:
+            if b'"ID":1' in kwargs["insert_block"]:
                 raise RuntimeError("HTTP status 500: the read limit is reached")
             # Пауза ПОСЛЕ барьера: гонки со стартом потоков она уже не создаёт,
             # но задаёт порядок — упавший блок завершается первым, поэтому все
