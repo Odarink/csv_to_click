@@ -113,6 +113,76 @@ def test_numeric_zero_one_column_infers_uint_not_bool(tmp_path: Path) -> None:
     assert schema.columns[1].final_type == "UInt64"
 
 
+@pytest.mark.parametrize(
+    ("values", "want_type"),
+    [
+        # Разбор съедает ведущий ноль и ведущий плюс, а текст обратно не вернуть.
+        # В банковской выгрузке это счета, БИК, ИНН, КПП, телефоны и индексы.
+        (["00123456789", "00987654321"], "String"),
+        (["044525225", "045004641"], "String"),
+        (["+79001234567", "+79001234568"], "String"),
+        (["007", "42"], "String"),
+        (["00.5", "1.25"], "String"),
+        (["-007", "-42"], "String"),
+        # Граница длины: двузначные коды с нулём впереди - месяцы, регионы,
+        # коды операций. `01` уехало бы единицей.
+        (["01", "07"], "String"),
+        # Не-ASCII цифры разбор перепишет целиком, а не только префикс:
+        # `١٢٣٤` уедет как `1234`.
+        (["٠١٢٣", "١٢٣٤"], "String"),
+        (["１２３", "４５６"], "String"),
+        # Числа, из которых разбор ничего не выкусывает, обязаны остаться числами.
+        (["0", "1", "2"], "UInt64"),
+        (["-7", "42"], "Int64"),
+        (["0.5", "1.25"], "Decimal(18, 2)"),
+        (["1e5", "2e5"], "Decimal(18, 2)"),
+        (["2024-01-05", "2024-02-06"], "Date"),
+        # Год с ведущими нулями - сентинел `DateTime.MinValue` из выгрузок .NET.
+        # Разбор даты ничего не теряет, и она обязана остаться датой.
+        (["0001-01-01", "0999-12-31"], "Date"),
+        (["true", "false"], "Bool"),
+    ],
+)
+def test_numeric_inference_refuses_types_that_would_eat_a_leading_zero_or_plus(
+    tmp_path: Path, values: list[str], want_type: str
+) -> None:
+    csv_path = write_csv(tmp_path / "column.csv", "code\n" + "".join(f"{value}\n" for value in values))
+
+    schema = analyze_csv_schema(csv_path)
+
+    assert schema.columns[0].final_type == want_type
+
+
+def test_leading_zero_column_says_in_notes_why_it_stayed_string(tmp_path: Path) -> None:
+    csv_path = write_csv(tmp_path / "accounts.csv", "account\n00123456789\n00987654321\n")
+
+    schema = analyze_csv_schema(csv_path)
+
+    notes = schema.columns[0].notes
+    assert "zero" in notes.lower(), notes
+
+
+def test_mixed_column_with_a_leading_zero_still_blames_the_mix(tmp_path: Path) -> None:
+    """Колонка не числовая вовсе, и объяснение обязано быть про смесь.
+
+    Пометка про ведущие нули здесь послала бы оператора искать не ту причину.
+    """
+    csv_path = write_csv(tmp_path / "mixed_zero.csv", "code\n007\nabc\n")
+
+    schema = analyze_csv_schema(csv_path)
+
+    assert schema.columns[0].final_type == "String"
+    assert "mixed" in schema.columns[0].notes.lower(), schema.columns[0].notes
+
+
+def test_leading_zero_column_with_empty_cells_becomes_nullable_string(tmp_path: Path) -> None:
+    csv_path = write_csv(tmp_path / "accounts_nullable.csv", "account,name\n00123456789,a\n,b\n")
+
+    schema = analyze_csv_schema(csv_path)
+
+    assert schema.columns[0].final_type == "Nullable(String)"
+
+
 def test_clickhouse_type_options_include_nullable_dropdown_values() -> None:
     assert "String" in CLICKHOUSE_TYPE_OPTIONS
     assert "Nullable(Decimal(38, 10))" in CLICKHOUSE_TYPE_OPTIONS

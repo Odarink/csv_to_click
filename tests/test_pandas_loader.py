@@ -179,6 +179,36 @@ def test_analyze_csv_with_pandas_sample_infers_schema_from_limited_rows(tmp_path
     assert amount_column.sample_values == ["10"]
 
 
+def test_pandas_sample_inference_keeps_leading_zero_identifiers_as_string(tmp_path: Path) -> None:
+    """Выборочный инференс не имеет права типизировать счёт числом.
+
+    Тест держит и чтение: если из `preview_csv_rows` уйдёт `dtype=str`, нули
+    пропадут ещё до статистики, и колонка снова станет UInt64.
+    """
+    csv_path = tmp_path / "accounts.csv"
+    csv_path.write_text("ACCOUNT,AMOUNT\n00123456789,10\n00987654321,20\n", encoding="utf_8")
+
+    schema = analyze_csv_with_pandas_sample(csv_path, ReadOptions(batch_size=1), nrows=2)
+
+    assert [(column.source_name, column.final_type) for column in schema.columns] == [
+        ("ACCOUNT", "String"),
+        ("AMOUNT", "UInt64"),
+    ]
+
+
+def test_pandas_chunk_inference_keeps_leading_zero_identifiers_as_string(tmp_path: Path) -> None:
+    """Ведущий ноль во ВТОРОМ чанке обязан решать судьбу колонки так же."""
+    csv_path = tmp_path / "accounts_full.csv"
+    csv_path.write_text("ACCOUNT,AMOUNT\n42,10\n00987654321,20\n", encoding="utf_8")
+
+    schema = analyze_csv_with_pandas_chunks(csv_path, ReadOptions(batch_size=1))
+
+    assert [(column.source_name, column.final_type) for column in schema.columns] == [
+        ("ACCOUNT", "String"),
+        ("AMOUNT", "UInt64"),
+    ]
+
+
 def test_analyze_csv_with_pandas_chunks_still_uses_full_file(tmp_path: Path) -> None:
     csv_path = tmp_path / "source.csv"
     csv_path.write_text("ID,NAME\n1,Alice\n2,\n", encoding="utf_8")
