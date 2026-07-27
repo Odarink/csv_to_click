@@ -10,15 +10,27 @@ ClickHouse: локальную `ReplicatedMergeTree` и распределенн
 
 ## Требования
 
-- Python 3.11+
+- `uv` — единственное, что нужно установить руками; Python он скачает сам
 - доступ к ClickHouse
 - CSV-файл должен лежать на той машине, где запущен Streamlit
 - CSV должен содержать строку заголовков
 - для secure-подключения нужны клиентские сертификат и ключ
 
-Для локального запуска на Windows runtime-зависимости устанавливаются из
-`requirements.txt`. `pyproject.toml` и `uv.lock` сохранены для разработки и
-альтернативного запуска через `uv`.
+Окружение ставится из `uv.lock` командой `uv sync --locked --extra dev` — это
+единственный поддерживаемый способ запуска. Версии библиотек зафиксированы
+намеренно: иначе `pandas`, `clickhouse-connect` или `urllib3` могут смениться
+между двумя загрузками, и сравнение их времени перестаёт что-либо значить.
+Флаг `--locked` выбран вместо `--frozen` осознанно: `--frozen` использует
+локфайл, вообще не сверяя его с `pyproject.toml`, а `--locked` откажется
+запускаться на разъехавшемся локфайле — молчаливое перерешивание как раз и есть
+то, что делает прогоны несравнимыми. Версия интерпретатора закреплена в
+`.python-version`, зависимости — в `pyproject.toml` и `uv.lock`.
+
+Группа `dev` ставится вместе с рантаймом сознательно: `uv sync` по умолчанию
+приводит окружение в точное соответствие локфайлу, то есть без `--extra dev`
+каждый запуск `loader.bat` удалял бы `pytest` из того же `.venv`, которым
+проверяется код. Побочный эффект: `pip` из `.venv` удаляется — он больше не
+нужен, пакеты ставит `uv`.
 
 ## Локальный запуск на Windows
 
@@ -27,20 +39,18 @@ ClickHouse: локальную `ReplicatedMergeTree` и распределенн
 При первом запуске файл сам:
 
 - перейдет в директорию проекта;
-- найдет установленный Python 3.11+;
-- создаст `.venv`, если окружения еще нет;
-- обновит `pip`;
-- установит зависимости из `requirements.txt`;
+- поставит окружение из `uv.lock` командой `uv sync --locked --extra dev`
+  (Python версии из `.python-version` `uv` при необходимости скачает сам);
 - проверит, что доступны `streamlit`, `pandas` и `clickhouse_connect`;
 - запустит приложение на `http://localhost:8501`.
 
-Если Python 3.11+ не установлен, `loader.bat` остановится и покажет команду:
+Если `uv` не установлен, `loader.bat` остановится и покажет команду:
 
 ```cmd
-winget install -e --id Python.Python.3.12
+winget install -e --id astral-sh.uv
 ```
 
-После установки Python заново откройте папку проекта и снова запустите
+После установки `uv` заново откройте папку проекта и снова запустите
 `loader.bat`.
 
 При необходимости задайте пользователя и пароль ClickHouse перед запуском:
@@ -64,66 +74,44 @@ C:\Users\<username>\tsh\clickhouse-prod.key
 Ручные команды нужны только для диагностики, если `loader.bat` завершился с
 ошибкой.
 
-Проверьте установленные версии Python:
+Проверьте, что `uv` доступен:
 
 ```cmd
-py -0p
+uv --version
 ```
 
-Для проекта нужен Python 3.11 или новее. Создать окружение вручную можно через
-установленную подходящую версию, например:
+Поставьте окружение из локфайла:
 
 ```cmd
-py -3.12 -m venv .venv
+uv sync --locked --extra dev
 ```
 
-Если в списке есть только Python 3.11, используйте:
+Если `uv sync --locked` отказывается работать, потому что локфайл разошёлся с
+`pyproject.toml`, пересоберите его — но помните, что это меняет версии библиотек
+и обнуляет сравнимость с предыдущими прогонами:
 
 ```cmd
-py -3.11 -m venv .venv
-```
-
-Активируйте окружение:
-
-```cmd
-.venv\Scripts\activate.bat
-```
-
-Проверьте версию Python внутри активированного окружения:
-
-```cmd
-python --version
-```
-
-Обновите `pip` и установите зависимости:
-
-```cmd
-python -m pip install --upgrade pip
-python -m pip install -r requirements.txt
+uv lock
 ```
 
 Проверьте, что основные библиотеки доступны:
 
 ```cmd
-python -c "import streamlit, pandas, clickhouse_connect; print('dependencies OK')"
+.venv\Scripts\python.exe -c "import streamlit, pandas, clickhouse_connect; print('dependencies OK')"
 ```
 
 Запустите приложение вручную:
 
 ```cmd
 set PYTHONPATH=%CD%\src
-python -m streamlit run src\csv_click\app.py --server.address 127.0.0.1 --server.port 8501
+.venv\Scripts\python.exe -m streamlit run src\csv_click\app.py --server.address 127.0.0.1 --server.port 8501
 ```
 
-## Альтернативный запуск через uv
-
-`uv` не требуется для основного локального запуска на Windows. Его можно
-использовать для разработки, если нужно синхронизировать зависимости из
-`pyproject.toml` и `uv.lock`:
+## Запуск на Linux и в JupyterHub
 
 ```bash
-uv sync
-uv run streamlit run src/csv_click/app.py --server.address 0.0.0.0 --server.port 8501
+uv sync --locked --extra dev
+uv run --locked --extra dev streamlit run src/csv_click/app.py --server.address 0.0.0.0 --server.port 8501
 ```
 
 Если приложение запускается в JupyterHub, открыть его через proxy:
@@ -167,7 +155,11 @@ http://localhost:8501
 5. При необходимости изменить `Distributed sharding key`. По умолчанию
    используется `rand()`.
 6. Выбрать `Batch size`. По умолчанию загружается по `100_000` строк в CSV чанке.
-7. Выбрать `Max insert payload, MB`. По умолчанию один HTTP `JSONEachRow` insert request ограничен `16` MB.
+7. Выбрать `Max insert payload, MB`. Значение по умолчанию — `16`, но приложение
+   намеренно режет на 10% ниже введённого (`INSERT_PAYLOAD_SAFETY_RATIO`), чтобы
+   остаться под лимитом HTTP/прокси, так что фактическая граница одного
+   `JSONEachRow` insert request — `14.4` MB. Действующее значение печатается в лог
+   загрузки строкой `Load settings` и сохраняется в записи о прогоне.
 8. Выбрать разделитель CSV: `,`, `;`, `\t`, `|` или `custom`.
 9. Выбрать кодировку: `utf_8`, `cp1251`, `windows-1251`, `utf-8-sig` или
    `custom`.
@@ -245,8 +237,13 @@ ENGINE = Distributed('<cluster>', '<database>', '<local_table>', <sharding_key>)
 
 ## Проверки разработки
 
-Запустить тесты:
+Запустить тесты (только из корня репозитория — часть тестов читает файлы по
+относительным путям):
 
 ```bash
-uv run --extra dev pytest
+uv run --locked --extra dev pytest
 ```
+
+`--locked` здесь не формальность: без него `uv run` может перерешать окружение и
+переписать `uv.lock`, то есть та самая команда, которой проверяют код, тихо
+сдвинет версии, зафиксированные ради сравнимости прогонов.

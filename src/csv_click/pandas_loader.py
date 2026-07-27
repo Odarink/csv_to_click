@@ -8,13 +8,15 @@ from datetime import date, datetime
 from decimal import Decimal
 from pathlib import Path
 import threading
-from typing import Iterator
+import time
+from typing import Iterator, TypeVar
 
 import numpy as np
 import pandas as pd
 
-from csv_click.clickhouse import raw_insert_batch
+from csv_click.clickhouse import raw_insert_batch, summary_elapsed_ns
 from csv_click.errors import CsvLoadError, CsvReadCancelled, CsvSchemaError
+from csv_click.load_stats import BlockProgress, LoadStats
 from csv_click.schema import (
     CsvColumn,
     CsvSchema,
@@ -489,9 +491,21 @@ def load_csv_via_raw_insert(
     worker_count: int = 1,
     client_factory: Callable[[], object] | None = None,
     progress_callback=None,
-) -> int:
+    stats: LoadStats | None = None,
+) -> LoadStats:
+    """Грузит CSV блоками JSONEachRow и возвращает счётчики прогона.
+
+    ``stats`` можно передать снаружи, чтобы частичные счётчики уцелели, если
+    загрузка упадёт на середине: исключение уносит возвращаемое значение, но не
+    переданный объект.
+    """
     if worker_count <= 0:
         raise ValueError("worker_count must be positive")
+    if stats is None:
+        stats = LoadStats()
+    # Нужен самой статистике: при worker_count > 1 запросы идут одновременно, и
+    # сумма серверных времён перестаёт быть долей стенных часов.
+    stats.worker_count = worker_count
     if worker_count > 1:
         if client_factory is None:
             raise ValueError("client_factory is required when worker_count is greater than 1")
@@ -505,23 +519,28 @@ def load_csv_via_raw_insert(
             max_insert_payload_bytes=max_insert_payload_bytes,
             worker_count=worker_count,
             progress_callback=progress_callback,
+            stats=stats,
         )
 
-    rows_count = 0
     usecols = [mapping.source_name for mapping in mappings if mapping.include]
-    for chunk_number, chunk in enumerate(iter_pandas_chunks(csv_path, read_options, usecols), start=1):
+    chunks = _iter_timed(iter_pandas_chunks(csv_path, read_options, usecols))
+    for chunk_number, (chunk, read_s) in enumerate(chunks, start=1):
+        stats.read_s += read_s
+        convert_started = time.perf_counter()
         converted = convert_chunk_to_schema(chunk, mappings, chunk_number)
+        stats.convert_s += time.perf_counter() - convert_started
         columns = list(converted.columns)
-        for block_number, (payload, block_rows) in enumerate(
+        payloads = _iter_timed(
             iter_json_each_row_payloads(
                 converted,
                 columns,
                 max_payload_bytes=max_insert_payload_bytes,
-            ),
-            start=1,
-        ):
+            )
+        )
+        for block_number, ((payload, block_rows), serialize_s) in enumerate(payloads, start=1):
+            stats.serialize_s += serialize_s
             try:
-                raw_insert_batch(client, database, table, columns, payload)
+                summary = raw_insert_batch(client, database, table, columns, payload)
             except Exception as exc:
                 raise _raw_insert_error(
                     exc=exc,
@@ -532,10 +551,18 @@ def load_csv_via_raw_insert(
                     block_rows=block_rows,
                     payload_bytes=len(payload),
                 ) from exc
-            rows_count += block_rows
+            progress = _block_progress(
+                chunk_number=chunk_number,
+                block_number=block_number,
+                block_rows=block_rows,
+                rows_total=stats.rows + block_rows,
+                payload_bytes=len(payload),
+                summary=summary,
+            )
+            stats.add_block(progress)
             if progress_callback:
-                progress_callback(chunk_number, block_number, block_rows, rows_count, len(payload))
-    return rows_count
+                progress_callback(progress)
+    return stats
 
 
 def _load_csv_via_raw_insert_parallel(
@@ -549,8 +576,8 @@ def _load_csv_via_raw_insert_parallel(
     max_insert_payload_bytes: int,
     worker_count: int,
     progress_callback,
-) -> int:
-    rows_count = 0
+    stats: LoadStats,
+) -> LoadStats:
     usecols = [mapping.source_name for mapping in mappings if mapping.include]
     max_pending = worker_count * 2
     worker_state = threading.local()
@@ -569,9 +596,9 @@ def _load_csv_via_raw_insert_parallel(
         block_rows: int,
         columns: list[str],
         payload: bytes,
-    ) -> tuple[int, int, int, int]:
+    ) -> _InsertedBlock:
         try:
-            raw_insert_batch(worker_client(), database, table, columns, payload)
+            summary = raw_insert_batch(worker_client(), database, table, columns, payload)
         except Exception as exc:
             raise _raw_insert_error(
                 exc=exc,
@@ -582,48 +609,89 @@ def _load_csv_via_raw_insert_parallel(
                 block_rows=block_rows,
                 payload_bytes=len(payload),
             ) from exc
-        return chunk_number, block_number, block_rows, len(payload)
+        return _InsertedBlock(
+            chunk_number=chunk_number,
+            block_number=block_number,
+            block_rows=block_rows,
+            payload_bytes=len(payload),
+            summary=summary,
+        )
+
+    def block_progress_for(inserted: _InsertedBlock) -> BlockProgress:
+        # rows_total — это «сколько строк принято на момент завершения ЭТОГО
+        # блока», а не порядковый номер отправки: блоки завершаются в любом
+        # порядке, а накопление идёт в порядке завершения и в одном потоке,
+        # поэтому итог от порядка не зависит.
+        return _block_progress(
+            chunk_number=inserted.chunk_number,
+            block_number=inserted.block_number,
+            block_rows=inserted.block_rows,
+            rows_total=stats.rows + inserted.block_rows,
+            payload_bytes=inserted.payload_bytes,
+            summary=inserted.summary,
+        )
 
     def cancel_pending(pending: set[Future]) -> None:
+        """Гасит оставшиеся задачи после сбоя.
+
+        Блоки, которые всё-таки успели дойти до сервера, засчитываются в stats:
+        эти строки уже лежат в ClickHouse, и запись о падении обязана их
+        показывать — иначе диагностика фазы 4 пойдёт по заниженным числам.
+        Progress callback при этом не дёргается: загрузка уже падает, а он
+        ходит в Streamlit и может подменить исходную ошибку своей.
+
+        Обработанные задачи вынимаются из набора: эту функцию зовут дважды на
+        одном и том же наборе — из collect_completed и из внешнего except, — и
+        без изъятия каждый успевший блок засчитался бы по два раза.
+        """
         for future in pending:
             future.cancel()
-        for future in pending:
+        while pending:
+            future = pending.pop()
             if future.cancelled():
                 continue
             try:
-                future.result()
+                inserted = future.result()
             except Exception:
-                pass
+                # Ошибку упавшего блока поднимает collect_completed; остальные
+                # производны от того же сбоя и контекста не добавляют.
+                continue
+            stats.add_block(block_progress_for(inserted))
 
-    def collect_completed(pending: set[Future]) -> int:
-        nonlocal rows_count
+    def collect_completed(pending: set[Future]) -> None:
+        # Вызывается только из главного потока, поэтому stats мутируется без лока.
         done, _pending = wait(pending, return_when=FIRST_COMPLETED)
         for future in done:
             pending.remove(future)
             try:
-                chunk_number, block_number, block_rows, payload_bytes = future.result()
-            except Exception:
+                inserted = future.result()
+            except BaseException:
                 cancel_pending(pending)
                 raise
-            rows_count += block_rows
+            progress = block_progress_for(inserted)
+            stats.add_block(progress)
             if progress_callback:
-                progress_callback(chunk_number, block_number, block_rows, rows_count, payload_bytes)
-        return rows_count
+                progress_callback(progress)
 
     pending: set[Future] = set()
     with ThreadPoolExecutor(max_workers=worker_count) as executor:
         try:
-            for chunk_number, chunk in enumerate(iter_pandas_chunks(csv_path, read_options, usecols), start=1):
+            chunks = _iter_timed(iter_pandas_chunks(csv_path, read_options, usecols))
+            for chunk_number, (chunk, read_s) in enumerate(chunks, start=1):
+                stats.read_s += read_s
+                convert_started = time.perf_counter()
                 converted = convert_chunk_to_schema(chunk, mappings, chunk_number)
+                stats.convert_s += time.perf_counter() - convert_started
                 columns = list(converted.columns)
-                for block_number, (payload, block_rows) in enumerate(
+                payloads = _iter_timed(
                     iter_json_each_row_payloads(
                         converted,
                         columns,
                         max_payload_bytes=max_insert_payload_bytes,
-                    ),
-                    start=1,
-                ):
+                    )
+                )
+                for block_number, ((payload, block_rows), serialize_s) in enumerate(payloads, start=1):
+                    stats.serialize_s += serialize_s
                     pending.add(
                         executor.submit(
                             insert_payload,
@@ -639,10 +707,68 @@ def _load_csv_via_raw_insert_parallel(
 
             while pending:
                 collect_completed(pending)
-        except Exception:
+        except BaseException:
+            # Именно BaseException: RerunException и StopException в Streamlit
+            # наследуются от него, а бросить их может любой st.*-вызов внутри
+            # progress_callback. При except Exception отмена не срабатывала, но
+            # ThreadPoolExecutor.__exit__ всё равно дожидался уже отправленных
+            # блоков — сервер их принимал, а запись о прогоне их теряла.
             cancel_pending(pending)
             raise
-    return rows_count
+    return stats
+
+
+@dataclass(frozen=True)
+class _InsertedBlock:
+    """Результат одной вставки, возвращаемый воркером в главный поток."""
+
+    chunk_number: int
+    block_number: int
+    block_rows: int
+    payload_bytes: int
+    summary: dict[str, str]
+
+
+_TimedItem = TypeVar("_TimedItem")
+
+
+def _iter_timed(iterator: Iterator[_TimedItem]) -> Iterator[tuple[_TimedItem, float]]:
+    """Отдаёт элементы вместе со временем, потраченным на получение каждого."""
+    while True:
+        started = time.perf_counter()
+        try:
+            item = next(iterator)
+        except StopIteration:
+            return
+        yield item, time.perf_counter() - started
+
+
+def _block_progress(
+    *,
+    chunk_number: int,
+    block_number: int,
+    block_rows: int,
+    rows_total: int,
+    payload_bytes: int,
+    summary: dict[str, str],
+) -> BlockProgress:
+    # raw_bytes == wire_bytes, пока тело не сжимается: сжатие приходит в фазе 2.
+    #
+    # Признак «сервер сообщил своё время» берётся из наличия elapsed_ns, а НЕ из
+    # непустоты сводки: драйвер всегда дописывает в неё query_id
+    # (httpclient.py:444), поэтому пустой она не бывает даже когда прокси срезал
+    # заголовок целиком, и проверка на пустоту была бы мёртвой.
+    elapsed_ns = summary_elapsed_ns(summary)
+    return BlockProgress(
+        chunk_number=chunk_number,
+        block_number=block_number,
+        block_rows=block_rows,
+        rows_total=rows_total,
+        raw_bytes=payload_bytes,
+        wire_bytes=payload_bytes,
+        server_ns=elapsed_ns or 0,
+        server_time_reported=elapsed_ns is not None,
+    )
 
 
 def _iter_rows(chunk: pd.DataFrame, columns: list[str]) -> Iterator[dict[str, object]]:

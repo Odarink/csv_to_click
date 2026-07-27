@@ -10,28 +10,15 @@ echo CSV to ClickHouse loader
 echo Project: %PROJECT_DIR%
 echo.
 
-call :find_python
-if not defined PYTHON_CMD goto :python_not_found
+where uv >nul 2>&1
+if errorlevel 1 goto :uv_not_found
 
-if not exist "%VENV_PYTHON%" (
-    echo Creating virtual environment in .venv
-    echo Running: python -m venv .venv
-    %PYTHON_CMD% -m venv .venv
-    if errorlevel 1 goto :venv_failed
-)
+echo Installing the locked environment
+echo Running: uv sync --locked --extra dev
+uv sync --locked --extra dev
+if errorlevel 1 goto :sync_failed
 
 if not exist "%VENV_PYTHON%" goto :venv_missing
-
-echo Updating pip
-echo Running: python -m pip install --upgrade pip
-"%VENV_PYTHON%" -m ensurepip --upgrade >nul 2>&1
-"%VENV_PYTHON%" -m pip install --upgrade pip
-if errorlevel 1 goto :pip_failed
-
-echo Installing dependencies from requirements.txt
-echo Running: python -m pip install -r requirements.txt
-"%VENV_PYTHON%" -m pip install -r requirements.txt
-if errorlevel 1 goto :deps_failed
 
 echo Checking runtime imports
 "%VENV_PYTHON%" -c "import streamlit, pandas, clickhouse_connect; print('dependencies OK')"
@@ -45,61 +32,30 @@ echo Running: python -m streamlit run src\csv_click\app.py --server.address 127.
 if errorlevel 1 goto :streamlit_failed
 goto :eof
 
-:find_python
-set "PYTHON_CMD="
-
-py -3.12 -c "import sys; raise SystemExit(0 if sys.version_info >= (3, 11) else 1)" >nul 2>&1
-if not errorlevel 1 (
-    set "PYTHON_CMD=py -3.12"
-    goto :eof
-)
-
-py -3.11 -c "import sys; raise SystemExit(0 if sys.version_info >= (3, 11) else 1)" >nul 2>&1
-if not errorlevel 1 (
-    set "PYTHON_CMD=py -3.11"
-    goto :eof
-)
-
-python -c "import sys; raise SystemExit(0 if sys.version_info >= (3, 11) else 1)" >nul 2>&1
-if not errorlevel 1 (
-    set "PYTHON_CMD=python"
-    goto :eof
-)
-
-goto :eof
-
-:python_not_found
+:uv_not_found
 echo.
-echo ERROR: Python 3.11 or newer was not found.
-echo Install Python 3.12, reopen this folder, and run loader.bat again.
+echo ERROR: uv was not found.
+echo The environment is installed from uv.lock so that library versions cannot
+echo drift between two loads. Install uv, reopen this folder, and run loader.bat again.
 echo.
 echo Suggested install command:
-echo winget install -e --id Python.Python.3.12
+echo winget install -e --id astral-sh.uv
 pause
 exit /b 1
 
-:venv_failed
+:sync_failed
 echo.
-echo ERROR: Could not create .venv.
+echo ERROR: uv sync --locked --extra dev failed. Two likely causes:
+echo   1. uv.lock no longer matches pyproject.toml. --locked refuses to launch on a
+echo      stale lock on purpose, because a silently re-resolved environment makes
+echo      before/after load timings incomparable. Run: uv lock
+echo   2. No internet access or the package index is unreachable.
 pause
 exit /b 1
 
 :venv_missing
 echo.
-echo ERROR: .venv\Scripts\python.exe was not created.
-pause
-exit /b 1
-
-:pip_failed
-echo.
-echo ERROR: pip update failed.
-pause
-exit /b 1
-
-:deps_failed
-echo.
-echo ERROR: dependency installation from requirements.txt failed.
-echo Check internet access or package index availability, then run loader.bat again.
+echo ERROR: .venv\Scripts\python.exe was not created by uv sync.
 pause
 exit /b 1
 

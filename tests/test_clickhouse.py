@@ -18,6 +18,7 @@ from csv_click.clickhouse import (
     get_client,
     quote_identifier,
     raw_insert_batch,
+    summary_elapsed_ns,
 )
 from csv_click.errors import CertificateError, ClickHouseConnectionError
 from csv_click.schema import CsvColumn, CsvSchema
@@ -34,6 +35,7 @@ class FakeClient:
 
     def raw_insert(self, **kwargs):
         self.raw_insert_kwargs = kwargs
+        return SimpleNamespace(summary={"written_rows": "1", "elapsed_ns": "1234567"})
 
 
 def sample_schema() -> CsvSchema:
@@ -326,3 +328,58 @@ def test_raw_insert_batch_uses_json_each_row() -> None:
         "insert_block": b'{"ID":1}',
         "fmt": "JSONEachRow",
     }
+
+
+def test_raw_insert_batch_returns_server_summary() -> None:
+    client = FakeClient([])
+
+    summary = raw_insert_batch(
+        client=client,
+        database="sandbox",
+        table="target_table",
+        column_names=["ID"],
+        payload=b'{"ID":1}',
+    )
+
+    assert summary == {"written_rows": "1", "elapsed_ns": "1234567"}
+
+
+def test_raw_insert_batch_returns_what_the_driver_produces_for_a_stripped_header() -> None:
+    """Драйвер безусловно дописывает в сводку query_id (httpclient.py:444), то
+    есть при срезанном прокси заголовке возвращается НЕ пустой словарь, а
+    словарь без elapsed_ns. Тест держит именно эту форму: фейк, возвращающий
+    None или {}, зеленил бы проверку, которой в бою не бывает."""
+
+    class StrippedSummaryClient:
+        def raw_insert(self, **kwargs):
+            return SimpleNamespace(summary={"query_id": "01234567-89ab-cdef"})
+
+    summary = raw_insert_batch(
+        client=StrippedSummaryClient(),
+        database="sandbox",
+        table="target_table",
+        column_names=["ID"],
+        payload=b'{"ID":1}',
+    )
+
+    assert summary == {"query_id": "01234567-89ab-cdef"}
+    assert summary_elapsed_ns(summary) is None
+
+
+def test_summary_elapsed_ns_separates_absent_from_zero() -> None:
+    assert summary_elapsed_ns({"elapsed_ns": "1234567"}) == 1234567
+    assert summary_elapsed_ns({"elapsed_ns": "0"}) == 0
+    # None, а не 0: «сервер не сообщил» и «сервер потратил ноль» — разные вещи,
+    # и на их различении стоит весь вывод «канал против сервера».
+    assert summary_elapsed_ns({}) is None
+    assert summary_elapsed_ns({"query_id": "abc"}) is None
+    assert summary_elapsed_ns({"elapsed_ns": ""}) is None
+    assert summary_elapsed_ns({"elapsed_ns": "not-a-number"}) is None
+
+
+def test_the_installed_driver_never_returns_an_empty_summary() -> None:
+    """Опора для теста выше: проверяем на реальном коде драйвера, что пустой
+    сводки не бывает даже когда в ответе нет ни одного нужного заголовка."""
+    from clickhouse_connect.driver.httpclient import HttpClient
+
+    assert HttpClient._summary(SimpleNamespace(headers={})) == {"query_id": ""}

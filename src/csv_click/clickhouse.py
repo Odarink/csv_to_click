@@ -354,13 +354,44 @@ def raw_insert_batch(
     table: str,
     column_names: list[str],
     payload: bytes,
-) -> None:
-    client.raw_insert(
+) -> dict[str, str]:
+    """Отправляет блок и возвращает разобранный заголовок ``X-ClickHouse-Summary``.
+
+    ⚠️ Пустого dict здесь не бывает, и проверять на него бессмысленно: драйвер
+    безусловно дописывает в сводку ключ ``query_id``
+    (``httpclient.py:437-445``) даже когда самого заголовка в ответе не было.
+    Поэтому «прокси срезал заголовок» определяется отсутствием ``elapsed_ns``,
+    а не пустотой словаря — см. :func:`summary_elapsed_ns`.
+
+    ⚠️ ``elapsed_ns`` в этом заголовке покрывает только работу инициатора.
+    ``settings`` здесь не передаются, поэтому ``distributed_foreground_insert``
+    остаётся серверным дефолтом 0, и ответ приходит как только записан
+    spool-файл: пересылка по шардам, репликация и мержи в него не входят.
+    """
+    result = client.raw_insert(
         table=f"{quote_identifier(database)}.{quote_identifier(table)}",
         column_names=column_names,
         insert_block=payload,
         fmt="JSONEachRow",
     )
+    return getattr(result, "summary", None) or {}
+
+
+def summary_elapsed_ns(summary: dict[str, str]) -> int | None:
+    """Серверное время из ``X-ClickHouse-Summary`` в наносекундах.
+
+    ``None`` означает «сервер этого не сообщил»: заголовок срезан прокси либо в
+    нём нет разбираемого ``elapsed_ns``. Ноль означал бы «сервер не потратил
+    времени» — это разные вещи, и на их различении стоит весь вывод «канал
+    против сервера», ради которого делается фаза 0.
+    """
+    raw_value = summary.get("elapsed_ns")
+    if raw_value is None:
+        return None
+    try:
+        return int(raw_value)
+    except (TypeError, ValueError):
+        return None
 
 
 def _validate_certificate_files(config: ClickHouseConfig) -> None:
