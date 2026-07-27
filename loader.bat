@@ -10,12 +10,12 @@ echo CSV to ClickHouse loader
 echo Project: %PROJECT_DIR%
 echo.
 
-where uv >nul 2>&1
-if errorlevel 1 goto :uv_not_found
+call :find_uv
+if not defined UV_CMD goto :uv_not_found
 
 echo Installing the locked environment
 echo Running: uv sync --locked --extra dev
-uv sync --locked --extra dev
+"%UV_CMD%" sync --locked --extra dev
 if errorlevel 1 goto :sync_failed
 
 if not exist "%VENV_PYTHON%" goto :venv_missing
@@ -32,14 +32,37 @@ echo Running: python -m streamlit run src\csv_click\app.py --server.address 127.
 if errorlevel 1 goto :streamlit_failed
 goto :eof
 
+:find_uv
+rem uv ищется на PATH, а затем в каталоге пользовательских скриптов Python.
+rem Второе нужно потому, что на рабочей машине без прав администратора
+rem единственный проходящий способ установки - pip install --user uv, а он
+rem кладёт uv.exe туда, чего на PATH обычно нет.
+set "UV_CMD="
+for /f "delims=" %%U in ('where uv 2^>nul') do (
+    set "UV_CMD=%%U"
+    goto :eof
+)
+for %%L in ("py -3.12" "py" "python") do (
+    for /f "delims=" %%D in ('%%~L -c "import os,sysconfig;d=sysconfig.get_path('scripts','nt_user');print(d if os.path.exists(os.path.join(d,'uv.exe')) else '')" 2^>nul') do (
+        if not "%%D"=="" (
+            set "UV_CMD=%%D\uv.exe"
+            echo Found uv outside PATH: %%D\uv.exe
+            goto :eof
+        )
+    )
+)
+goto :eof
+
 :uv_not_found
 echo.
-echo ERROR: uv was not found.
+echo ERROR: uv was not found, neither on PATH nor in the Python user scripts directory.
 echo The environment is installed from uv.lock so that library versions cannot
 echo drift between two loads. Install uv, reopen this folder, and run loader.bat again.
 echo.
-echo Suggested install command:
-echo winget install -e --id astral-sh.uv
+echo Without administrator rights:
+echo   py -3.12 -m pip install --user uv
+echo With administrator rights:
+echo   winget install --source winget -e --id astral-sh.uv
 pause
 exit /b 1
 

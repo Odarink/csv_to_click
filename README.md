@@ -44,14 +44,26 @@ ClickHouse: локальную `ReplicatedMergeTree` и распределенн
 - проверит, что доступны `streamlit`, `pandas` и `clickhouse_connect`;
 - запустит приложение на `http://localhost:8501`.
 
-Если `uv` не установлен, `loader.bat` остановится и покажет команду:
+Если `uv` не установлен, `loader.bat` остановится и покажет, как его поставить.
+Без прав администратора:
 
 ```cmd
-winget install -e --id astral-sh.uv
+py -3.12 -m pip install --user uv
 ```
 
-После установки `uv` заново откройте папку проекта и снова запустите
-`loader.bat`.
+С правами администратора:
+
+```cmd
+winget install --source winget -e --id astral-sh.uv
+```
+
+`--source winget` обязателен: без него winget сначала идёт в источник `msstore`
+и на машине с корпоративным перехватом TLS падает с
+`0x8a15005e : The server certificate did not match any of the expected values`.
+
+После установки заново запустите `loader.bat`. Менять `PATH` вручную не нужно:
+`pip install --user` кладёт `uv.exe` в каталог пользовательских скриптов Python,
+которого на `PATH` обычно нет, и `loader.bat` ищет его там сам.
 
 При необходимости задайте пользователя и пароль ClickHouse перед запуском:
 
