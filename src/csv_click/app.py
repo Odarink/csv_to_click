@@ -79,6 +79,13 @@ CSV_READ_STATE_KEYS = [
 LARGE_CSV_PRECHECK_THRESHOLD_BYTES = 50 * 1024 * 1024
 SAMPLE_PRECHECK_ROWS = 200_000
 INSERT_PAYLOAD_SAFETY_RATIO = 0.9
+#: Как часто прогресс загрузки трогает интерфейс. Каждый `st.*`-вызов уходит по
+#: вебсокету и способен бросить RerunException, то есть убить загрузку: на 381
+#: блоке рабочего прогона это 1143 таких вызова вместо трёх сотен.
+LOAD_UI_MIN_INTERVAL_S = 1.0
+#: Сколько последних строк лога уходит в сокет. Полный лог копится в памяти, а
+#: отправка его целиком на каждый блок и была той самой O(n²).
+LOAD_LOG_TAIL_LINES = 400
 
 
 def main() -> None:
@@ -834,7 +841,12 @@ def _append_load_log(log_messages: list[str], message: str) -> None:
 
 
 def _render_load_log(log_container, log_messages: list[str]) -> None:
-    log_container.code("\n".join(log_messages), language="text")
+    tail = log_messages[-LOAD_LOG_TAIL_LINES:]
+    hidden = len(log_messages) - len(tail)
+    text = "\n".join(tail)
+    if hidden:
+        text = f"... {hidden} earlier lines omitted ...\n{text}"
+    log_container.code(text, language="text")
 
 
 def _format_load_error(exc: Exception) -> str:
@@ -914,10 +926,27 @@ def _create_and_load(
     )
     outcome = "failed"
     error_message: str | None = None
+    # Ставится сразу после возврата загрузчика, до любого `st.*`: дальше уже
+    # нельзя ни объявлять провал загрузки, ни удалять таблицы.
+    load_completed = False
+    ui_last_update: float | None = None
 
-    def log(message: str) -> None:
+    def ui_due() -> bool:
+        """Пора ли трогать интерфейс. Первый вызов проходит всегда."""
+        nonlocal ui_last_update
+        now = time.perf_counter()
+        if ui_last_update is not None and now - ui_last_update < LOAD_UI_MIN_INTERVAL_S:
+            return False
+        ui_last_update = now
+        return True
+
+    def log(message: str, *, flush: bool = True) -> None:
         _append_load_log(log_messages, message)
-        _render_load_log(log_container, log_messages)
+        # flush=False только у прогресса загрузки: строка копится и уедет со
+        # следующей отрисовкой. Все остальные сообщения, включая ошибки,
+        # показываются сразу.
+        if flush:
+            _render_load_log(log_container, log_messages)
 
     try:
         mappings = mappings_from_editor_rows(st.session_state["type_rows"])
@@ -1018,17 +1047,21 @@ def _create_and_load(
         def on_progress(block: BlockProgress) -> None:
             nonlocal inserted_rows
             inserted_rows = block.rows_total
+            payload_mb = block.wire_bytes / 1024 / 1024
+            due = ui_due()
+            log(
+                f"Loaded chunk {block.chunk_number}, block {block.block_number}: "
+                f"{block.block_rows} rows, {payload_mb:.2f} MB, total {block.rows_total}.",
+                flush=due,
+            )
+            if not due:
+                return
             if total_rows:
                 progress.progress(min(1.0, inserted_rows / total_rows))
             metrics.metric("Inserted rows", inserted_rows)
-            payload_mb = block.wire_bytes / 1024 / 1024
             status.info(
                 f"Loaded chunk {block.chunk_number}, block {block.block_number}: "
                 f"{block.block_rows} rows"
-            )
-            log(
-                f"Loaded chunk {block.chunk_number}, block {block.block_number}: "
-                f"{block.block_rows} rows, {payload_mb:.2f} MB, total {block.rows_total}."
             )
 
         driver_retries = DriverRetryCounter()
@@ -1054,14 +1087,22 @@ def _create_and_load(
             stats.insert_wall_s = time.perf_counter() - insert_started
             stats.driver_retries = driver_retries.count
 
+        # Данные в ClickHouse. Дальше идут только `st.*`-вызовы, а каждый из них
+        # бросает RerunException, если пользователь тронул интерфейс: без этих
+        # двух строк запись объявляла бы прерванной загрузку, которая прошла, а
+        # `except Exception` ниже удалял бы обе залитые таблицы.
+        load_completed = True
+        outcome = "ok"
         inserted_rows = stats.rows
         progress.progress(1.0)
+        # Плитка обновляется по троттлингу, и последние блоки в неё не попадают:
+        # без этой строки она навсегда осталась бы с промежуточным числом.
+        metrics.metric("Inserted rows", inserted_rows)
         elapsed = time.time() - start
         log(f"Load finished: {inserted_rows} rows in {elapsed:.2f} sec.")
         for line in format_load_stats_lines(stats):
             log(line)
         status.success(f"Load finished: {inserted_rows} rows in {elapsed:.2f} sec")
-        outcome = "ok"
     except CertificateError as exc:
         error_message = f"Certificate error: {exc}"
         log(error_message)
@@ -1071,7 +1112,9 @@ def _create_and_load(
         log(error_message)
         status.error(error_message)
     except (CsvSchemaError, ClickHouseConnectionError, CsvClickError) as exc:
-        if tables_created and client is not None:
+        # Не при `load_completed`: строки уже в таблицах, и сбой отчёта не повод
+        # их уничтожать.
+        if tables_created and client is not None and not load_completed:
             try:
                 _cleanup_after_failed_load(client, config, distributed_table, log)
             except Exception as cleanup_exc:
@@ -1080,12 +1123,20 @@ def _create_and_load(
         log(error_message)
         status.error(error_message)
     except Exception as exc:
-        if tables_created and client is not None:
+        # Не при `load_completed`: строки уже в таблицах, и сбой отчёта не повод
+        # их уничтожать.
+        if tables_created and client is not None and not load_completed:
             try:
                 _cleanup_after_failed_load(client, config, distributed_table, log)
             except Exception as cleanup_exc:
                 log(f"Cleanup error: {cleanup_exc}")
-        error_message = _format_load_error(exc)
+        if load_completed:
+            # Загрузка прошла, сломался отчёт. Прогонять текст через
+            # `_format_load_error` нельзя: он объясняет сбой ЗАГРУЗКИ и,
+            # например, обычную ошибку сокета выдаёт за невидимую таблицу.
+            error_message = f"The load finished, but reporting it failed: {exc}"
+        else:
+            error_message = _format_load_error(exc)
         log(error_message)
         status.error(error_message)
     finally:

@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import time
 from pathlib import Path
 from types import SimpleNamespace
@@ -173,6 +174,7 @@ def test_successful_load_reports_every_clock_and_persists_the_run_record(load_en
     assert record["stats"]["server_ns"] == 2 * BLOCK_SERVER_NS
     assert record["stats"]["insert_wall_s"] > 0
     assert record["stats"]["preflight_s"] > 0
+    assert record["stats"]["source_fully_read"] is True
     assert record["stats"]["connect_s"] >= 0.05
     assert record["stats"]["total_s"] > 0
     assert record["stats"]["src_bytes"] == load_environment.csv_path.stat().st_size
@@ -304,6 +306,269 @@ def test_a_streamlit_rerun_is_recorded_as_interrupted_and_not_as_a_silent_failur
     assert record["outcome"] == "interrupted"
     assert "interrupted" in record["error"]
     assert record["stats"]["rows"] == 0
+
+
+class RerunException(BaseException):
+    """Форма исключения Streamlit: наследник BaseException, мимо `except Exception`."""
+
+
+class InterruptingSlot(FakeSlot):
+    """Слот, который на N-м вызове названного метода бросает RerunException.
+
+    Бросает ДО записи вызова: настоящий `st.*` тоже не успевает ничего показать.
+    """
+
+    def __init__(self, method: str, call_number: int) -> None:
+        super().__init__()
+        self._method = method
+        self._call_number = call_number
+        self._calls = 0
+
+    def _tick(self, method: str) -> None:
+        if method != self._method:
+            return
+        self._calls += 1
+        if self._calls == self._call_number:
+            raise RerunException("rerun")
+
+    def progress(self, value: float) -> None:
+        self._tick("progress")
+        super().progress(value)
+
+    def success(self, text: str) -> None:
+        self._tick("success")
+        super().success(text)
+
+    def metric(self, label: str, value: object) -> None:
+        self._tick("metric")
+        super().metric(label, value)
+
+
+class StreamlitWithInterruptingSlot(FakeStreamlit):
+    """Отдаёт подготовленный слот на нужной позиции.
+
+    Порядок создания в `_create_and_load`: progress, status, metrics, log.
+    """
+
+    def __init__(self, session_state: dict[str, object], slot_index: int, slot: FakeSlot) -> None:
+        super().__init__(session_state)
+        self._slot_index = slot_index
+        self._interrupting = slot
+
+    def _new_slot(self) -> FakeSlot:
+        if len(self.slots) == self._slot_index:
+            self.slots.append(self._interrupting)
+            return self._interrupting
+        return super()._new_slot()
+
+
+def test_a_rerun_while_reporting_a_finished_load_is_recorded_as_ok(
+    load_environment,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Загрузка прошла, строки в ClickHouse — запись обязана это сказать.
+
+    Прерывание ловим на ПЕРВОМ `st.*`-вызове после загрузки: это
+    `progress.progress(1.0)`, третий вызов слота (два блока до него). Отметка
+    успеха должна стоять раньше него, иначе запись объявит провал загрузки,
+    которая прошла.
+    """
+    cleanups: list[str] = []
+    monkeypatch.setattr(
+        app,
+        "_cleanup_after_failed_load",
+        lambda client, config, distributed_table, log: cleanups.append(distributed_table),
+    )
+    # Нулевой интервал, чтобы троттлинг не менял нумерацию вызовов: два блока
+    # дают два вызова progress, и третий — уже тот, что после загрузки.
+    monkeypatch.setattr(app, "LOAD_UI_MIN_INTERVAL_S", 0.0)
+    monkeypatch.setattr(
+        app,
+        "st",
+        StreamlitWithInterruptingSlot(
+            load_environment.streamlit.session_state,
+            slot_index=0,
+            slot=InterruptingSlot("progress", 3),
+        ),
+    )
+
+    with pytest.raises(RerunException):
+        load_environment.run(FakeRawClient())
+
+    record = read_single_record(load_environment.records)
+    assert record["outcome"] == "ok"
+    assert record["stats"]["rows"] == 3
+    assert record["stats"]["source_fully_read"] is True
+    assert cleanups == [], "залитые таблицы нельзя удалять из-за сбоя в отчёте"
+
+
+def test_a_rerun_during_the_load_says_the_source_was_not_read_to_the_end(
+    load_environment,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Прерывание внутри загрузки: конец файла НЕ подтверждён.
+
+    Здесь прерывание приходит на последнем блоке трёхстрочного файла, то есть
+    строки в таблице как раз все. Поле про это и не говорит: оно утверждает
+    ровно одно — итератор чанков не был исчерпан, значит право заявить «файл
+    прочитан целиком» не заработано. Настоящее прерывание на середине файла
+    проверяется на уровне загрузчика, в tests/test_pandas_loader.py.
+    """
+    monkeypatch.setattr(app, "LOAD_UI_MIN_INTERVAL_S", 0.0)
+    monkeypatch.setattr(
+        app,
+        "st",
+        StreamlitWithInterruptingSlot(
+            load_environment.streamlit.session_state,
+            slot_index=2,
+            slot=InterruptingSlot("metric", 2),
+        ),
+    )
+
+    with pytest.raises(RerunException):
+        load_environment.run(FakeRawClient())
+
+    record = read_single_record(load_environment.records)
+    assert record["outcome"] == "interrupted"
+    assert record["stats"]["source_fully_read"] is False
+
+
+def _renders_ending_on_a_block_line(fake_st: FakeStreamlit) -> int:
+    """Сколько отрисовок лога случилось сразу после строки о блоке.
+
+    Строка про блок оказывается ПОСЛЕДНЕЙ в отрисованном тексте только тогда,
+    когда отрисовка произошла прямо за ней. Придержанная строка попадёт в лог
+    позже, уже не последней, — так и отличается «шлём каждый блок» от «шлём не
+    чаще интервала».
+    """
+    return sum(
+        1
+        for slot in fake_st.slots
+        for kind, text in slot.messages
+        if kind == "code" and text.splitlines() and "Loaded chunk" in text.splitlines()[-1]
+    )
+
+
+class SlotFailingOnSuccess(FakeSlot):
+    """Streamlit роняет обычное исключение, когда сообщение слишком велико."""
+
+    def success(self, text: str) -> None:
+        raise RuntimeError("ForwardMsg is too large")
+
+
+def test_a_reporting_error_after_a_finished_load_does_not_drop_the_tables(
+    load_environment,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Обычное исключение из `st.*` уходит в `except Exception`, а тот удалял
+    ОБЕ таблицы. Строки уже в ClickHouse: сбой отчёта не повод их уничтожать.
+
+    Проверяется именно обычным исключением, а не RerunException: последняя
+    наследует BaseException и мимо `except Exception` проходит, то есть чистку
+    не проверяет вообще.
+    """
+    cleanups: list[str] = []
+    monkeypatch.setattr(
+        app,
+        "_cleanup_after_failed_load",
+        lambda client, config, distributed_table, log: cleanups.append(distributed_table),
+    )
+    monkeypatch.setattr(
+        app,
+        "st",
+        StreamlitWithInterruptingSlot(
+            load_environment.streamlit.session_state,
+            slot_index=1,
+            slot=SlotFailingOnSuccess(),
+        ),
+    )
+
+    load_environment.run(FakeRawClient())
+
+    record = read_single_record(load_environment.records)
+    assert cleanups == [], "таблицы с залитыми строками удалены из-за сбоя отчёта"
+    assert record["outcome"] == "ok"
+    assert record["stats"]["rows"] == 3
+    assert record["error"] is not None, "причина сбоя отчёта не должна пропадать"
+    # Текст обязан говорить про отчёт, а не про загрузку: `_format_load_error`
+    # рассказывает про сбой ЗАГРУЗКИ и на этом пути врал бы.
+    assert "load error" not in record["error"].lower(), record["error"]
+    assert "report" in record["error"].lower(), record["error"]
+
+
+def test_progress_updates_are_throttled_instead_of_firing_on_every_block(
+    load_environment,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """381 блок прошлого прогона давал 381 обновление и лог, растущий O(n²)."""
+    monkeypatch.setattr(app, "LOAD_UI_MIN_INTERVAL_S", 3600.0)
+
+    load_environment.run(FakeRawClient())
+
+    metrics = [metric for slot in load_environment.streamlit.slots for metric in slot.metrics]
+    assert _renders_ending_on_a_block_line(load_environment.streamlit) == 1, (
+        "лог тоже не должен уходить в сокет на каждый блок"
+    )
+    # Придержать промежуточные обновления можно, оставить плитку с устаревшим
+    # числом навсегда — нет: после загрузки она обязана показать итог.
+    assert metrics[-1] == ("Inserted rows", 3), metrics
+
+
+def test_a_zero_interval_still_updates_on_every_block(
+    load_environment,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Обратный конец: троттлинг не должен ПРОПУСКАТЬ обновления навсегда."""
+    monkeypatch.setattr(app, "LOAD_UI_MIN_INTERVAL_S", 0.0)
+
+    load_environment.run(FakeRawClient())
+
+    metrics = [metric for slot in load_environment.streamlit.slots for metric in slot.metrics]
+    assert len(metrics) == 3, "два блока плюс итоговое обновление"
+    assert _renders_ending_on_a_block_line(load_environment.streamlit) == 2
+
+
+def test_the_throttle_rearms_after_the_interval_passes(
+    load_environment,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Неградусный интервал, а рабочий: обновления обязаны ВОЗОБНОВЛЯТЬСЯ.
+
+    Оба прежних теста стояли на крайностях (0 и 3600), и троттлинг, который
+    замолкает навсегда после первого блока либо считает интервал вдвое, проходил
+    бы их. Здесь вставка спит дольше интервала, поэтому оба блока попадают в
+    интерфейс, а придержать их можно только сломанными часами.
+    """
+    monkeypatch.setattr(app, "LOAD_UI_MIN_INTERVAL_S", 0.02)
+
+    class SlowClient(FakeRawClient):
+        def raw_insert(self, **kwargs):
+            time.sleep(0.05)
+            return super().raw_insert(**kwargs)
+
+    load_environment.run(SlowClient())
+
+    assert _renders_ending_on_a_block_line(load_environment.streamlit) == 2
+
+
+def test_the_rendered_log_is_bounded_instead_of_resending_everything() -> None:
+    """Лечение O(n²): в сокет уходит хвост, а не весь накопленный лог."""
+    slot = FakeSlot()
+    messages = [f"line {index}" for index in range(app.LOAD_LOG_TAIL_LINES + 50)]
+
+    app._render_load_log(slot, messages)
+
+    text = slot.messages[-1][1]
+    lines = text.splitlines()
+    assert f"line {len(messages) - 1}" in text
+    assert "line 0" not in text
+    # Хвост плюс ровно одна строка о скрытом: без неё оператор не узнает, что
+    # часть лога обрезана, и решит, что загрузка началась с середины.
+    assert len(lines) == app.LOAD_LOG_TAIL_LINES + 1
+    assert not lines[0].startswith("line "), lines[0]
+    # Именно число, а не подстрока: `"50" in ...` выполнялось бы и на строке
+    # `line 50`, то есть держало бы неверный счётчик скрытых.
+    assert re.findall(r"\d+", lines[0]) == ["50"], lines[0]
 
 
 def test_the_run_record_names_the_socket_the_load_actually_used(load_environment) -> None:

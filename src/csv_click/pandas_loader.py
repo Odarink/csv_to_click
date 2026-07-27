@@ -695,6 +695,8 @@ def load_csv_via_raw_insert(
             try:
                 summary = raw_insert_batch(client, database, table, columns, payload)
             except Exception as exc:
+                # Тот же учёт, что на параллельном пути: блок не подтверждён.
+                stats.blocks_unconfirmed += 1
                 raise _raw_insert_error(
                     exc=exc,
                     database=database,
@@ -715,6 +717,8 @@ def load_csv_via_raw_insert(
             stats.add_block(progress)
             if progress_callback:
                 progress_callback(progress)
+    # Итератор чанков исчерпан: файл прочитан до конца, блоков больше не будет.
+    stats.source_fully_read = True
     return stats
 
 
@@ -802,12 +806,15 @@ def _load_csv_via_raw_insert_parallel(
         while pending:
             future = pending.pop()
             if future.cancelled():
+                # Блок не был отправлен вообще: его строк в таблице нет.
+                stats.blocks_unconfirmed += 1
                 continue
             try:
                 inserted = future.result()
             except Exception:
                 # Ошибку упавшего блока поднимает collect_completed; остальные
                 # производны от того же сбоя и контекста не добавляют.
+                stats.blocks_unconfirmed += 1
                 continue
             stats.add_block(block_progress_for(inserted))
 
@@ -819,6 +826,9 @@ def _load_csv_via_raw_insert_parallel(
             try:
                 inserted = future.result()
             except BaseException:
+                # Сюда попадает только сбой самой вставки: `future.result()` не
+                # зовёт progress_callback. Значит блок не подтверждён.
+                stats.blocks_unconfirmed += 1
                 cancel_pending(pending)
                 raise
             progress = block_progress_for(inserted)
@@ -860,6 +870,9 @@ def _load_csv_via_raw_insert_parallel(
                     if len(pending) >= max_pending:
                         collect_completed(pending)
 
+            # Файл прочитан до конца и все блоки отданы воркерам. Долетели ли
+            # они — отдельный вопрос, на него отвечает `blocks_unconfirmed`.
+            stats.source_fully_read = True
             while pending:
                 collect_completed(pending)
         except BaseException:
