@@ -120,6 +120,7 @@ class _ColumnStats:
     all_float: bool = True
     all_date: bool = True
     all_datetime: bool = True
+    has_lossy_numeric_text: bool = False
     max_decimal_scale: int = 0
     sample_values: list[str] | None = None
 
@@ -150,6 +151,13 @@ class _ColumnStats:
         self.all_float = self.all_float and _is_float(raw)
         self.all_date = self.all_date and _is_date(raw)
         self.all_datetime = self.all_datetime and _is_datetime(raw)
+        if not self.has_lossy_numeric_text and (
+            self.all_uint or self.all_int or self.all_decimal or self.all_float
+        ):
+            # Флаг читают только числовые ветки `_infer_type`. Числовые признаки
+            # обратно в True не возвращаются, так что после их сброса считать
+            # нечего: на текстовой колонке это снимает вызов с каждого значения.
+            self.has_lossy_numeric_text = _loses_text_as_number(raw)
         if decimal_scale is not None:
             self.max_decimal_scale = max(self.max_decimal_scale, decimal_scale)
 
@@ -328,6 +336,12 @@ def _infer_type(stats: _ColumnStats) -> tuple[str, str]:
         return "String", "All values are empty; fallback to String"
     if stats.all_bool and stats.has_explicit_bool_literal:
         return "Bool", ""
+    if stats.has_lossy_numeric_text and (
+        stats.all_uint or stats.all_int or stats.all_decimal or stats.all_float
+    ):
+        # Условие про числовые флаги обязательно: дата `0001-01-01` тоже
+        # начинается с ведущего нуля, но её разбор ничего не теряет.
+        return "String", "Leading zeros, a plus sign or non-ASCII digits would be lost; fallback to String"
     if stats.all_uint:
         return "UInt64", ""
     if stats.all_int:
@@ -391,6 +405,24 @@ def _is_int(value: str) -> bool:
 
 def _is_uint(value: str) -> bool:
     return re.fullmatch(r"\+?\d+", value) is not None
+
+
+def _loses_text_as_number(value: str) -> bool:
+    """Число только по виду: разбор изменит текст, и обратно его не собрать.
+
+    `00123456789` уедет как `123456789`, `+79001234567` потеряет плюс. Не-ASCII
+    цифры разбор переписывает целиком: `١٢٣٤` и `１２３` он читает как обычные
+    числа, потому что `\\d`, `float` и `Decimal` в Python юникодные.
+
+    Для банковской выгрузки это счета, БИК, ИНН, КПП, телефоны и индексы: порча
+    выглядит правдоподобно и молча. Одиночный `0` и `0.5` разбор не трогает.
+    """
+    if not value.isascii():
+        return True
+    if value.startswith("+"):
+        return True
+    digits = value.removeprefix("-")
+    return len(digits) > 1 and digits[0] == "0" and digits[1].isdigit()
 
 
 def _decimal_scale(value: str) -> int | None:
