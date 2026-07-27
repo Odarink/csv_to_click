@@ -24,6 +24,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import pandas as pd
 import pytest
 
 from csv_click.pandas_loader import (
@@ -34,6 +35,7 @@ from csv_click.pandas_loader import (
     convert_chunk_to_schema,
     iter_pandas_chunks,
     preview_csv_rows,
+    text_columns_for,
 )
 
 
@@ -168,6 +170,36 @@ def test_our_na_marker_set_matches_what_pandas_would_have_used() -> None:
     from csv_click.pandas_loader import NA_MARKERS
 
     assert NA_MARKERS == set(STR_NA_VALUES)
+
+
+def test_only_columns_that_need_raw_text_are_read_as_text(tmp_path: Path) -> None:
+    """Текстом читается лишь то, где значима исходная запись. Числа pandas
+    разбирает сам — это и быстрее, и точнее; читать их через строку значило бы
+    платить за корректность там, где она ничего не требует."""
+    csv_path = write(tmp_path, "code,qty,price,note\n007,10,1.5,NA\n042,20,2.5,ok\n")
+    mappings = [
+        SchemaMapping("code", "code", True, "String", False),
+        SchemaMapping("qty", "qty", True, "UInt64", False),
+        SchemaMapping("price", "price", True, "Float64", False),
+        SchemaMapping("note", "note", True, "String", False),
+    ]
+
+    columns = ["code", "qty", "price", "note"]
+    chunk = next(iter(iter_pandas_chunks(csv_path, OPTIONS, columns, text_columns_for(mappings))))
+
+    assert chunk["code"].tolist() == ["007", "042"], "ведущие нули обязаны уцелеть"
+    assert chunk["note"].tolist() == ["NA", "ok"], "NA в String — значение, а не пропуск"
+    assert pd.api.types.is_numeric_dtype(chunk["qty"])
+    assert pd.api.types.is_numeric_dtype(chunk["price"])
+
+
+def test_a_fractional_value_in_an_integer_column_fails_loudly(tmp_path: Path) -> None:
+    """Раньше здесь стоял `int(value)`, молча обрезавший дробную часть: `1.7`
+    в Int64-колонке уезжало единицей."""
+    csv_path = write(tmp_path, "id,v\n1,1.7\n")
+
+    with pytest.raises(Exception, match="whole number"):
+        load(csv_path, {"id": "UInt64", "v": "Int64"})
 
 
 def test_a_header_with_spaces_around_a_name_loads(tmp_path: Path) -> None:

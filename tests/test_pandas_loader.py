@@ -230,9 +230,15 @@ def test_convert_chunk_supports_include_rename_and_nullable_int() -> None:
     converted = convert_chunk_to_schema(chunk, mappings, chunk_number=1)
 
     assert converted.columns.tolist() == ["ID", "C_SPOSOB_KVIT_0"]
-    assert converted["C_SPOSOB_KVIT_0"].map(lambda value: type(value).__name__).tolist() == [
-        "int",
-        "NoneType",
+    # Проверяются отправляемые байты, а не промежуточные Python-типы: `.map()`
+    # по маскированной Int64-серии отдаёт float, и такой пин мерил бы поведение
+    # pandas, а не наши данные.
+    assert [
+        json.loads(line)
+        for line in chunk_to_json_lines(converted, ["ID", "C_SPOSOB_KVIT_0"]).decode("utf-8").splitlines()
+    ] == [
+        {"ID": 1, "C_SPOSOB_KVIT_0": 10},
+        {"ID": 2, "C_SPOSOB_KVIT_0": None},
     ]
 
 
