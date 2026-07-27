@@ -10,6 +10,8 @@ from typing import Iterator, TypeVar
 
 import numpy as np
 import pandas as pd
+import pyarrow as pa
+import pyarrow.compute as pc
 
 from csv_click.clickhouse import raw_insert_batch, summary_elapsed_ns
 from csv_click.errors import CsvLoadError, CsvReadCancelled, CsvSchemaError
@@ -76,6 +78,20 @@ class SchemaMapping:
 #: остальное читается текстом: там значима исходная запись — ведущие нули в
 #: String, хвостовой ноль в `1.50` для Decimal, литералы вроде `NA`.
 NATIVELY_PARSED_TYPES: frozenset[str] = frozenset({"Int64", "UInt64", "Float64"})
+
+#: Что `to_json` экранирует обратным слэшем внутри строки. Прямой слэш — не
+#: описка, а наследие ujson: `a/b` уезжает как `a\/b`. Снято выполнением, не
+#: по документации, и закреплено дифференциальным тестом.
+_JSON_ESCAPES: tuple[tuple[str, str], ...] = (("\\", "\\\\"), ('"', '\\"'), ("/", "\\/"))
+#: Управляющие символы `to_json` пишет escape-последовательностью. Быстрый путь так не умеет и
+#: на них отказывается в пользу эталона.
+_JSON_UNSUPPORTED_RE = r"[\x00-\x1f]"
+#: Один проход вместо трёх замен: если ни одного особого символа в колонке нет,
+#: экранировать нечего. На тексте без слэшей и кавычек это обычный случай.
+_JSON_ESCAPE_NEEDED_RE = r'["\\/\x00-\x1f]'
+#: Сколько значений object-колонки хватает, чтобы отказать по типу без полной
+#: конвертации в Arrow. Смотрится голова, потому что колонка однородна по типу.
+_OBJECT_PEEK_ROWS = 8
 
 
 def text_columns_for(mappings: list[SchemaMapping]) -> set[str]:
@@ -538,18 +554,30 @@ def validate_csv_sample_with_pandas_chunks(
 
 
 def chunk_to_json_lines(chunk: pd.DataFrame, columns: list[str]) -> bytes:
-    """Весь чанк в JSONEachRow одним векторным вызовом.
+    """Весь чанк в JSONEachRow: сначала Arrow, при отказе — `to_json`.
 
-    Заменяет построчный цикл с `json.dumps`: на замеренном профиле (одна
-    колонка, 107 млн строк) он занимал 90,1% времени вставки и держал пять
-    HTTP-воркеров голодными. `to_json` уходит в C и снимает постоянные расходы
-    на строку, которые на узком файле и составляют почти всё.
+    Замерено на профиле выгрузки (одна колонка, 500 тыс. строк на чанк):
+    `to_json` даёт 0,288 мкс/строку, сборка через Arrow — 0,083, то есть 3,5×.
+    Это главная стадия: на прогоне в 500 млн строк она занимала 70,5% времени
+    вставки, а сервер — 4,9%.
+
+    Быстрый путь берётся ТОЛЬКО когда обещает байт-в-байт тот же результат.
+    Иначе возвращается `None`, и чанк идёт эталоном: расхождение здесь означало
+    бы порчу данных, а не замедление.
 
     Все значения к этому моменту уже приведены `convert_chunk_to_schema` к
     типам, которые `to_json` кодирует напрямую: str, int, float, bool, None и
     Decimal — последний он кодирует строкой, ровно как это делал `str()` в
     построчном пути. Временные колонки приведены к строкам там же, вектором.
     """
+    fast = _arrow_json_lines(chunk, columns)
+    if fast is not None:
+        return fast
+    return _pandas_json_lines(chunk, columns)
+
+
+def _pandas_json_lines(chunk: pd.DataFrame, columns: list[str]) -> bytes:
+    """Эталон, с которым обязан совпадать быстрый путь."""
     payload = chunk[columns].to_json(
         orient="records",
         lines=True,
@@ -557,6 +585,157 @@ def chunk_to_json_lines(chunk: pd.DataFrame, columns: list[str]) -> bytes:
         double_precision=15,
     )
     return payload.rstrip("\n").encode("utf-8")
+
+
+def _arrow_json_lines(chunk: pd.DataFrame, columns: list[str]) -> bytes | None:
+    """Тот же JSONEachRow, собранный вычислениями Arrow. `None` — отказ.
+
+    Строка собирается ОДНИМ вызовом `binary_join_element_wise`: литералы
+    (`{"имя":`, запятые, `}`) передаются скалярами и размножаются сами, поэтому
+    на строку не остаётся ни одного действия на Python.
+    """
+    if not columns or len(chunk) == 0:
+        return None
+
+    # Сначала ДЕШЁВАЯ проверка всех колонок и только потом сборка. Отказ решается
+    # по dtype и по типу первых значений, без конвертации: иначе кадр, у которого
+    # непригодна ПОСЛЕДНЯЯ колонка, успевал полностью собраться через Arrow и
+    # выброситься. Замерено на пяти колонках с Decimal в конце: 1,28× медленнее
+    # эталона против 1,01× после этой проверки.
+    for column in columns:
+        if not _arrow_may_support(chunk[column]):
+            return None
+
+    # Контракт функции — либо байты, либо `None`; бросать нельзя. Несовпадение
+    # типов в ядрах Arrow приходит именно исключением, и уронить им загрузку
+    # значило бы обменять 14 минут работы на неизвестное ядро. Откат при этом
+    # выдаёт ТЕ ЖЕ байты, так что тише не становится ничего, кроме скорости.
+    try:
+        parts: list[object] = []
+        for index, column in enumerate(columns):
+            fragment = _arrow_json_values(chunk[column])
+            if fragment is None:
+                # Отказ хотя бы одной колонки — отказ всего чанка. Собирать
+                # строку из частей двух путей нельзя: разойдётся весь блок.
+                return None
+            key = _arrow_json_key(column)
+            if key is None:
+                return None
+            parts.append(pa.scalar(('{' if index == 0 else ',') + f'"{key}":'))
+            parts.append(fragment)
+        parts.append(pa.scalar("}"))
+
+        lines = pc.binary_join_element_wise(*parts, pa.scalar(""))
+        offsets = pa.array([0, len(lines)], type=pa.int32())
+        joined = pc.binary_join(pa.ListArray.from_arrays(offsets, lines), "\n")
+    except pa.ArrowException:
+        return None
+    return joined[0].as_py().encode("utf-8")
+
+
+def _arrow_may_support(series: pd.Series) -> bool:
+    """Может ли колонка идти быстрым путём — решается БЕЗ конвертации в Arrow.
+
+    Не окончательный ответ: `_arrow_json_values` проверяет ещё и тип Arrow после
+    конвертации. Смысл этой функции — отказать всему кадру раньше, чем на него
+    потратятся вычисления Arrow.
+    """
+    if pd.api.types.is_float_dtype(series):
+        return False
+    if pd.api.types.is_object_dtype(series):
+        return _arrow_supports_object_values(series)
+    return True
+
+
+def _arrow_supports_object_values(series: pd.Series) -> bool:
+    """Годится ли object-колонка быстрому пути, судя по первым значениям.
+
+    Нужна только для ДЕШЁВОГО отказа. `True` ничего не гарантирует: тип всё
+    равно проверяется после конвертации. Замерено, зачем это: `from_pandas` на
+    Decimal-объектах стоит 0,855 мкс/строку, и кадр с одной такой колонкой был
+    в 2,15 раза медленнее, чем до правки — конвертация делалась и выбрасывалась.
+
+    Пропуски пропускаются: колонка из одних пропусков решается уже в Arrow.
+    """
+    for value in series.head(_OBJECT_PEEK_ROWS):
+        if value is None or value is pd.NA:
+            continue
+        if isinstance(value, float) and value != value:
+            continue
+        return isinstance(value, (str, bool, int, np.bool_, np.integer))
+    return True
+
+
+def _arrow_json_key(column: str) -> str | None:
+    """Имя колонки, экранированное как это делает `to_json`. `None` — отказ.
+
+    Ключ экранируется по тем же правилам, что значение: имя `q"q` без этого
+    давало `{"q"q":1}`, то есть сломанный JSON. Найдено дифференциальным
+    фаззером; целевое имя приходит из редактора типов свободным текстом, и
+    `normalize_identifier` к нему не применяется.
+    """
+    if any(ord(char) < 0x20 for char in column):
+        return None
+    for needle, replacement in _JSON_ESCAPES:
+        column = column.replace(needle, replacement)
+    return column
+
+
+def _arrow_json_values(series: pd.Series) -> pa.Array | None:
+    """Колонка в готовые фрагменты значения: число как есть, строка в кавычках.
+
+    `None` — когда байт-в-байт совпадение с `to_json` не гарантируется. Фрагмент
+    НИКОГДА не содержит null: пропуск превращается в литерал `null`, иначе
+    `binary_join_element_wise` обнулил бы всю строку.
+    """
+    if pd.api.types.is_float_dtype(series):
+        # Самый дешёвый отказ: у `to_json` свой формат float (`1e+20` при
+        # double_precision=15), и совпадение с ним не доказано.
+        return None
+    if pd.api.types.is_object_dtype(series) and not _arrow_supports_object_values(series):
+        return None
+
+    try:
+        values = pa.Array.from_pandas(series)
+    except (pa.ArrowException, OverflowError, TypeError, ValueError):
+        # Смешанная object-колонка либо int вне int64 (`OverflowError`). Эталон
+        # их кодирует, быстрый путь — нет.
+        return None
+
+    if not isinstance(values, pa.Array):
+        # Колонка, чей UTF-8 не влез в 2 ГиБ, приезжает `ChunkedArray`. Ядра
+        # Arrow его принимают, а `ListArray.from_arrays` бросает обычный
+        # `TypeError` мимо `ArrowException` — и загрузка падала вместо отката.
+        return None
+
+    # Решает ТИП ARROW, а не dtype pandas: `convert_chunk_to_schema` отдаёт Bool
+    # и целые в object-колонке, и по dtype они выглядели текстом.
+    if pa.types.is_integer(values.type) or pa.types.is_boolean(values.type):
+        text = pc.cast(values, pa.string())
+        return pc.fill_null(text, "null") if values.null_count else text
+
+    if not (pa.types.is_string(values.type) or pa.types.is_large_string(values.type)):
+        # Decimal и прочие объекты приезжают своим типом Arrow, а не строкой.
+        return None
+
+    if pa.types.is_large_string(values.type):
+        # dtype "string" в pandas даёт large_string, а его ядра
+        # `binary_join_element_wise` со скалярами string не смешивают.
+        try:
+            values = pc.cast(values, pa.string())
+        except pa.ArrowInvalid:
+            return None
+
+    if pc.any(pc.match_substring_regex(values, _JSON_ESCAPE_NEEDED_RE)).as_py():
+        if pc.any(pc.match_substring_regex(values, _JSON_UNSUPPORTED_RE)).as_py():
+            # Управляющие символы to_json пишет escape-последовательностью, чего
+            # этого не умеет, а угадывать здесь нельзя.
+            return None
+        for needle, replacement in _JSON_ESCAPES:
+            values = pc.replace_substring(values, needle, replacement)
+
+    quoted = pc.binary_join_element_wise(pa.scalar('"'), values, pa.scalar('"'), pa.scalar(""))
+    return pc.fill_null(quoted, "null") if values.null_count else quoted
 
 
 def iter_json_each_row_payloads(
@@ -584,6 +763,13 @@ def iter_json_each_row_payloads(
     bytes_per_row = max(1.0, len(sample) / sample_rows)
     rows_per_block = max(1, int(max_payload_bytes / bytes_per_row))
 
+    # Чанк, который по оценке влезает целиком, уходит одним куском. Иначе цикл
+    # ниже платит по одному bytes-объекту и одной итерации упаковки на КАЖДУЮ
+    # строку: на профиле выгрузки это 67% времени сериализации при блоке 9,5 МБ
+    # против лимита 28,3 МБ, то есть при работе, которой не требовалось.
+    # Решение принимается по ФАКТИЧЕСКОЙ длине: оценка снята с головы чанка и
+    # умеет соврать, а блок сверх лимита ClickHouse отвергнет. Риск памяти тот
+    # же, что у цикла ниже: он режет срезами ровно по этой же оценке.
     # Уже сериализованные, но ещё не отправленные строки. Благодаря буферу
     # перебравший срез не выбрасывается: лишние строки уходят в следующий блок,
     # и каждая строка сериализуется РОВНО ОДИН раз. Без него нарезка на
@@ -592,6 +778,19 @@ def iter_json_each_row_payloads(
     pending: list[bytes] = []
     pending_bytes = 0
     start = 0
+
+    if bytes_per_row * total_rows <= max_payload_bytes:
+        whole = chunk_to_json_lines(chunk, columns)
+        if len(whole) <= max_payload_bytes:
+            yield whole, total_rows
+            return
+        # Оценка соврала. Строки из собранного payload — ровно то, что цикл ниже
+        # собирался сериализовать заново, поэтому он их забирает, а не
+        # выбрасывает: иначе чанк сериализовался бы дважды.
+        pending = whole.split(b"\n")
+        pending_bytes = sum(map(len, pending))
+        start = total_rows
+        del whole
     while pending or start < total_rows:
         while start < total_rows and pending_bytes + max(0, len(pending) - 1) <= max_payload_bytes:
             stop = min(start + rows_per_block, total_rows)

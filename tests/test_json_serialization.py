@@ -16,8 +16,12 @@
 from __future__ import annotations
 
 import json
+import random
+from decimal import Decimal
 
+import numpy as np
 import pandas as pd
+import pyarrow as pa
 import pytest
 
 import csv_click.pandas_loader as pandas_loader
@@ -451,6 +455,62 @@ def test_the_block_estimate_grows_back_after_a_run_of_fat_rows(
     assert len(calls) <= 30, f"проходов сериализации {len(calls)}, оценка не восстанавливается"
 
 
+def test_a_chunk_whose_head_looks_thin_still_respects_the_limit() -> None:
+    """Оценка размера берётся с ГОЛОВЫ чанка, и она умеет соврать.
+
+    1024 тонкие строки, дальше толстые: по голове чанк «влезает целиком», на
+    деле нет. Решение «отдать одним блоком» обязано опираться на фактическую
+    длину, а не на оценку, иначе в ClickHouse уедет блок сверх лимита.
+    """
+    values = ["t" * 10] * 1024 + ["F" * 5000] * 200
+    frame = pd.DataFrame({"col": values}, dtype="object")
+    converted = convert_chunk_to_schema(
+        frame, [SchemaMapping("col", "col", True, "String", False)], chunk_number=1
+    )
+    limit = 100_000
+
+    blocks = list(iter_json_each_row_payloads(converted, ["col"], max_payload_bytes=limit))
+
+    assert sum(rows for _, rows in blocks) == len(values)
+    assert all(len(payload) <= limit for payload, _ in blocks)
+    restored = [
+        json.loads(line)["col"]
+        for payload, _ in blocks
+        for line in payload.decode("utf-8").splitlines()
+    ]
+    assert restored == values
+
+
+def test_a_fitting_chunk_is_serialized_in_one_pass(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Чанк, который влезает целиком, сериализуется одним проходом.
+
+    Тест держит именно это: срезов по `rows_per_block` быть не должно. Сколько
+    работы делается ВНУТРИ прохода, снаружи не видно — построчная упаковка
+    проверяется замером и эквивалентной мутацией, а не этим тестом.
+    """
+    converted = build_rows(5_000)
+    serialized_rows: list[int] = []
+    original = pandas_loader.chunk_to_json_lines
+
+    def counted(chunk: pd.DataFrame, columns: list[str]) -> bytes:
+        serialized_rows.append(len(chunk))
+        return original(chunk, columns)
+
+    monkeypatch.setattr(pandas_loader, "chunk_to_json_lines", counted)
+
+    blocks = list(
+        pandas_loader.iter_json_each_row_payloads(converted, ["col"], max_payload_bytes=1_000_000)
+    )
+
+    assert len(blocks) == 1
+    assert blocks[0][1] == 5_000
+    assert blocks[0][0] == pandas_loader.chunk_to_json_lines(converted, ["col"])
+    assert max(serialized_rows) == 5_000, (
+        "чанк обязан сериализоваться одним куском, а не срезами: "
+        f"размеры проходов {serialized_rows}"
+    )
+
+
 def test_an_empty_chunk_yields_no_blocks_at_all() -> None:
     """Пустой блок отправился бы в ClickHouse как пустой INSERT."""
     frame = pd.DataFrame({"col": []}, dtype="object")
@@ -468,3 +528,388 @@ def test_a_chunk_that_fits_is_emitted_as_one_block() -> None:
 
     assert len(blocks) == 1
     assert blocks[0][1] == 10
+
+
+# --- фаза 3c: тот же JSONEachRow, собранный через Arrow -----------------------
+#
+# Быстрый путь имеет право существовать только при БАЙТ-В-БАЙТ совпадении с
+# `to_json`. Поэтому главная проверка тут дифференциальная: эталон против Arrow
+# на значениях, которые обычно и расходятся. Расхождения `to_json`, снятые
+# выполнением: прямой слэш экранируется (`a/b` -> `a\/b`), не-ASCII уезжает как
+# есть (`force_ascii=False`), управляющие символы становятся `\u0001`.
+
+ARROW_CASES: dict[str, pd.Series] = {
+    "UInt64": pd.Series(pd.array([0, 7, 18446744073709551615], dtype="UInt64")),
+    "UInt64 с пропуском": pd.Series(pd.array([7, None, 42], dtype="UInt64")),
+    "Int64 отрицательные": pd.Series(pd.array([-9223372036854775808, 0, 42], dtype="Int64")),
+    "Int64 с пропуском": pd.Series(pd.array([-7, None], dtype="Int64")),
+    "boolean": pd.Series(pd.array([True, False], dtype="boolean")),
+    "boolean с пропуском": pd.Series(pd.array([True, None, False], dtype="boolean")),
+    "строки обычные": pd.Series(["Иванов", "ok", ""], dtype="object"),
+    "строки с кавычкой": pd.Series(['a"b', 'both "x" and "y"'], dtype="object"),
+    "строки с обратным слэшем": pd.Series(["a\\b", "C:\\Users\\x"], dtype="object"),
+    "строки с прямым слэшем": pd.Series(["01/02/2024", "a/b/c"], dtype="object"),
+    "строки со всеми тремя": pd.Series(['a"b\\c/d'], dtype="object"),
+    "строки не-ASCII": pd.Series(["Иванов Иван", "ок 🚀", "über"], dtype="object"),
+    "строки с пропуском": pd.Series(["a", None], dtype="object"),
+    "строки dtype string": pd.Series(pd.array(["a", None, 'q"q'], dtype="string")),
+    "строки, похожие на JSON": pd.Series(['{"a": 1}', "[1,2]", "null"], dtype="object"),
+    "одна строка": pd.Series(pd.array([1], dtype="Int64")),
+}
+
+
+@pytest.mark.parametrize("case", sorted(ARROW_CASES))
+def test_the_arrow_path_matches_to_json_byte_for_byte(case: str) -> None:
+    frame = pd.DataFrame({"col": ARROW_CASES[case]})
+
+    fast = pandas_loader._arrow_json_lines(frame, ["col"])
+
+    assert fast is not None, "быстрый путь обязан браться на этих типах"
+    assert fast == pandas_loader._pandas_json_lines(frame, ["col"])
+
+
+COLUMN_NAME_CASES: dict[str, str] = {
+    "кавычка в имени": 'q"q',
+    "обратный слэш в имени": "back\\slash",
+    "прямой слэш в имени": "с/слэшем",
+    "не-ASCII в имени": "имя_колонки",
+    "точка в имени": "a.b",
+}
+
+
+@pytest.mark.parametrize("case", sorted(COLUMN_NAME_CASES))
+def test_the_arrow_path_escapes_column_names_like_to_json(case: str) -> None:
+    """`to_json` экранирует и КЛЮЧ, не только значение.
+
+    Найдено дифференциальным фаззером: имя `q"q` давало `{"q"q":1}` — сломанный
+    JSON. Целевое имя колонки приходит из редактора типов свободным текстом,
+    `normalize_identifier` к нему не применяется, так что вход достижим.
+    """
+    column = COLUMN_NAME_CASES[case]
+    frame = pd.DataFrame({column: pd.array([1, None], dtype="Int64")})
+
+    fast = pandas_loader._arrow_json_lines(frame, [column])
+
+    assert fast is not None
+    assert fast == pandas_loader._pandas_json_lines(frame, [column])
+
+
+def test_a_control_character_in_a_column_name_falls_back() -> None:
+    column = "col\x01name"
+    frame = pd.DataFrame({column: pd.array([1], dtype="Int64")})
+
+    assert pandas_loader._arrow_json_lines(frame, [column]) is None
+    assert chunk_to_json_lines(frame, [column]) == pandas_loader._pandas_json_lines(frame, [column])
+
+
+def test_the_arrow_path_matches_to_json_on_many_columns_at_once() -> None:
+    """Порядок колонок, запятые и кавычки в ключах — там же, где у эталона."""
+    frame = pd.DataFrame(
+        {
+            "nmid": pd.array([1, None], dtype="UInt64"),
+            "name": pd.Series(['Иванов "И"', None], dtype="object"),
+            "flag": pd.array([True, None], dtype="boolean"),
+            "dt": pd.Series(["2024-01-02 03:04:05", "0001-01-01 00:00:00"], dtype="object"),
+        }
+    )
+    columns = ["nmid", "name", "flag", "dt"]
+
+    fast = pandas_loader._arrow_json_lines(frame, columns)
+
+    assert fast is not None
+    assert fast == pandas_loader._pandas_json_lines(frame, columns)
+
+
+def test_safe_columns_never_reach_the_reference_serializer(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Быстрый путь обязан действительно БРАТЬСЯ, а не просто существовать.
+
+    Без этого теста удаление быстрого пути оставило бы весь набор зелёным: байты
+    совпадают, меняется только скорость. Эталон здесь заминирован, а ожидаемые
+    байты выписаны руками, а не получены тем же кодом.
+    """
+
+    def must_not_run(chunk: pd.DataFrame, columns: list[str]) -> bytes:
+        raise AssertionError("эталон `to_json` не должен вызываться на безопасных колонках")
+
+    monkeypatch.setattr(pandas_loader, "_pandas_json_lines", must_not_run)
+    frame = pd.DataFrame(
+        {
+            "nmid": pd.array([7, None], dtype="UInt64"),
+            "name": pd.Series(["Иванов", 'q"q'], dtype="object"),
+            # dtype "string" даёт large_string: он тоже обязан идти быстрым путём,
+            # а не откатываться на эталон из-за несовпадения типов в ядре Arrow.
+            "code": pd.array(["01", None], dtype="string"),
+        }
+    )
+
+    payload = chunk_to_json_lines(frame, ["nmid", "name", "code"])
+
+    assert payload == (
+        '{"nmid":7,"name":"Иванов","code":"01"}\n'
+        '{"nmid":null,"name":"q\\"q","code":null}'
+    ).encode("utf-8")
+
+
+# Временные dtype здесь намеренно отсутствуют: `_convert_series` приводит их к
+# строкам до сериализации, а сам эталон на них предупреждает об устаревшем
+# формате даты — проверять чужую депрекацию тут нечего.
+EXOTIC_DTYPES: dict[str, pd.Series] = {
+    "categorical": pd.Series(pd.Categorical(["a", "b", "a"])),
+    "arrow large_string": pd.Series(["a", None], dtype=pd.ArrowDtype(pa.large_string())),
+    "arrow int32": pd.Series([1, None], dtype=pd.ArrowDtype(pa.int32())),
+    "arrow decimal": pd.Series([Decimal("1.50")], dtype=pd.ArrowDtype(pa.decimal128(18, 2))),
+    "numpy int32": pd.Series([1, 2], dtype="int32"),
+    "numpy bool": pd.Series([True, False], dtype="bool"),
+    "пустая object": pd.Series([], dtype="object"),
+}
+
+
+@pytest.mark.parametrize("case", sorted(EXOTIC_DTYPES))
+def test_no_dtype_makes_the_arrow_path_raise_instead_of_refusing(case: str) -> None:
+    """Контракт: либо байт-в-байт как эталон, либо отказ. Исключения — нельзя.
+
+    Через `custom_type` в редакторе типов до сериализации доезжают колонки,
+    которых обычный путь не создаёт. Исключение здесь обменяло бы 14 минут
+    загрузки на незнакомое ядро Arrow.
+    """
+    frame = pd.DataFrame({"col": EXOTIC_DTYPES[case]})
+
+    assert chunk_to_json_lines(frame, ["col"]) == pandas_loader._pandas_json_lines(frame, ["col"])
+
+
+_FUZZ_CHARS = [
+    "a", "Z", "0", " ", "", '"', "\\", "/", "'", "`", " ", " ",
+    "Иванов", "über", "中文", "🚀", "{", "}", "[", "]", ":", ",", "null", "true",
+    "-", "+", "e", ".", "\\u0041", "\\\\", '\\"',
+]
+_FUZZ_NAMES = ["col", "nmid", "имя", "a b", "a.b", 'q"q', "back\\slash", "с/слэшем"]
+_FUZZ_INTS = [0, 1, -1, 2**31 - 1, 2**63 - 1, -(2**63), 2**64 - 1, 10**18]
+
+
+def _fuzz_series(rng: random.Random, rows: int) -> pd.Series:
+    kind = rng.choice(["uint", "int", "bool", "object", "string"])
+    if kind == "uint":
+        values = [rng.choice([None, *_FUZZ_INTS]) for _ in range(rows)]
+        return pd.Series(pd.array([None if v is None or v < 0 else v for v in values], dtype="UInt64"))
+    if kind == "int":
+        values = [rng.choice([None, *_FUZZ_INTS]) for _ in range(rows)]
+        return pd.Series(pd.array([None if v is None or v >= 2**63 else v for v in values], dtype="Int64"))
+    if kind == "bool":
+        return pd.Series(pd.array([rng.choice([True, False, None]) for _ in range(rows)], dtype="boolean"))
+    texts = [
+        rng.choice([None, "".join(rng.choice(_FUZZ_CHARS) for _ in range(rng.randint(0, 5)))])
+        for _ in range(rows)
+    ]
+    return pd.Series(pd.array(texts, dtype="string") if kind == "string" else texts, dtype=None if kind == "string" else "object")
+
+
+def test_the_arrow_path_survives_a_seeded_differential_fuzz() -> None:
+    """Перебор случайных кадров против эталона. Семя фиксировано.
+
+    Этот перебор нашёл настоящий дефект — неэкранированные ИМЕНА колонок, из-за
+    которых имя `q"q` давало сломанный JSON. Ручные случаи его не поймали, потому
+    что имя колонки никто не подозревал. 20 тыс. итераций того же генератора
+    расхождений больше не дают; здесь их 400, чтобы набор оставался быстрым.
+    """
+    rng = random.Random(20260727)
+    fast_taken = 0
+
+    for _ in range(400):
+        rows = rng.randint(1, 5)
+        names = rng.sample(_FUZZ_NAMES, rng.randint(1, 4))
+        frame = pd.DataFrame({name: _fuzz_series(rng, rows) for name in names})
+        columns = list(frame.columns)
+        rng.shuffle(columns)
+
+        fast = pandas_loader._arrow_json_lines(frame, columns)
+        if fast is None:
+            continue
+        fast_taken += 1
+        assert fast == pandas_loader._pandas_json_lines(frame, columns), (
+            f"расхождение на кадре {({name: list(frame[name]) for name in columns})}, колонки {columns}"
+        )
+
+    assert fast_taken > 100, f"быстрый путь брался всего {fast_taken} раз — перебор ничего не проверил"
+
+
+def test_a_chunked_arrow_column_falls_back_instead_of_crashing() -> None:
+    """Строковая колонка больше 2 ГиБ приезжает `ChunkedArray`, а не `Array`.
+
+    Найдено ревью. Такой массив проходит все проверки типа, ядра Arrow его
+    принимают, а `ListArray.from_arrays` бросает ОБЫЧНЫЙ `TypeError` — не
+    наследник `ArrowException`. Загрузка падала вместо отката на эталон, который
+    с этими данными работает.
+    """
+    chunked = pa.chunked_array([pa.array(["a", None]), pa.array(['q"q'])])
+    frame = pd.DataFrame({"col": pd.Series(pd.arrays.ArrowExtensionArray(chunked))})
+
+    assert pandas_loader._arrow_json_lines(frame, ["col"]) is None
+    assert chunk_to_json_lines(frame, ["col"]) == pandas_loader._pandas_json_lines(frame, ["col"])
+
+
+def test_an_object_column_of_huge_ints_falls_back_instead_of_crashing() -> None:
+    """`from_pandas` на int больше int64 бросает `OverflowError`."""
+    frame = pd.DataFrame({"col": pd.Series([2**70, 1], dtype="object")})
+
+    assert pandas_loader._arrow_json_lines(frame, ["col"]) is None
+    assert chunk_to_json_lines(frame, ["col"]) == pandas_loader._pandas_json_lines(frame, ["col"])
+
+
+@pytest.mark.parametrize("code", list(range(0x20)))
+def test_every_control_character_sends_the_chunk_to_the_reference(code: int) -> None:
+    """Все 32 управляющих символа, а не три штучных.
+
+    Ревью показало: мутация границы класса `[\\x00-\\x1f]` на `[\\x00-\\x1e]`
+    выживала, потому что 0x1f не проверялся ни одним тестом.
+    """
+    frame = pd.DataFrame({"col": [f"a{chr(code)}b"]}, dtype="object")
+
+    assert pandas_loader._arrow_json_lines(frame, ["col"]) is None
+    assert chunk_to_json_lines(frame, ["col"]) == pandas_loader._pandas_json_lines(frame, ["col"])
+
+
+@pytest.mark.parametrize("code", list(range(0x20)))
+def test_every_control_character_in_a_column_name_sends_the_chunk_to_the_reference(code: int) -> None:
+    column = f"a{chr(code)}b"
+    frame = pd.DataFrame({column: pd.array([1], dtype="Int64")})
+
+    assert pandas_loader._arrow_json_lines(frame, [column]) is None
+    assert chunk_to_json_lines(frame, [column]) == pandas_loader._pandas_json_lines(frame, [column])
+
+
+#: Тип из редактора -> берётся ли быстрый путь ПОСЛЕ реальной конвертации.
+#: Таблица снята выполнением и держит границу выигрыша: если путь перестанет
+#: браться на String или числах, ускорение исчезнет молча.
+FAST_PATH_BY_TYPE: dict[str, bool] = {
+    "String": True,
+    "Int64": True,
+    "UInt64": True,
+    "Float64": False,
+    "Decimal(18, 2)": False,
+    "Decimal(38, 10)": False,
+    "Date": True,
+    "DateTime": True,
+    "Bool": True,
+}
+
+
+@pytest.mark.parametrize("clickhouse_type", sorted(FAST_PATH_BY_TYPE))
+@pytest.mark.parametrize("nullable", [False, True])
+def test_the_fast_path_covers_the_types_it_claims(clickhouse_type: str, nullable: bool) -> None:
+    """Ровно на каких типах живёт ускорение — и что байты при этом те же."""
+    samples = {
+        "String": ["abc", "007"],
+        "Int64": ["42", "-7"],
+        "UInt64": ["42", "0"],
+        "Float64": ["1.5", "0"],
+        "Decimal(18, 2)": ["1.50", "0"],
+        "Decimal(38, 10)": ["1.5", "0"],
+        "Date": ["2024-01-02", "2024-01-03"],
+        "DateTime": ["2024-01-02 03:04:05", "2024-01-03 00:00:00"],
+        "Bool": ["true", "false"],
+    }
+    values = list(samples[clickhouse_type])
+    final_type = f"Nullable({clickhouse_type})" if nullable else clickhouse_type
+    if nullable:
+        values[-1] = ""
+    converted = convert_chunk_to_schema(
+        pd.DataFrame({"col": values}, dtype="object"),
+        [SchemaMapping("col", "col", True, final_type, nullable)],
+        chunk_number=1,
+    )
+
+    fast = pandas_loader._arrow_json_lines(converted, ["col"])
+
+    assert (fast is not None) is FAST_PATH_BY_TYPE[clickhouse_type]
+    assert chunk_to_json_lines(converted, ["col"]) == pandas_loader._pandas_json_lines(converted, ["col"])
+
+
+OBJECT_PEEK_CASES: dict[str, tuple[list[object], bool]] = {
+    "строки": (["a", "b"], True),
+    "строки с пропусками впереди": ([None, None, "a"], True),
+    "python int": ([1, 2], True),
+    "python bool": ([True, False], True),
+    "numpy bool": ([np.True_, np.False_], True),
+    "Decimal": ([Decimal("1.50")], False),
+    "float": ([1.5], False),
+    "только пропуски": ([None, None], True),
+    "bytes": ([b"a"], False),
+    "вложенный список": ([["a"]], False),
+}
+
+
+@pytest.mark.parametrize("case", sorted(OBJECT_PEEK_CASES))
+def test_object_columns_are_refused_by_value_type_before_any_conversion(case: str) -> None:
+    """Отказ обязан быть ДЕШЁВЫМ, иначе быстрый путь хуже своего отсутствия.
+
+    Замерено: `pa.Array.from_pandas` на Decimal-объектах стоит 0,855 мкс/строку,
+    и кадр с одной такой колонкой был в 2,15 раза МЕДЛЕННЕЕ, чем до правки —
+    конвертация делалась только чтобы её выбросить. Решение принимается по типу
+    первых значений; `True` здесь ничего не обещает, тип проверяется и после.
+    """
+    values, supported = OBJECT_PEEK_CASES[case]
+
+    assert pandas_loader._arrow_supports_object_values(pd.Series(values, dtype="object")) is supported
+
+
+def test_a_decimal_column_does_not_drag_the_whole_chunk_below_the_reference() -> None:
+    """Кадр, который быстрый путь отказывает, не должен стать медленнее эталона.
+
+    Проверяется поведением, а не секундами: Decimal-колонка обязана отсеяться
+    решением по типу, то есть до конвертации всего кадра в Arrow.
+    """
+    frame = pd.DataFrame(
+        {
+            "nmid": pd.array([1, 2], dtype="UInt64"),
+            "amt": pd.Series([Decimal("1.50"), Decimal("2")], dtype="object"),
+        }
+    )
+
+    assert pandas_loader._arrow_supports_object_values(frame["amt"]) is False
+    assert pandas_loader._arrow_json_lines(frame, ["nmid", "amt"]) is None
+    assert chunk_to_json_lines(frame, ["nmid", "amt"]) == pandas_loader._pandas_json_lines(
+        frame, ["nmid", "amt"]
+    )
+
+
+FALLBACK_CASES: dict[str, pd.Series] = {
+    "float — формат не доказан": pd.Series(pd.array([1.5, 1e20], dtype="Float64")),
+    "Decimal — объекты": pd.Series([Decimal("1.50"), Decimal("2")], dtype="object"),
+    "управляющий символ": pd.Series(["a\x01b"], dtype="object"),
+    "перевод строки": pd.Series(["a\nb"], dtype="object"),
+    "табуляция": pd.Series(["a\tb"], dtype="object"),
+    "смешанные объекты": pd.Series(["a", 1], dtype="object"),
+}
+
+
+@pytest.mark.parametrize("case", sorted(FALLBACK_CASES))
+def test_the_arrow_path_refuses_what_it_cannot_promise(case: str) -> None:
+    """Отказ, а не приблизительный ответ: молча разойтись с эталоном нельзя."""
+    frame = pd.DataFrame({"col": FALLBACK_CASES[case]})
+
+    assert pandas_loader._arrow_json_lines(frame, ["col"]) is None
+
+
+@pytest.mark.parametrize("case", sorted(FALLBACK_CASES))
+def test_a_refused_chunk_still_serializes_through_to_json(case: str) -> None:
+    frame = pd.DataFrame({"col": FALLBACK_CASES[case]})
+
+    assert chunk_to_json_lines(frame, ["col"]) == pandas_loader._pandas_json_lines(frame, ["col"])
+
+
+def test_a_mixed_frame_falls_back_as_a_whole_when_one_column_is_unsafe() -> None:
+    """Одна колонка вне быстрого пути — весь чанк идёт эталоном.
+
+    Собирать строку из частей разных путей нельзя: расхождение в одной колонке
+    испортило бы весь блок, а не одно поле.
+    """
+    frame = pd.DataFrame(
+        {
+            "nmid": pd.array([1, 2], dtype="UInt64"),
+            "amount": pd.array([1.5, 2.5], dtype="Float64"),
+        }
+    )
+    columns = ["nmid", "amount"]
+
+    assert pandas_loader._arrow_json_lines(frame, columns) is None
+    assert chunk_to_json_lines(frame, columns) == pandas_loader._pandas_json_lines(frame, columns)
