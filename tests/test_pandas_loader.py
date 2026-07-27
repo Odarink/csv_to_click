@@ -461,6 +461,8 @@ def test_load_csv_via_raw_insert_parallel_uses_client_factory(tmp_path: Path) ->
     assert len(worker_calls) == 4
     assert len(worker_clients) > 1
     assert sorted(event.rows_total for event in progress_events) == [1, 2, 3, 4]
+    assert stats.source_fully_read is True
+    assert stats.blocks_unconfirmed == 0
 
 
 def test_load_csv_via_raw_insert_parallel_requires_client_factory(tmp_path: Path) -> None:
@@ -741,6 +743,7 @@ def test_failed_parallel_load_still_counts_blocks_the_server_already_accepted(tm
     assert stats.blocks == 3, "успешные блоки потеряны при отмене оставшихся задач"
     assert stats.rows == 3
     assert stats.server_ns == 3 * BLOCK_SERVER_NS
+    assert stats.blocks_unconfirmed >= 1, "упавший блок обязан быть посчитан неподтверждённым"
     # Засчитаны, но НЕ отправлены в progress_callback: загрузка уже падает, а
     # callback ходит в Streamlit и может подменить исходную ошибку своей.
     assert events == []
@@ -794,6 +797,49 @@ def test_a_streamlit_rerun_mid_load_still_counts_what_the_server_accepted(tmp_pa
         f"сервер принял {len(accepted)} блоков, а записано {stats.blocks}"
     )
     assert stats.rows == 4
+    # Файл из четырёх строк успел прочитаться целиком до первого callback: все
+    # блоки были отданы воркерам, умер только отчёт.
+    assert stats.source_fully_read is True
+
+
+def test_a_rerun_before_the_producer_finished_says_the_source_is_not_fully_read(tmp_path: Path) -> None:
+    """Прерывание НА СЕРЕДИНЕ файла: в таблице останется префикс.
+
+    Этот путь — с воркерами — тот, которым грузит оператор, и именно он должен
+    честно сказать, что дочитать файл не успели. 10 блоков против max_pending=4
+    гарантируют, что callback дёрнется, пока итератор чанков ещё не исчерпан.
+
+    Отменённые блоки обязаны быть посчитаны: сервер их не видел, и без счётчика
+    запись утверждала бы, что отправлено всё прочитанное.
+    """
+    csv_path = tmp_path / "rerun_midfile.csv"
+    csv_path.write_text("ID\n" + "".join(f"{index}\n" for index in range(10)), encoding="utf_8")
+    mappings = [SchemaMapping("ID", "ID", True, "UInt64", False)]
+    stats = LoadStats()
+
+    class RerunException(BaseException):
+        pass
+
+    def rerun_on_first_progress(block) -> None:
+        raise RerunException("streamlit rerun")
+
+    with pytest.raises(RerunException):
+        load_csv_via_raw_insert(
+            client=FakeRawClient(),
+            csv_path=csv_path,
+            read_options=ReadOptions(batch_size=1),
+            database="sandbox",
+            table="target_table",
+            mappings=mappings,
+            worker_count=2,
+            client_factory=FakeRawClient,
+            progress_callback=rerun_on_first_progress,
+            stats=stats,
+        )
+
+    assert stats.source_fully_read is False
+    assert stats.rows < 10, "префикс файла, а не весь файл"
+    assert stats.blocks_unconfirmed > 0, "отменённые блоки не посчитаны"
 
 
 def test_mappings_from_editor_rows_prefers_custom_type_override() -> None:
