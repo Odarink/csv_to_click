@@ -43,6 +43,15 @@ _BLOCK_ESTIMATE_GROWTH_LIMIT = 16
 DEFAULT_SCHEMA_SAMPLE_ROWS = 100_000
 ENCODING_SUGGESTIONS: tuple[str, ...] = ("utf_8", "utf-8-sig", "cp1251", "windows-1251")
 MOJIBAKE_MARKERS: tuple[str, ...] = ("С‚", "Рµ", "Р°", "Рё", "Рѕ", "РЅ", "�")
+#: Текстовые маркеры пропуска. Повторяет `na_values` по умолчанию в pandas —
+#: файл читается с `keep_default_na=False`, поэтому распознаём их сами и только
+#: там, где они действительно означают пропуск (везде, кроме String).
+#: Совпадение с pandas закреплено тестом.
+NA_MARKERS: frozenset[str] = frozenset({
+    "", "#N/A", "#N/A N/A", "#NA", "-1.#IND", "-1.#QNAN", "-NaN", "-nan",
+    "1.#IND", "1.#QNAN", "<NA>", "N/A", "NA", "NULL", "NaN", "None", "n/a",
+    "nan", "null",
+})
 
 
 @dataclass(frozen=True)
@@ -77,7 +86,12 @@ def iter_pandas_chunks(
             sep=read_options.separator,
             encoding=read_options.encoding,
             chunksize=read_options.batch_size,
-            usecols=usecols,
+            usecols=_raw_header_names(csv_path, read_options, usecols),
+            # Ровно то же, что читают превью и инференс. Без этого путь загрузки
+            # видит другие данные, чем интерфейс: `007` становится числом 7,
+            # литералы NA/null/N/A - пропусками, а `1.50` в Decimal теряет ноль.
+            dtype=str,
+            keep_default_na=False,
         )
         for chunk in reader:
             chunk.columns = chunk.columns.str.strip()
@@ -87,6 +101,31 @@ def iter_pandas_chunks(
             "Cannot parse CSV with "
             f"separator {read_options.separator!r} and encoding {read_options.encoding}: {exc}"
         ) from exc
+
+
+def _raw_header_names(
+    csv_path: str | Path,
+    read_options: ReadOptions,
+    usecols: list[str] | None,
+) -> list[str] | None:
+    """Переводит обрезанные имена колонок обратно в сырые имена заголовка.
+
+    `pd.read_csv` сопоставляет `usecols` с СЫРЫМ заголовком, а `.str.strip()`
+    выполняется строкой позже. Поэтому заголовок вида `id, code ,amt`, обычный
+    для выгрузок из Excel, ронял и загрузку, и preflight с
+    `ValueError: Usecols do not match columns`, называя колонку, которую
+    интерфейс показывает без пробелов.
+    """
+    if usecols is None:
+        return None
+    header = pd.read_csv(
+        csv_path,
+        sep=read_options.separator,
+        encoding=read_options.encoding,
+        nrows=0,
+    )
+    raw_by_stripped = {str(name).strip(): name for name in header.columns}
+    return [raw_by_stripped.get(name, name) for name in usecols]
 
 
 def preview_csv_rows(
@@ -851,10 +890,40 @@ def _raw_insert_error(
     )
 
 
+def _missing_mask(series: pd.Series, na_markers: bool) -> pd.Series:
+    """Где значения нет.
+
+    С `keep_default_na=False` пустая ячейка приезжает пустой строкой, а не NaN,
+    поэтому одной `isna()` больше не хватает. Пустая строка и отсутствие
+    значения в CSV неразличимы: `,,` и `,"",` читаются одинаково.
+
+    ``na_markers`` включает распознавание текстовых маркеров вроде ``NA`` и
+    ``null``. Смысл маркера зависит от типа колонки: в String это значение, в
+    числовой или временной - отсутствие значения. Флаг `keep_default_na`
+    действует на весь файл и такого различия сделать не может.
+    """
+    values = series.astype("object")
+    missing = series.isna() | values.eq("")
+    if na_markers:
+        missing = missing | values.isin(NA_MARKERS)
+    return missing
+
+
 def _convert_series(series: pd.Series, clickhouse_type: str) -> pd.Series:
     nullable, inner_type = unwrap_nullable(clickhouse_type)
+    # В String-колонке `NA` и `null` - обычный текст, ради чего фаза 3b и
+    # делалась; во всех остальных типах это по-прежнему пропуск.
+    missing = _missing_mask(series, na_markers=inner_type != "String")
     if inner_type == "String":
-        return series.map(lambda value: None if pd.isna(value) and nullable else str(value))
+        # Для Nullable пустая ячейка это NULL, для обычного String - пустая
+        # строка. Раньше сюда доезжал NaN, и не-nullable колонка получала текст
+        # "nan" - значение, которого в файле не было.
+        filler = None if nullable else ""
+        return series.astype("object").mask(missing, filler).map(
+            lambda value: value if value is None else str(value)
+        ).astype("object")
+    # Остальным типам пустая ячейка это отсутствие значения; ниже её ждут как NaN.
+    series = series.astype("object").mask(missing, None)
     if inner_type in {"Int64", "UInt64"}:
         converted = pd.to_numeric(series, errors="raise")
         if not nullable and converted.isna().any():

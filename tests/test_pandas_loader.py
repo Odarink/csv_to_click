@@ -78,7 +78,10 @@ def test_iter_pandas_chunks_uses_selected_separator_and_encoding(tmp_path: Path)
 
     assert len(chunks) == 1
     assert chunks[0].columns.tolist() == ["ID", "NAME"]
-    assert chunks[0].iloc[0].to_dict() == {"ID": 1, "NAME": "тест"}
+    # Строка, а не число: путь загрузки теперь читает файл ровно так же, как
+    # превью и инференс. Раньше `007` здесь становилось числом 7 и уезжало в
+    # String-колонку как "7" — см. tests/test_read_consistency.py.
+    assert chunks[0].iloc[0].to_dict() == {"ID": "1", "NAME": "тест"}
 
 
 def test_preview_csv_rows_uses_selected_separator_and_encoding(tmp_path: Path) -> None:
