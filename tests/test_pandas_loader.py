@@ -78,7 +78,10 @@ def test_iter_pandas_chunks_uses_selected_separator_and_encoding(tmp_path: Path)
 
     assert len(chunks) == 1
     assert chunks[0].columns.tolist() == ["ID", "NAME"]
-    assert chunks[0].iloc[0].to_dict() == {"ID": 1, "NAME": "тест"}
+    # Строка, а не число: путь загрузки теперь читает файл ровно так же, как
+    # превью и инференс. Раньше `007` здесь становилось числом 7 и уезжало в
+    # String-колонку как "7" — см. tests/test_read_consistency.py.
+    assert chunks[0].iloc[0].to_dict() == {"ID": "1", "NAME": "тест"}
 
 
 def test_preview_csv_rows_uses_selected_separator_and_encoding(tmp_path: Path) -> None:
@@ -227,9 +230,15 @@ def test_convert_chunk_supports_include_rename_and_nullable_int() -> None:
     converted = convert_chunk_to_schema(chunk, mappings, chunk_number=1)
 
     assert converted.columns.tolist() == ["ID", "C_SPOSOB_KVIT_0"]
-    assert converted["C_SPOSOB_KVIT_0"].map(lambda value: type(value).__name__).tolist() == [
-        "int",
-        "NoneType",
+    # Проверяются отправляемые байты, а не промежуточные Python-типы: `.map()`
+    # по маскированной Int64-серии отдаёт float, и такой пин мерил бы поведение
+    # pandas, а не наши данные.
+    assert [
+        json.loads(line)
+        for line in chunk_to_json_lines(converted, ["ID", "C_SPOSOB_KVIT_0"]).decode("utf-8").splitlines()
+    ] == [
+        {"ID": 1, "C_SPOSOB_KVIT_0": 10},
+        {"ID": 2, "C_SPOSOB_KVIT_0": None},
     ]
 
 

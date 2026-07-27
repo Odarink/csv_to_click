@@ -43,6 +43,15 @@ _BLOCK_ESTIMATE_GROWTH_LIMIT = 16
 DEFAULT_SCHEMA_SAMPLE_ROWS = 100_000
 ENCODING_SUGGESTIONS: tuple[str, ...] = ("utf_8", "utf-8-sig", "cp1251", "windows-1251")
 MOJIBAKE_MARKERS: tuple[str, ...] = ("С‚", "Рµ", "Р°", "Рё", "Рѕ", "РЅ", "�")
+#: Текстовые маркеры пропуска. Повторяет `na_values` по умолчанию в pandas —
+#: файл читается с `keep_default_na=False`, поэтому распознаём их сами и только
+#: там, где они действительно означают пропуск (везде, кроме String).
+#: Совпадение с pandas закреплено тестом.
+NA_MARKERS: frozenset[str] = frozenset({
+    "", "#N/A", "#N/A N/A", "#NA", "-1.#IND", "-1.#QNAN", "-NaN", "-nan",
+    "1.#IND", "1.#QNAN", "<NA>", "N/A", "NA", "NULL", "NaN", "None", "n/a",
+    "nan", "null",
+})
 
 
 @dataclass(frozen=True)
@@ -63,21 +72,48 @@ class SchemaMapping:
     notes: str = ""
 
 
+#: Типы, которые pandas разбирает при чтении быстрее и без потерь. Всё
+#: остальное читается текстом: там значима исходная запись — ведущие нули в
+#: String, хвостовой ноль в `1.50` для Decimal, литералы вроде `NA`.
+NATIVELY_PARSED_TYPES: frozenset[str] = frozenset({"Int64", "UInt64", "Float64"})
+
+
+def text_columns_for(mappings: list[SchemaMapping]) -> set[str]:
+    """Колонки, которые обязаны приехать сырым текстом."""
+    return {
+        mapping.source_name
+        for mapping in mappings
+        if mapping.include and unwrap_nullable(mapping.final_type)[1] not in NATIVELY_PARSED_TYPES
+    }
+
+
 def iter_pandas_chunks(
     csv_path: str | Path,
     read_options: ReadOptions,
     usecols: list[str] | None = None,
+    text_columns: set[str] | None = None,
 ) -> Iterator[pd.DataFrame]:
+    """Читает CSV чанками так же, как его читают превью и инференс.
+
+    ``text_columns`` — какие колонки нужны сырым текстом; остальные pandas
+    разбирает сам, что и быстрее, и точнее для чисел. ``None`` означает «все
+    текстом» и используется путями инференса, которые типов ещё не знают.
+    """
     if read_options.batch_size <= 0:
         raise ValueError("batch_size must be positive")
 
     try:
+        raw_usecols = _raw_header_names(csv_path, read_options, usecols)
         reader = pd.read_csv(
             csv_path,
             sep=read_options.separator,
             encoding=read_options.encoding,
             chunksize=read_options.batch_size,
-            usecols=usecols,
+            usecols=raw_usecols,
+            # Ровно то же, что читают превью и инференс. Без этого путь загрузки
+            # видит другие данные, чем интерфейс: `007` становится числом 7,
+            # литералы NA/null/N/A - пропусками, а `1.50` в Decimal теряет ноль.
+            **_read_type_options(csv_path, read_options, raw_usecols, text_columns),
         )
         for chunk in reader:
             chunk.columns = chunk.columns.str.strip()
@@ -87,6 +123,60 @@ def iter_pandas_chunks(
             "Cannot parse CSV with "
             f"separator {read_options.separator!r} and encoding {read_options.encoding}: {exc}"
         ) from exc
+
+
+def _read_type_options(
+    csv_path: str | Path,
+    read_options: ReadOptions,
+    raw_usecols: list[str] | None,
+    text_columns: set[str] | None,
+) -> dict[str, object]:
+    """Аргументы `read_csv`, отвечающие за типы и пропуски.
+
+    `keep_default_na` — переключатель на весь файл, а смысл маркера пропуска
+    зависит от колонки: `NA` в String это значение, в числовой — пропуск.
+    Поэтому маркеры выключаются глобально и возвращаются точечно через
+    `na_values` тем колонкам, которые pandas разбирает сам.
+    """
+    if text_columns is None:
+        return {"dtype": str, "keep_default_na": False}
+
+    names = raw_usecols if raw_usecols is not None else _header_names(csv_path, read_options)
+    stripped = {name: str(name).strip() for name in names}
+    dtype = {name: str for name, clean in stripped.items() if clean in text_columns}
+    na_values = {
+        name: list(NA_MARKERS) for name, clean in stripped.items() if clean not in text_columns
+    }
+    return {"dtype": dtype, "keep_default_na": False, "na_values": na_values}
+
+
+def _header_names(csv_path: str | Path, read_options: ReadOptions) -> list[str]:
+    header = pd.read_csv(
+        csv_path,
+        sep=read_options.separator,
+        encoding=read_options.encoding,
+        nrows=0,
+    )
+    return list(header.columns)
+
+
+def _raw_header_names(
+    csv_path: str | Path,
+    read_options: ReadOptions,
+    usecols: list[str] | None,
+) -> list[str] | None:
+    """Переводит обрезанные имена колонок обратно в сырые имена заголовка.
+
+    `pd.read_csv` сопоставляет `usecols` с СЫРЫМ заголовком, а `.str.strip()`
+    выполняется строкой позже. Поэтому заголовок вида `id, code ,amt`, обычный
+    для выгрузок из Excel, ронял и загрузку, и preflight с
+    `ValueError: Usecols do not match columns`, называя колонку, которую
+    интерфейс показывает без пробелов.
+    """
+    if usecols is None:
+        return None
+    raw_by_stripped = {str(name).strip(): name for name in _header_names(csv_path, read_options)}
+    return [raw_by_stripped.get(name, name) for name in usecols]
 
 
 def preview_csv_rows(
@@ -399,7 +489,10 @@ def validate_csv_with_pandas_chunks(
 ) -> int:
     rows_count = 0
     usecols = [mapping.source_name for mapping in mappings if mapping.include]
-    for chunk_number, chunk in enumerate(iter_pandas_chunks(csv_path, read_options, usecols), start=1):
+    text_columns = text_columns_for(mappings)
+    for chunk_number, chunk in enumerate(
+        iter_pandas_chunks(csv_path, read_options, usecols, text_columns), start=1
+    ):
         converted = convert_chunk_to_schema(chunk, mappings, chunk_number)
         for _payload, _payload_rows in iter_json_each_row_payloads(
             converted,
@@ -423,7 +516,10 @@ def validate_csv_sample_with_pandas_chunks(
 
     rows_count = 0
     usecols = [mapping.source_name for mapping in mappings if mapping.include]
-    for chunk_number, chunk in enumerate(iter_pandas_chunks(csv_path, read_options, usecols), start=1):
+    text_columns = text_columns_for(mappings)
+    for chunk_number, chunk in enumerate(
+        iter_pandas_chunks(csv_path, read_options, usecols, text_columns), start=1
+    ):
         remaining_rows = sample_rows - rows_count
         if remaining_rows <= 0:
             break
@@ -578,7 +674,9 @@ def load_csv_via_raw_insert(
         )
 
     usecols = [mapping.source_name for mapping in mappings if mapping.include]
-    chunks = _iter_timed(iter_pandas_chunks(csv_path, read_options, usecols))
+    chunks = _iter_timed(
+        iter_pandas_chunks(csv_path, read_options, usecols, text_columns_for(mappings))
+    )
     for chunk_number, (chunk, read_s) in enumerate(chunks, start=1):
         stats.read_s += read_s
         convert_started = time.perf_counter()
@@ -731,7 +829,9 @@ def _load_csv_via_raw_insert_parallel(
     pending: set[Future] = set()
     with ThreadPoolExecutor(max_workers=worker_count) as executor:
         try:
-            chunks = _iter_timed(iter_pandas_chunks(csv_path, read_options, usecols))
+            chunks = _iter_timed(
+        iter_pandas_chunks(csv_path, read_options, usecols, text_columns_for(mappings))
+    )
             for chunk_number, (chunk, read_s) in enumerate(chunks, start=1):
                 stats.read_s += read_s
                 convert_started = time.perf_counter()
@@ -851,19 +951,61 @@ def _raw_insert_error(
     )
 
 
+def _missing_mask(series: pd.Series, na_markers: bool) -> pd.Series:
+    """Где значения нет.
+
+    С `keep_default_na=False` пустая ячейка приезжает пустой строкой, а не NaN,
+    поэтому одной `isna()` больше не хватает. Пустая строка и отсутствие
+    значения в CSV неразличимы: `,,` и `,"",` читаются одинаково.
+
+    ``na_markers`` включает распознавание текстовых маркеров вроде ``NA`` и
+    ``null``. Смысл маркера зависит от типа колонки: в String это значение, в
+    числовой или временной - отсутствие значения. Флаг `keep_default_na`
+    действует на весь файл и такого различия сделать не может.
+    """
+    if not (pd.api.types.is_object_dtype(series) or pd.api.types.is_string_dtype(series)):
+        # Числовую колонку pandas разобрал сам, текстовых маркеров в ней уже
+        # нет, а astype("object") боксил бы каждое значение в Python-объект.
+        return series.isna()
+    values = series.astype("object")
+    missing = series.isna() | values.eq("")
+    if na_markers:
+        missing = missing | values.isin(NA_MARKERS)
+    return missing
+
+
 def _convert_series(series: pd.Series, clickhouse_type: str) -> pd.Series:
     nullable, inner_type = unwrap_nullable(clickhouse_type)
+    # В String-колонке `NA` и `null` - обычный текст, ради чего фаза 3b и
+    # делалась; во всех остальных типах это по-прежнему пропуск.
+    missing = _missing_mask(series, na_markers=inner_type != "String")
     if inner_type == "String":
-        return series.map(lambda value: None if pd.isna(value) and nullable else str(value))
+        # Для Nullable пустая ячейка это NULL, для обычного String - пустая
+        # строка. Раньше сюда доезжал NaN, и не-nullable колонка получала текст
+        # "nan" - значение, которого в файле не было.
+        filler = None if nullable else ""
+        values = series.astype("object")
+        if not pd.api.types.is_string_dtype(series):
+            # Обычный путь сюда не попадает: String-колонки читаются текстом.
+            # Ветка нужна для кадров, собранных в коде, а не прочитанных из CSV.
+            values = values.map(lambda value: value if value is None else str(value))
+        return values.mask(missing, filler)
+    # Остальным типам пустая ячейка это отсутствие значения; ниже её ждут как NaN.
+    series = series.astype("object").mask(missing, None)
     if inner_type in {"Int64", "UInt64"}:
         converted = pd.to_numeric(series, errors="raise")
         if not nullable and converted.isna().any():
             raise CsvSchemaError("empty value is not allowed for non-nullable integer")
-        return pd.Series(
-            [None if pd.isna(value) else int(value) for value in converted.tolist()],
-            index=series.index,
-            dtype="object",
-        )
+        # Целочисленный dtype с поддержкой пропусков: to_json печатает из него
+        # и целые, и null сам, без построчного боксинга в Python int.
+        try:
+            return converted.astype("UInt64" if inner_type == "UInt64" else "Int64")
+        except (TypeError, ValueError) as exc:
+            # Раньше здесь стоял int(value), который молча ОБРЕЗАЛ дробную
+            # часть: 1.7 в Int64-колонке уезжало единицей.
+            raise CsvSchemaError(
+                f"value is not a whole number and cannot be stored as {inner_type}: {exc}"
+            ) from exc
     if inner_type == "Float64":
         converted = pd.to_numeric(series, errors="raise")
         if not nullable and converted.isna().any():
@@ -876,11 +1018,9 @@ def _convert_series(series: pd.Series, clickhouse_type: str) -> pd.Series:
                 "value does not fit into Float64 and became infinity; "
                 "use String or Decimal for this column"
             )
-        return pd.Series(
-            [None if pd.isna(value) else float(value) for value in converted.tolist()],
-            index=series.index,
-            dtype="object",
-        )
+        # Float-dtype с поддержкой пропусков: to_json печатает из него и числа,
+        # и null сам, без построчного боксинга.
+        return converted.astype("Float64")
     if inner_type.startswith("Decimal("):
         # Decimal остаётся Decimal: to_json кодирует его как строку "1.50", то
         # есть ровно так же, как это делал построчный путь через str().
