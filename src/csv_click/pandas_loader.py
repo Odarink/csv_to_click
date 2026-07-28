@@ -566,6 +566,20 @@ COMPRESSION_CODECS: tuple[str, ...] = ("zstd", "lz4", "gzip")
 COMPRESSION_OFF = "off"
 
 
+def wire_codec(compression: str | None) -> str | None:
+    """Что отдать драйверу как кодек: настоящий кодек либо `None`.
+
+    Драйвер ставит `Content-Encoding` из ЛЮБОЙ непустой строки
+    (`httpclient.py:417-418`), поэтому `off` обязан превратиться в `None`
+    ЗДЕСЬ, а не «пониматься» дальше по пути. Прогон 2026-07-27 23:54 упал на
+    первом же блоке с ответом прокси `unsupported compression method off`:
+    выключатель уехал в заголовок как имя кодека.
+    """
+    if not compression or compression == COMPRESSION_OFF:
+        return None
+    return compression
+
+
 def compress_payload(payload: bytes, codec: str | None) -> bytes:
     """Сжимает тело блока перед отправкой. `None`/`off` — вернуть как есть.
 
@@ -920,6 +934,9 @@ def load_csv_via_raw_insert(
         raise ValueError("worker_count must be positive")
     if stats is None:
         stats = LoadStats()
+    # Ниже по пути ходит только настоящий кодек либо None: `off` в заголовке
+    # роняет загрузку на первом блоке ответом прокси.
+    compression = wire_codec(compression)
     # Нужен самой статистике: при worker_count > 1 запросы идут одновременно, и
     # сумма серверных времён перестаёт быть долей стенных часов.
     stats.worker_count = worker_count
@@ -1265,6 +1282,15 @@ def _raw_insert_error(
         hint = (
             " The insert request exceeded the ClickHouse HTTP/proxy read limit. "
             "Reduce Max insert payload, MB or Batch size and retry."
+        )
+    elif "unsupported compression method" in message.lower():
+        # Так ответил контур на `Content-Encoding: zstd` 2026-07-27 23:53.
+        # Отвергает не ClickHouse, а то, что стоит перед ним, поэтому список
+        # поддерживаемых кодеков угадать нельзя — его можно только перебрать.
+        hint = (
+            " The path in front of ClickHouse refused this Content-Encoding. "
+            "Try another Insert compression codec or set it to off; the load fails "
+            "on the first block, so each attempt costs seconds."
         )
     payload_mb = payload_bytes / 1024 / 1024
     return CsvLoadError(
