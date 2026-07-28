@@ -1,5 +1,6 @@
 from pathlib import Path
 
+import pandas as pd
 import pytest
 
 from csv_click.schema import (
@@ -151,6 +152,205 @@ def test_numeric_inference_refuses_types_that_would_eat_a_leading_zero_or_plus(
     schema = analyze_csv_schema(csv_path)
 
     assert schema.columns[0].final_type == want_type
+
+
+@pytest.mark.parametrize(
+    ("value", "want_type"),
+    [
+        # Эти написания стоят в `NA_MARKERS` загрузчика, то есть путь загрузки
+        # читает их пропуском: колонка обязана быть Nullable, иначе загрузка
+        # падает на первом блоке.
+        ("nan", "Nullable(Decimal(18, 2))"),
+        ("NaN", "Nullable(Decimal(18, 2))"),
+        ("-nan", "Nullable(Decimal(18, 2))"),
+        ("-NaN", "Nullable(Decimal(18, 2))"),
+        # А эти `float` читает, но в списке маркеров их НЕТ. Пропуском загрузчик
+        # их не считает, а `to_json` напечатал бы `null` - деньги молча пропали
+        # бы. Такая колонка обязана остаться текстом.
+        ("NAN", "String"),
+        ("Nan", "String"),
+        ("nAn", "String"),
+        ("+nan", "String"),
+        # Бесконечность - не пропуск и не число, которое можно отправить:
+        # загрузчик отвергает её сам и советует String.
+        ("inf", "String"),
+        ("-inf", "String"),
+        ("Infinity", "String"),
+        # Этот литерал читает только `Decimal`, и в ClickHouse его не отправить.
+        ("sNaN", "String"),
+    ],
+)
+def test_float_literals_get_a_type_the_load_path_accepts(
+    tmp_path: Path, value: str, want_type: str
+) -> None:
+    """`Decimal()` принимает эти литералы, а показатель степени у них не число.
+
+    Оператору такой файл возвращал `TypeError` про str и int из внутренностей
+    инференса, то есть анализ не проходил вообще. `nan` в CSV - обычное дело:
+    так пропуски пишет сам pandas. Тип обязан не только выбраться, но и пройти
+    строгую проверку - иначе анализ отработал, а загрузка падает.
+    """
+    from csv_click.pandas_loader import (
+        ReadOptions,
+        schema_to_mappings,
+        validate_csv_with_pandas_chunks,
+    )
+
+    csv_path = write_csv(tmp_path / "floats.csv", f"amount\n1.5\n{value}\n")
+
+    schema = analyze_csv_schema(csv_path)
+
+    assert schema.columns[0].final_type == want_type
+    validate_csv_with_pandas_chunks(
+        csv_path, ReadOptions(batch_size=10), schema_to_mappings(schema)
+    )
+
+
+@pytest.mark.parametrize(
+    ("value", "want_type"),
+    [
+        # Обычные деньги: тип не меняется.
+        ("1500.50", "Decimal(18, 2)"),
+        # Ровно 18 значащих цифр - предел Decimal(18, 2).
+        ("1234567890123456.78", "Decimal(18, 2)"),
+        # 19 значащих: в Decimal(18, 2) уже не влезает.
+        ("12345678901234567.89", "Decimal(38, 2)"),
+        ("12345678901234567890.12", "Decimal(38, 2)"),
+        # 42 значащих: нужен Decimal256.
+        ("1" * 40 + ".25", "Decimal(76, 2)"),
+        # Больше 76 значащих не вмещает ни один Decimal.
+        ("1" * 80 + ".25", "String"),
+        # Тот же счёт для дробных: 28 + 10 влезает в 38, 30 + 10 уже нет.
+        ("1234567890123456789012345678.1234567890", "Decimal(38, 10)"),
+        ("123456789012345678901234567890.1234567890", "Decimal(76, 10)"),
+        # Ширина не СУЖАЕТСЯ: в режиме `Fast sample` за выборкой останутся
+        # значения крупнее, и запас, который был до правки, обязан сохраниться.
+        ("0.1234567890", "Decimal(38, 10)"),
+        ("0.25", "Decimal(18, 2)"),
+        # Ноль в экспоненциальной записи - это ноль, а не 31 цифра. `adjusted()`
+        # у нулевой мантиссы возвращает показатель степени, и одна такая ячейка
+        # уводила денежную колонку в String.
+        ("0E+30", "Decimal(18, 2)"),
+        ("-0E+20", "Decimal(18, 2)"),
+        ("0E+79", "Decimal(18, 2)"),
+    ],
+)
+def test_decimal_precision_is_wide_enough_for_the_value(
+    tmp_path: Path, value: str, want_type: str
+) -> None:
+    """Точность обязана вмещать цифры, а не только знаки после запятой.
+
+    Инференс считал один scale, поэтому значению с 20 целыми цифрами доставался
+    `Decimal(18, 2)`, где целых всего 16.
+    """
+    csv_path = write_csv(tmp_path / "amounts.csv", f"amount\n{value}\n")
+
+    schema = analyze_csv_schema(csv_path)
+
+    assert schema.columns[0].final_type == want_type
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "1500.50",
+        "12345678901234567.89",
+        "1" * 40 + ".25",
+        "0.1234567890",
+        "1234567890123456789012345678.1234567890",
+        "123456789012345678901234567890.1234567890",
+    ],
+)
+def test_inferred_type_is_offered_by_the_type_editor(tmp_path: Path, value: str) -> None:
+    """Тип, который выбрал инференс, обязан быть в списке редактора.
+
+    Редактор рисует `final_type` как `SelectboxColumn` с фиксированными
+    опциями. Тип вне списка сервер сохраняет, но оператор, тронув ячейку, не
+    сможет вернуть его - выбирать будет не из чего.
+    """
+    csv_path = write_csv(tmp_path / "amounts.csv", f"amount\n{value}\n")
+
+    schema = analyze_csv_schema(csv_path)
+
+    assert schema.columns[0].final_type in CLICKHOUSE_TYPE_OPTIONS
+
+
+def test_nullable_variant_is_offered_for_every_plain_option() -> None:
+    plain = [option for option in CLICKHOUSE_TYPE_OPTIONS if not option.startswith("Nullable(")]
+
+    missing = [name for name in plain if f"Nullable({name})" not in CLICKHOUSE_TYPE_OPTIONS]
+
+    assert not missing
+
+
+def test_value_too_wide_for_any_decimal_says_why_in_notes(tmp_path: Path) -> None:
+    csv_path = write_csv(tmp_path / "huge.csv", "amount\n" + "1" * 80 + ".25\n")
+
+    schema = analyze_csv_schema(csv_path)
+
+    notes = schema.columns[0].notes.lower()
+    assert "digits" in notes, notes
+
+
+@pytest.mark.parametrize("value", ["NAN", "Nan", "nAn", "+nan", "inf", "Infinity"])
+def test_unlisted_nan_and_infinity_reach_the_wire_as_text(tmp_path: Path, value: str) -> None:
+    """Написание, которого нет в маркерах пропуска, обязано доехать значением.
+
+    Иначе `to_json` печатает `null`: строгая проверка проходит, прогон
+    отчитывается успехом, а сумма исчезает. Это худший исход из возможных, и
+    именно он получался, пока инференс считал такие ячейки пропуском.
+    """
+    from csv_click.pandas_loader import (
+        ReadOptions,
+        chunk_to_json_lines,
+        convert_chunk_to_schema,
+        schema_to_mappings,
+        validate_csv_with_pandas_chunks,
+    )
+
+    csv_path = write_csv(tmp_path / "amounts.csv", f"amount\n1500.50\n{value}\n")
+    schema = analyze_csv_schema(csv_path)
+    mappings = schema_to_mappings(schema)
+
+    validate_csv_with_pandas_chunks(csv_path, ReadOptions(batch_size=10), mappings)
+
+    chunk = pd.DataFrame({"amount": ["1500.50", value]}, dtype="object")
+    payload = chunk_to_json_lines(convert_chunk_to_schema(chunk, mappings, 1), ["amount"]).decode()
+    assert "null" not in payload, payload
+    assert value in payload, payload
+
+
+def test_column_of_only_missing_markers_does_not_claim_to_be_empty(tmp_path: Path) -> None:
+    """`nan` - маркер пропуска, но для String-колонки это текст, и он доедет.
+
+    Пометка про пустую колонку рядом с образцом `nan` посылает оператора искать
+    не ту причину, а Nullable у колонки без пропусков - неправда о данных.
+    """
+    csv_path = write_csv(tmp_path / "markers.csv", "note\nnan\nnan\n")
+
+    schema = analyze_csv_schema(csv_path)
+    column = schema.columns[0]
+
+    assert column.final_type == "String"
+    assert "empty" not in column.notes.lower(), column.notes
+
+
+def test_missing_marker_beside_text_keeps_the_column_not_nullable(tmp_path: Path) -> None:
+    csv_path = write_csv(tmp_path / "mixed.csv", "note\nnan\nAcme\n")
+
+    schema = analyze_csv_schema(csv_path)
+
+    assert schema.columns[0].final_type == "String"
+
+
+def test_one_zero_cell_does_not_widen_the_column(tmp_path: Path) -> None:
+    """Ноль рядом с обычными суммами не должен ни расширять тип, ни врать в пометке."""
+    csv_path = write_csv(tmp_path / "amounts.csv", "amount\n1500.50\n0E+79\n99.99\n")
+
+    schema = analyze_csv_schema(csv_path)
+
+    assert schema.columns[0].final_type == "Decimal(18, 2)"
+    assert schema.columns[0].notes == ""
 
 
 def test_leading_zero_column_says_in_notes_why_it_stayed_string(tmp_path: Path) -> None:

@@ -11,13 +11,36 @@ from typing import Iterable
 from csv_click.errors import CsvSchemaError
 
 
+#: Текстовые маркеры пропуска. Повторяет `na_values` по умолчанию в pandas —
+#: файл читается с `keep_default_na=False`, поэтому распознаём их сами и только
+#: там, где они действительно означают пропуск (везде, кроме String).
+#: Совпадение с pandas закреплено тестом.
+#:
+#: Инференс обязан спрашивать этот же список, а не «похоже ли значение на nan»:
+#: `float()` читает 24 написания nan, а загрузчик пропуском считает четыре из
+#: них. На разошедшемся написании инференс выбирал Nullable-число, загрузчик
+#: отправлял `null`, и сумма исчезала при зелёной проверке.
+NA_MARKERS: frozenset[str] = frozenset({
+    "", "#N/A", "#N/A N/A", "#NA", "-1.#IND", "-1.#QNAN", "-NaN", "-nan",
+    "1.#IND", "1.#QNAN", "<NA>", "N/A", "NA", "NULL", "NaN", "None", "n/a",
+    "nan", "null",
+})
+
+#: Список редактора типов. Всё, что умеет выбрать инференс, обязано быть здесь:
+#: `final_type` рисуется как `SelectboxColumn`, и тип вне списка сервер сохранит,
+#: но оператор, тронув ячейку, вернуть его уже не сможет - выбирать не из чего.
+#: Широкие `Decimal` появились здесь потому, что точность теперь считается по
+#: цифрам значения (см. `_decimal_type`).
 CLICKHOUSE_TYPE_OPTIONS = [
     "String",
     "Int64",
     "UInt64",
     "Float64",
     "Decimal(18, 2)",
+    "Decimal(38, 2)",
+    "Decimal(76, 2)",
     "Decimal(38, 10)",
+    "Decimal(76, 10)",
     "Date",
     "DateTime",
     "Bool",
@@ -26,7 +49,10 @@ CLICKHOUSE_TYPE_OPTIONS = [
     "Nullable(UInt64)",
     "Nullable(Float64)",
     "Nullable(Decimal(18, 2))",
+    "Nullable(Decimal(38, 2))",
+    "Nullable(Decimal(76, 2))",
     "Nullable(Decimal(38, 10))",
+    "Nullable(Decimal(76, 10))",
     "Nullable(Date)",
     "Nullable(DateTime)",
     "Nullable(Bool)",
@@ -121,7 +147,16 @@ class _ColumnStats:
     all_date: bool = True
     all_datetime: bool = True
     has_lossy_numeric_text: bool = False
+    #: Встретился маркер пропуска из `NA_MARKERS`. Пропуск для любого типа, кроме
+    #: String, где это текст, — поэтому решение о Nullable отложено.
+    has_na_marker: bool = False
+    #: Встретилось nan или бесконечность в написании, которого нет в `NA_MARKERS`.
+    #: Ни пропуск, ни отправляемое число: `to_json` записал бы `null` молча.
+    has_unsendable_float: bool = False
     max_decimal_scale: int = 0
+    #: Цифр в целой части самого длинного значения. Вместе со scale даёт
+    #: precision: без него `Decimal(18, 2)` доставался числу с 20 целыми цифрами.
+    max_decimal_int_digits: int = 0
     sample_values: list[str] | None = None
 
     def add_value(self, value: str) -> None:
@@ -133,8 +168,22 @@ class _ColumnStats:
         if raw == "":
             self.has_empty = True
             return
+        if raw in NA_MARKERS:
+            # Путь загрузки читает эти написания пропуском во всём, кроме String,
+            # где они остаются текстом. Значит и тип, и nullable зависят от того,
+            # чем колонка окажется, — решение отложено в `_needs_nullable`.
+            self.has_na_marker = True
+            return
 
+        float_kind = _float_kind(raw)
         self.total_non_empty += 1
+        # `float()` читает 24 написания nan против четырёх в `NA_MARKERS`. То, что
+        # в список не попало, загрузчик пропуском не считает, а `to_json`
+        # напечатал бы `null`: сумма исчезла бы при зелёной проверке.
+        self.has_unsendable_float = self.has_unsendable_float or float_kind in {
+            "nan",
+            "infinity",
+        }
         self.all_bool = self.all_bool and _is_bool(raw)
         self.has_explicit_bool_literal = self.has_explicit_bool_literal or raw.lower() in {
             "true",
@@ -146,9 +195,9 @@ class _ColumnStats:
         }
         self.all_int = self.all_int and _is_int(raw)
         self.all_uint = self.all_uint and _is_uint(raw)
-        decimal_scale = _decimal_scale(raw)
-        self.all_decimal = self.all_decimal and decimal_scale is not None
-        self.all_float = self.all_float and _is_float(raw)
+        decimal_shape = _decimal_shape(raw)
+        self.all_decimal = self.all_decimal and decimal_shape is not None
+        self.all_float = self.all_float and float_kind is not None
         self.all_date = self.all_date and _is_date(raw)
         self.all_datetime = self.all_datetime and _is_datetime(raw)
         if not self.has_lossy_numeric_text and (
@@ -158,8 +207,10 @@ class _ColumnStats:
             # обратно в True не возвращаются, так что после их сброса считать
             # нечего: на текстовой колонке это снимает вызов с каждого значения.
             self.has_lossy_numeric_text = _loses_text_as_number(raw)
-        if decimal_scale is not None:
+        if decimal_shape is not None:
+            int_digits, decimal_scale = decimal_shape
             self.max_decimal_scale = max(self.max_decimal_scale, decimal_scale)
+            self.max_decimal_int_digits = max(self.max_decimal_int_digits, int_digits)
 
 
 def normalize_identifier(value: str) -> str:
@@ -196,14 +247,15 @@ def analyze_csv_schema(csv_path: str | Path, delimiter: str | None = None) -> Cs
     columns: list[CsvColumn] = []
     for source_name, column_name in zip(reader.fieldnames, normalized_names, strict=True):
         inferred_type, notes = _infer_type(stats[source_name])
-        final_type = _with_nullable(inferred_type, stats[source_name].has_empty)
+        nullable = _needs_nullable(stats[source_name], inferred_type)
+        final_type = _with_nullable(inferred_type, nullable)
         columns.append(
             CsvColumn(
                 column_name=column_name,
                 source_name=source_name,
                 inferred_type=inferred_type,
                 final_type=final_type,
-                nullable=stats[source_name].has_empty,
+                nullable=nullable,
                 sample_values=stats[source_name].sample_values or [],
                 notes=notes,
             )
@@ -258,7 +310,7 @@ def convert_value(value: str, clickhouse_type: str) -> object:
             raise CsvSchemaError("expected UInt64")
         return int(raw)
     if inner_type == "Float64":
-        if not _is_float(raw):
+        if _float_kind(raw) is None:
             raise CsvSchemaError("expected Float64")
         return float(raw)
     if inner_type.startswith("Decimal("):
@@ -333,9 +385,20 @@ def schema_to_editor_rows(schema: CsvSchema) -> list[dict[str, object]]:
 
 def _infer_type(stats: _ColumnStats) -> tuple[str, str]:
     if stats.total_non_empty == 0:
+        if stats.has_na_marker:
+            # Колонка не пуста: маркеры пропуска в String-колонке доедут текстом,
+            # и пометка про пустоту послала бы оператора искать не ту причину.
+            return "String", "Only missing-value markers; fallback to String"
         return "String", "All values are empty; fallback to String"
     if stats.all_bool and stats.has_explicit_bool_literal:
         return "Bool", ""
+    if stats.has_unsendable_float:
+        # Ни пропуск, ни отправляемое число. Числовым типом такое значение
+        # уехало бы как `null` при зелёной проверке, поэтому колонка - текст.
+        return "String", (
+            "Infinity or a nan spelling outside the missing-value markers cannot "
+            "be sent as a number; fallback to String"
+        )
     if stats.has_lossy_numeric_text and (
         stats.all_uint or stats.all_int or stats.all_decimal or stats.all_float
     ):
@@ -348,9 +411,9 @@ def _infer_type(stats: _ColumnStats) -> tuple[str, str]:
         return "Int64", ""
     if stats.all_decimal:
         if stats.max_decimal_scale <= 2:
-            return "Decimal(18, 2)", ""
+            return _decimal_type(stats, scale=2, widths=(18, 38, 76))
         if stats.max_decimal_scale <= 10:
-            return "Decimal(38, 10)", ""
+            return _decimal_type(stats, scale=10, widths=(38, 76))
         return "Float64", "Decimal scale is too high; fallback to Float64"
     if stats.all_date:
         return "Date", ""
@@ -359,6 +422,48 @@ def _infer_type(stats: _ColumnStats) -> tuple[str, str]:
     if stats.all_float:
         return "Float64", ""
     return "String", "Mixed or unsupported values; fallback to String"
+
+
+def _decimal_type(stats: _ColumnStats, scale: int, widths: tuple[int, ...]) -> tuple[str, str]:
+    """Первая из `widths`, вмещающая и цифры, и знаки после запятой.
+
+    Точность - это ВСЕ значащие цифры, а не только дробные: в `Decimal(18, 2)`
+    целых остаётся 16, поэтому сумме с 20 цифрами до запятой он не годится.
+    Ширины - это Decimal64/128/256 ClickHouse; шире 76 цифр не бывает, и такая
+    колонка уходит в `String`, а не во `Float64`: `Float64` округлит молча, а
+    для этого проекта тихая порча дороже неудобного типа.
+
+    Ширина только РАСТЁТ, и первая в `widths` - та, что выбиралась раньше.
+    Сужать по инференсу нельзя: в режиме `Fast sample` он видит сто тысяч строк,
+    а в остатке файла найдётся значение шире, и оно упрётся в тип, которого до
+    этой правки хватало.
+    """
+    precision_needed = stats.max_decimal_int_digits + scale
+    for precision in widths:
+        if precision_needed <= precision:
+            note = (
+                ""
+                if precision == widths[0]
+                else f"Widened to Decimal({precision}, {scale}): {precision_needed} digits are needed"
+            )
+            return f"Decimal({precision}, {scale})", note
+    return "String", (
+        f"{precision_needed} digits exceed the 76 a ClickHouse Decimal holds; "
+        "fallback to String to keep the value exact"
+    )
+
+
+def _needs_nullable(stats: _ColumnStats, inferred_type: str) -> bool:
+    """Появятся ли в колонке пропуски после чтения тем же путём, что у загрузчика.
+
+    Пустая ячейка - пропуск всегда. Маркер вроде `NA` или `nan` - пропуск во всём,
+    кроме `String`: там загрузчик оставляет его текстом (`_missing_mask` зовётся с
+    `na_markers=inner_type != "String"`), и `Nullable` обещал бы пропуски, которых
+    в таблице не будет.
+    """
+    if stats.has_empty:
+        return True
+    return stats.has_na_marker and inferred_type != "String"
 
 
 def _with_nullable(clickhouse_type: str, nullable: bool) -> str:
@@ -425,21 +530,52 @@ def _loses_text_as_number(value: str) -> bool:
     return len(digits) > 1 and digits[0] == "0" and digits[1].isdigit()
 
 
-def _decimal_scale(value: str) -> int | None:
+def _decimal_shape(value: str) -> tuple[int, int] | None:
+    """``(цифр в целой части, знаков после запятой)`` или ``None`` - не Decimal.
+
+    Обе величины из ОДНОГО разбора: инференс зовёт эту функцию на каждое
+    значение файла, и второй `Decimal()` стоил бы ровно столько же, сколько
+    первый. Целая часть считается по `adjusted()`, поэтому `1E+30` даёт 31
+    цифру, а не 1: тип обязан вмещать записанное число, а не его запись.
+
+    `Decimal()` принимает `nan`, `inf` и `snan`, и показатель степени у них не
+    число, а буква: `'n'`, `'F'`, `'N'`. Сравнение с нулём роняло инференс
+    `TypeError`, то есть файл не анализировался вовсе. Такие литералы - не
+    Decimal (ClickHouse их в Decimal не примет), и колонка уходит во Float64.
+    """
     try:
         parsed = Decimal(value)
     except InvalidOperation:
         return None
     exponent = parsed.as_tuple().exponent
-    return abs(exponent) if exponent < 0 else 0
+    if not isinstance(exponent, int):
+        return None
+    scale = abs(exponent) if exponent < 0 else 0
+    if not parsed:
+        # У нулевой мантиссы `adjusted()` возвращает показатель степени, поэтому
+        # `0E+30` отчитывался о 31 цифре: одна такая ячейка расширяла тип целой
+        # колонки, а `0E+79` уводил её в String. Ноль не занимает разрядов, и
+        # такую запись даёт обычное вычитание равных Decimal.
+        return 0, scale
+    return max(parsed.adjusted() + 1, 0), scale
 
 
-def _is_float(value: str) -> bool:
+def _float_kind(value: str) -> str | None:
+    """``"finite"``, ``"nan"``, ``"infinity"`` или ``None``, если это не float.
+
+    Одним разбором отвечает на три разных вопроса: годится ли значение во
+    Float64, надо ли считать его пропуском и не бесконечность ли это. Раньше
+    здесь был `_is_float`, который на все три отвечал «да».
+    """
     try:
-        float(value)
+        parsed = float(value)
     except ValueError:
-        return False
-    return True
+        return None
+    if parsed != parsed:
+        return "nan"
+    if parsed in {float("inf"), float("-inf")}:
+        return "infinity"
+    return "finite"
 
 
 def _is_date(value: str) -> bool:
