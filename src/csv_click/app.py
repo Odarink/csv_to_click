@@ -77,6 +77,13 @@ CSV_READ_STATE_KEYS = [
     "csv_preview_rows",
     "csv_preview_warning",
 ]
+#: Слоты выбора ключей: живут в пределах одного прочитанного CSV. Выбор оператора
+#: обязан переживать перерисовки, но НЕ переезжать на другой файл: у чужого файла
+#: колонка с тем же именем - другие данные, а ключ выглядел бы выбранным.
+CHOICE_STATE_KEYS = [
+    "order_by_choice",
+    "sharding_column_choice",
+]
 LARGE_CSV_PRECHECK_THRESHOLD_BYTES = 50 * 1024 * 1024
 SAMPLE_PRECHECK_ROWS = 200_000
 INSERT_PAYLOAD_SAFETY_RATIO = 0.9
@@ -290,6 +297,68 @@ Preview DDL только показывает SQL и ничего не созд�
     )
 
 
+def _choice_widget_key(state_key: str) -> str:
+    return f"{state_key}_widget"
+
+
+def _remember_choice(state_key: str) -> None:
+    """Запомнить выбор ОПЕРАТОРА. Вызывается Streamlit только при его действии."""
+    st.session_state[state_key] = st.session_state[_choice_widget_key(state_key)]
+
+
+def _remembered_selectbox(label: str, options: list[str], state_key: str) -> str | None:
+    """Selectbox, переживающий пропуск отрисовки и смену списка колонок.
+
+    Streamlit хранит состояние виджета, только пока тот рисуется на каждом
+    прогоне: стоит форме пропасть на один rerun - выбор молча съезжает на первую
+    колонку, и таблица создаётся не с тем ключом. Свой слот в session_state
+    живёт независимо от виджета и переживает пропуск.
+
+    Три обязательства, каждое куплено дефектом:
+
+    - `index=` НЕ передаётся. В Streamlit 1.58 index входит в тождество виджета,
+      поэтому восстановление через index ломало второй выбор подряд: оператор
+      исправлял ошибочный ключ, клик уходил в старое тождество и молча пропадал.
+      Значение восстанавливается предустановкой ключа виджета, а `key=` держит
+      тождество постоянным.
+    - Слот пишется ТОЛЬКО из `on_change`, то есть по действию оператора. Иначе
+      нетронутый дефолт запоминался как выбор и позже всплывал сообщением
+      "Previously selected" про то, чего оператор не выбирал.
+    - Колонка ушла из списка - выбор аннулируется здесь же, слот удаляется, и
+      предупреждение звучит один раз, в тот прогон, когда это случилось. Держать
+      пропавший выбор в слоте было нельзя: `on_change` срабатывает только на
+      ИЗМЕНЕНИЕ значения (`_widget_changed` в session_state.py), поэтому выбрать
+      объявленную замену оператор не мог - слот оставался прежним, предупреждение
+      висело неснимаемо, а возврат колонки молча уводил ключ от того, что
+      оператор видел последним. Цена решения: вернувшаяся колонка выбор не
+      воскрешает, и это честнее - её исключил сам оператор, предупреждённый.
+
+    Замену в ключ виджета не пишем: Streamlit сам гасит значение вне options.
+    И что оператору объявлена ровно та колонка, которая уедет в DDL, и что гашение
+    вообще случилось, держит один тест - test_dropped_order_by_selection_warns_and_falls_back:
+    он сверяет текст предупреждения с `load_params` на том прогоне, где оно звучит.
+    """
+    widget_key = _choice_widget_key(state_key)
+    stored = st.session_state.get(state_key)
+    if stored is not None and stored not in options:
+        if options:
+            st.warning(
+                f'Previously selected {label} "{stored}" is no longer among the '
+                f'columns; falling back to "{options[0]}".'
+            )
+        st.session_state.pop(state_key, None)
+        stored = None
+    if stored is not None:
+        st.session_state[widget_key] = stored
+    return st.selectbox(
+        label,
+        options=options,
+        key=widget_key,
+        on_change=_remember_choice,
+        args=(state_key,),
+    )
+
+
 def _render_connection_and_load_form(schema: CsvSchema) -> dict[str, object] | None:
     settings = _get_app_settings()
     target_names = _schema_target_names(schema)
@@ -300,9 +369,11 @@ def _render_connection_and_load_form(schema: CsvSchema) -> dict[str, object] | N
         database = st.text_input("Database", value=settings.database)
         distributed_table = st.text_input("Distributed table name")
         cluster = st.text_input("Cluster", value=settings.cluster)
-        order_by = st.selectbox("ORDER BY", options=target_names)
+        order_by = _remembered_selectbox("ORDER BY", target_names, "order_by_choice")
         partition_by = st.text_input("PARTITION BY (optional)")
-        sharding_column = st.selectbox("Distributed sharding key", options=target_names)
+        sharding_column = _remembered_selectbox(
+            "Distributed sharding key", target_names, "sharding_column_choice"
+        )
         batch_size = st.number_input(
             "Batch size",
             min_value=1,
@@ -624,6 +695,9 @@ def _clear_csv_read_state(include_path: bool = True) -> None:
         if key == "csv_path" and not include_path:
             continue
         st.session_state.pop(key, None)
+    for key in CHOICE_STATE_KEYS:
+        st.session_state.pop(key, None)
+        st.session_state.pop(_choice_widget_key(key), None)
 
 
 def _request_stop_csv_read() -> None:
