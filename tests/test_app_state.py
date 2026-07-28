@@ -135,10 +135,10 @@ def test_connection_form_uses_persisted_settings_and_no_table_specific_defaults(
     assert "load_app_settings" in source
     assert "save_app_settings" in source
     assert 'st.text_input("ORDER BY")' not in form_source
-    assert 'st.selectbox("ORDER BY"' in form_source
+    assert '_remembered_selectbox("ORDER BY"' in form_source
     assert '"Distributed sharding key"' in form_source
     assert 'st.text_input("Distributed sharding key"' not in form_source
-    assert 'st.selectbox("Distributed sharding key"' in form_source
+    assert '"Distributed sharding key", target_names' in form_source
     assert 'st.text_input("PARTITION BY (optional)")' in form_source
     assert 'value="rand()"' not in form_source
     assert 'value="sipHash64(ID)"' not in form_source
@@ -157,7 +157,8 @@ def test_connection_form_uses_schema_target_columns_for_sorting_and_sharding() -
     assert match is not None
     form_source = match.group(0)
     assert "_schema_target_names(schema)" in form_source
-    assert "options=target_names" in form_source
+    assert '_remembered_selectbox("ORDER BY", target_names, "order_by_choice")' in form_source
+    assert '"Distributed sharding key", target_names, "sharding_column_choice"' in form_source
     assert '"sharding_key": sharding_column' in form_source
 
 
