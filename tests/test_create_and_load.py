@@ -219,6 +219,32 @@ def test_the_chosen_codec_reaches_the_wire_and_the_record(load_environment, monk
     assert "compressed" in load_environment.streamlit.rendered_log
 
 
+def test_the_default_setting_does_not_put_off_into_the_header(load_environment) -> None:
+    """Путь ПО УМОЛЧАНИЮ обязан работать.
+
+    Реальный прогон 2026-07-27 23:54 упал на первом блоке: приложение отдало
+    кодек строкой `off`, драйвер сделал из неё `Content-Encoding`, и прокси
+    ответил `unsupported compression method off`. Фейк здесь ведёт себя как тот
+    прокси — принимает только настоящие кодеки.
+    """
+
+    class ProxyLikeClient(FakeRawClient):
+        def raw_insert(self, **kwargs):
+            codec = kwargs.get("compression")
+            if codec is not None and codec not in {"zstd", "lz4", "gzip"}:
+                raise RuntimeError(
+                    "HTTP driver received HTTP status 500, server response: "
+                    f"clickHouse engine unsupported compression method {codec}"
+                )
+            return super().raw_insert(**kwargs)
+
+    load_environment.run(ProxyLikeClient())
+
+    record = read_single_record(load_environment.records)
+    assert record["outcome"] == "ok", record["error"]
+    assert record["stats"]["rows"] == 3
+
+
 def test_without_compression_the_wire_carries_the_raw_payload(load_environment) -> None:
     load_environment.run(FakeRawClient())
 

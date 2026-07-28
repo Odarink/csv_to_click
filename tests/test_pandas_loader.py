@@ -853,6 +853,114 @@ def test_a_rerun_before_the_producer_finished_says_the_source_is_not_fully_read(
     assert stats.blocks_unconfirmed > 0, "отменённые блоки не посчитаны"
 
 
+class ProxyLikeClient(FakeRawClient):
+    """Фейк, который ведёт себя как прокси контура: непустой
+    `Content-Encoding` он проверяет по списку и на чужое отвечает 500.
+
+    Так упал реальный прогон 2026-07-27 23:54: приложение отдавало кодек `off`
+    как строку, драйвер ставил из неё заголовок, и прокси ответил
+    `unsupported compression method off`. Прежний фейк принимал что угодно и
+    потому зеленил путь, которого в бою не существует.
+    """
+
+    SUPPORTED = {"zstd", "lz4", "gzip"}
+
+    def raw_insert(self, **kwargs):
+        codec = kwargs.get("compression")
+        if codec is not None and codec not in self.SUPPORTED:
+            raise RuntimeError(
+                f"HTTP driver received HTTP status 500, server response: "
+                f"clickHouse engine unsupported compression method {codec}"
+            )
+        return super().raw_insert(**kwargs)
+
+
+@pytest.mark.parametrize("switched_off", ["off", "", None])
+def test_compression_switched_off_never_reaches_the_driver(tmp_path: Path, switched_off) -> None:
+    """`off` — это НЕ кодек, а выключатель.
+
+    Драйвер ставит `Content-Encoding` из ЛЮБОЙ непустой строки, поэтому `off`
+    обязан превращаться в `None` до вызова, а не после. Иначе ломается путь по
+    умолчанию — то есть каждая загрузка.
+    """
+    csv_path = tmp_path / "plain.csv"
+    csv_path.write_text("ID\n1\n2\n", encoding="utf_8")
+    client = ProxyLikeClient()
+
+    load_csv_via_raw_insert(
+        client=client,
+        csv_path=csv_path,
+        read_options=ReadOptions(batch_size=2),
+        database="sandbox",
+        table="target_table",
+        mappings=[SchemaMapping("ID", "ID", True, "UInt64", False)],
+        compression=switched_off,
+        stats=LoadStats(),
+    )
+
+    assert [call.get("compression") for call in client.calls] == [None]
+
+
+def test_compression_switched_off_never_reaches_the_driver_on_the_parallel_path(tmp_path: Path) -> None:
+    """Оператор грузит пятью воркерами — там тот же выключатель."""
+    csv_path = tmp_path / "plain_parallel.csv"
+    csv_path.write_text("ID\n1\n2\n", encoding="utf_8")
+    clients: list[ProxyLikeClient] = []
+
+    def client_factory():
+        client = ProxyLikeClient()
+        clients.append(client)
+        return client
+
+    load_csv_via_raw_insert(
+        client=FakeRawClient(),
+        csv_path=csv_path,
+        read_options=ReadOptions(batch_size=1),
+        database="sandbox",
+        table="target_table",
+        mappings=[SchemaMapping("ID", "ID", True, "UInt64", False)],
+        worker_count=2,
+        client_factory=client_factory,
+        compression="off",
+        stats=LoadStats(),
+    )
+
+    sent = [call.get("compression") for client in clients for call in client.calls]
+    assert sent == [None, None]
+
+
+def test_a_rejected_codec_tells_the_operator_what_to_do(tmp_path: Path) -> None:
+    """Контур ответил `unsupported compression method zstd` сырым текстом 500.
+
+    Сообщение обязано говорить, что делать: сменить кодек или выключить сжатие.
+    Иначе оператор видит пятисотку от прокси и остаётся с ней один на один.
+    """
+    csv_path = tmp_path / "rejected.csv"
+    csv_path.write_text("ID\n1\n", encoding="utf_8")
+
+    class RejectsZstd(ProxyLikeClient):
+        """Ровно поведение контура: zstd мы умеем, а он — нет."""
+
+        SUPPORTED = {"lz4", "gzip"}
+
+    with pytest.raises(CsvLoadError) as failure:
+        load_csv_via_raw_insert(
+            client=RejectsZstd(),
+            csv_path=csv_path,
+            read_options=ReadOptions(batch_size=1),
+            database="sandbox",
+            table="target_table",
+            mappings=[SchemaMapping("ID", "ID", True, "UInt64", False)],
+            compression="zstd",
+            stats=LoadStats(),
+        )
+
+    message = str(failure.value)
+    assert "unsupported compression method" in message
+    assert "Insert compression" in message, "не сказано, какую ручку крутить"
+    assert "off" in message
+
+
 class CompressionAwareClient(FakeRawClient):
     """Фейк, который РАСПАКОВЫВАЕТ полученное и проверяет заголовок.
 
