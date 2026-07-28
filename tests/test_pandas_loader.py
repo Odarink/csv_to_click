@@ -929,6 +929,97 @@ def test_compression_switched_off_never_reaches_the_driver_on_the_parallel_path(
     assert sent == [None, None]
 
 
+def _wide_csv(tmp_path: Path, rows: int) -> Path:
+    """Файл, на котором сжатие занимает заметное время, а не микросекунды."""
+    csv_path = tmp_path / "compressible.csv"
+    csv_path.write_text(
+        "ID,NOTE\n" + "".join(f"{index},{'Иванов Иван ' * 4}{index}\n" for index in range(rows)),
+        encoding="utf_8",
+    )
+    return csv_path
+
+
+def test_compression_is_not_counted_as_time_spent_on_the_wire(tmp_path: Path) -> None:
+    """`insert_busy_s` — единственный измеритель провода, и он обязан остаться им.
+
+    Сжатие уехало в воркеры ради параллелизма (zlib отпускает GIL, 4,5× на пяти
+    потоках), но если завести его ВНУТРЬ часов вставки, то диагностика «кто кого
+    ждал» начнёт показывать процессор как сеть.
+    """
+    csv_path = _wide_csv(tmp_path, 20_000)
+    mappings = [
+        SchemaMapping("ID", "ID", True, "UInt64", False),
+        SchemaMapping("NOTE", "NOTE", True, "String", False),
+    ]
+    stats = LoadStats()
+
+    load_csv_via_raw_insert(
+        client=FakeRawClient(),
+        csv_path=csv_path,
+        read_options=ReadOptions(batch_size=20_000),
+        database="sandbox",
+        table="target_table",
+        mappings=mappings,
+        worker_count=2,
+        client_factory=FakeRawClient,
+        compression="gzip",
+        stats=stats,
+    )
+
+    assert stats.compress_s > 0, "сжатие не замерено"
+    assert stats.insert_busy_s < stats.compress_s, (
+        f"часы вставки {stats.insert_busy_s:.4f} с включают сжатие {stats.compress_s:.4f} с: "
+        "мгновенный фейк не может слать дольше, чем длится gzip"
+    )
+
+
+def test_every_block_contributes_its_compression_time(tmp_path: Path) -> None:
+    """Сжимают ПЯТЬ потоков, а складывает главный: иначе часть слагаемых теряется.
+
+    `float +=` из нескольких потоков теряет обновления молча, поэтому время
+    возвращается вместе с блоком, а не пишется в общий счётчик из воркера.
+    """
+    csv_path = _wide_csv(tmp_path, 4_000)
+    mappings = [
+        SchemaMapping("ID", "ID", True, "UInt64", False),
+        SchemaMapping("NOTE", "NOTE", True, "String", False),
+    ]
+
+    one_block = LoadStats()
+    load_csv_via_raw_insert(
+        client=FakeRawClient(),
+        csv_path=csv_path,
+        read_options=ReadOptions(batch_size=4_000),
+        database="sandbox",
+        table="target_table",
+        mappings=mappings,
+        worker_count=2,
+        client_factory=FakeRawClient,
+        compression="gzip",
+        stats=one_block,
+    )
+
+    four_blocks = LoadStats()
+    load_csv_via_raw_insert(
+        client=FakeRawClient(),
+        csv_path=csv_path,
+        read_options=ReadOptions(batch_size=1_000),
+        database="sandbox",
+        table="target_table",
+        mappings=mappings,
+        worker_count=2,
+        client_factory=FakeRawClient,
+        compression="gzip",
+        stats=four_blocks,
+    )
+
+    assert one_block.blocks == 1 and four_blocks.blocks == 4
+    assert four_blocks.compress_s > one_block.compress_s / 2, (
+        f"четыре блока дали {four_blocks.compress_s:.4f} с против {one_block.compress_s:.4f} с "
+        "на одном: слагаемые теряются"
+    )
+
+
 def test_a_rejected_codec_tells_the_operator_what_to_do(tmp_path: Path) -> None:
     """Контур ответил `unsupported compression method zstd` сырым текстом 500.
 

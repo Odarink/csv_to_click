@@ -606,9 +606,10 @@ def compress_payload(payload: bytes, codec: str | None) -> bytes:
 def _compress_block(payload: bytes, compression: str | None, stats: LoadStats) -> bytes:
     """Сжимает тело блока и записывает потраченное время в счётчики.
 
-    Жмёт ПРОДЮСЕР, а не воркер: после перехода на Arrow продюсер простаивает
-    85% времени, а у воркера время — это провод, и мешать в него процессор
-    значило бы испортить единственный измеритель узкого места.
+    Только для ПОСЛЕДОВАТЕЛЬНОГО пути, где поток один и распараллеливать нечего.
+    На пути с воркерами сжатие делает сам воркер: zlib отпускает GIL (4,5× на
+    пяти потоках), и на прогоне с gzip продюсер был занят 99,5% времени, из них
+    53% — сжатие, при простое воркеров 74%.
     """
     if not compression or compression == COMPRESSION_OFF:
         return payload
@@ -1043,16 +1044,21 @@ def _load_csv_via_raw_insert_parallel(
         block_rows: int,
         columns: list[str],
         payload: bytes,
-        raw_bytes: int,
         submitted_at: float,
     ) -> _InsertedBlock:
-        # Часы снимаются ЗДЕСЬ, в воркере: только так видно, сколько длится сама
-        # вставка. Складывает эти числа главный поток, поэтому лок не нужен —
-        # воркер трогает лишь свои локальные float.
+        # Сжатие делает ВОРКЕР, а не продюсер: zlib отпускает GIL (замерено
+        # 4,5x на пяти потоках), а на прогоне с gzip продюсер был занят 99,5%
+        # времени, из них 53% — сжатие в одном потоке, при простое воркеров 74%.
+        compress_started = time.perf_counter()
+        body = compress_payload(payload, compression)
+        compress_s = time.perf_counter() - compress_started
+
+        # Часы вставки начинаются ПОСЛЕ сжатия: `insert_busy_s` — единственный
+        # измеритель провода, и процессор в него подмешивать нельзя.
         started = time.perf_counter()
         try:
             summary = raw_insert_batch(
-                worker_client(), database, table, columns, payload, compression
+                worker_client(), database, table, columns, body, compression
             )
         except Exception as exc:
             raise _raw_insert_error(
@@ -1068,9 +1074,12 @@ def _load_csv_via_raw_insert_parallel(
             chunk_number=chunk_number,
             block_number=block_number,
             block_rows=block_rows,
-            payload_bytes=raw_bytes,
-            wire_bytes=len(payload),
+            payload_bytes=len(payload),
+            wire_bytes=len(body),
             summary=summary,
+            # Время сжатия возвращается вместе с блоком и складывается в главном
+            # потоке: `float +=` из пяти воркеров теряет слагаемые молча.
+            compress_s=compress_s,
             # Разность отметок из РАЗНЫХ потоков законна: perf_counter на Windows
             # это QueryPerformanceCounter, он общесистемный, а не потоковый.
             queue_s=started - submitted_at,
@@ -1087,6 +1096,7 @@ def _load_csv_via_raw_insert_parallel(
         # общих счётчиков не трогают, поэтому лок не нужен.
         stats.insert_busy_s += inserted.insert_s
         stats.insert_queue_s += inserted.queue_s
+        stats.compress_s += inserted.compress_s
         return _block_progress(
             chunk_number=inserted.chunk_number,
             block_number=inserted.block_number,
@@ -1181,8 +1191,7 @@ def _load_csv_via_raw_insert_parallel(
                             block_number=block_number,
                             block_rows=block_rows,
                             columns=columns,
-                            payload=_compress_block(payload, compression, stats),
-                            raw_bytes=len(payload),
+                            payload=payload,
                             submitted_at=time.perf_counter(),
                         )
                     )
@@ -1218,6 +1227,8 @@ class _InsertedBlock:
     summary: dict[str, str]
     #: Сколько блок пролежал в очереди пула: от `submit` до начала отправки.
     queue_s: float = 0.0
+    #: Сколько заняло сжатие тела в этом воркере.
+    compress_s: float = 0.0
     #: Сколько длилась сама вставка в воркере, стенные часы.
     insert_s: float = 0.0
 
