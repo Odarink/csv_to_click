@@ -21,10 +21,12 @@ from csv_click.clickhouse import raw_insert_batch, summary_elapsed_ns
 from csv_click.errors import CsvLoadError, CsvReadCancelled, CsvSchemaError
 from csv_click.load_stats import BlockProgress, LoadStats
 from csv_click.schema import (
+    NA_MARKERS,
     CsvColumn,
     CsvSchema,
     _ColumnStats,
     _infer_type,
+    _needs_nullable,
     convert_value,
     normalize_identifier,
     unwrap_nullable,
@@ -49,15 +51,6 @@ _BLOCK_ESTIMATE_GROWTH_LIMIT = 16
 DEFAULT_SCHEMA_SAMPLE_ROWS = 100_000
 ENCODING_SUGGESTIONS: tuple[str, ...] = ("utf_8", "utf-8-sig", "cp1251", "windows-1251")
 MOJIBAKE_MARKERS: tuple[str, ...] = ("С‚", "Рµ", "Р°", "Рё", "Рѕ", "РЅ", "�")
-#: Текстовые маркеры пропуска. Повторяет `na_values` по умолчанию в pandas —
-#: файл читается с `keep_default_na=False`, поэтому распознаём их сами и только
-#: там, где они действительно означают пропуск (везде, кроме String).
-#: Совпадение с pandas закреплено тестом.
-NA_MARKERS: frozenset[str] = frozenset({
-    "", "#N/A", "#N/A N/A", "#NA", "-1.#IND", "-1.#QNAN", "-NaN", "-nan",
-    "1.#IND", "1.#QNAN", "<NA>", "N/A", "NA", "NULL", "NaN", "None", "n/a",
-    "nan", "null",
-})
 
 
 @dataclass(frozen=True)
@@ -375,7 +368,8 @@ def _schema_from_stats(source_names: list[str], stats: dict[str, _ColumnStats]) 
     columns = []
     for source_name in source_names:
         inferred_type, notes = _infer_type(stats[source_name])
-        final_type = f"Nullable({inferred_type})" if stats[source_name].has_empty else inferred_type
+        nullable = _needs_nullable(stats[source_name], inferred_type)
+        final_type = f"Nullable({inferred_type})" if nullable else inferred_type
         columns.append(
             CsvColumn(
                 column_name=normalize_identifier(source_name),

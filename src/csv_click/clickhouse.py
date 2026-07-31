@@ -221,8 +221,12 @@ def build_create_local_table_sql(
     table = quote_identifier(table)
     cluster = quote_identifier(cluster)
     order_by_sql = quote_column_identifier(order_by)
+    # Не сырой бэктик: целевое имя приходит из редактора типов свободным текстом,
+    # `mappings_to_schema` проверяет его только на непустоту, и бэктик в имени
+    # закрывал кавычку — дальше в DDL уезжал любой текст оператора.
     columns_sql = ",\n    ".join(
-        f"`{column.column_name}` {column.final_type}" for column in schema.columns
+        f"{quote_column_identifier(column.column_name)} {column.final_type}"
+        for column in schema.columns
     )
     partition_sql = f"\nPARTITION BY {partition_by.strip()}" if partition_by and partition_by.strip() else ""
     return f"""CREATE TABLE {database}.{table}
