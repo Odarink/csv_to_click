@@ -404,3 +404,48 @@ def test_schema_from_editor_rows_accepts_datetime64_timezone_custom_type(tmp_pat
 def test_normalize_identifier_rejects_duplicate_columns_after_normalization() -> None:
     assert normalize_identifier("Order ID") == "order_id"
     assert normalize_identifier("123") == "col_123"
+
+
+def test_normalize_identifier_keeps_cyrillic_letters() -> None:
+    """Заголовок целиком из кириллицы обязан давать имя, а не пустоту.
+
+    ASCII-класс стирал такое имя до `_`, а `strip("_")` — до пустой строки, и
+    выгрузка падала на «CSV header contains an empty column name». Кириллица —
+    не край, а обычный случай выгрузок этого проекта.
+    """
+    assert normalize_identifier("ИНН") == "инн"
+    assert normalize_identifier("Организационно-правовая форма") == "организационно_правовая_форма"
+    assert normalize_identifier("Id Селлера") == "id_селлера"
+
+
+def test_normalize_identifier_still_rejects_a_name_without_letters_or_digits() -> None:
+    """Пустое имя всё ещё обязано ловиться: сообщение об ошибке достижимо."""
+    with pytest.raises(CsvSchemaError, match="empty column name"):
+        normalize_identifier(" --- ")
+
+
+def test_analyze_csv_schema_reads_a_cyrillic_header(tmp_path: Path) -> None:
+    csv_path = write_csv(
+        tmp_path / "sellers.csv",
+        "\r\n".join(
+            [
+                "Id Селлера;ИНН;Наименование селлера;Полное наименование селлера;"
+                "Организационно-правовая форма",
+                "35;10000;perfume shop;aaaa aaaa aaaa;Самозанятый",
+                "48;10000;bbbb bbbb bbbb;bbbb bbbb bbbb;Самозанятый",
+                "",
+            ]
+        ),
+    )
+
+    schema = analyze_csv_schema(csv_path)
+
+    assert [column.column_name for column in schema.columns] == [
+        "id_селлера",
+        "инн",
+        "наименование_селлера",
+        "полное_наименование_селлера",
+        "организационно_правовая_форма",
+    ]
+    assert schema.source_names[1] == "ИНН"
+    assert validate_csv_against_schema(csv_path, schema) == 2

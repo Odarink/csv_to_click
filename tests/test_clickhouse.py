@@ -89,6 +89,64 @@ def test_build_local_ddl_contains_cluster_replicated_engine_order_and_partition(
     assert not sql.rstrip().endswith(";")
 
 
+def test_build_local_ddl_backticks_a_cyrillic_column_name() -> None:
+    """Кириллическое имя колонки уезжает в DDL как есть, в бэктиках."""
+    schema = CsvSchema(
+        columns=[
+            CsvColumn(
+                column_name="инн",
+                source_name="ИНН",
+                inferred_type="UInt64",
+                final_type="UInt64",
+                nullable=False,
+                sample_values=["10000"],
+                notes="",
+            )
+        ]
+    )
+
+    sql = build_create_local_table_sql(
+        database="sandbox",
+        table="sellers_local",
+        cluster="clickhouse",
+        schema=schema,
+        order_by="инн",
+    )
+
+    assert "`инн` UInt64" in sql
+    assert "ORDER BY `инн`" in sql
+
+
+def test_build_local_ddl_rejects_a_backtick_in_a_column_name() -> None:
+    """Имя из редактора типов нормализацию не проходит: бэктик закрыл бы кавычку.
+
+    `mappings_to_schema` проверяет целевое имя только на непустоту, поэтому
+    оператор мог дописать в DDL произвольный текст через `x`` DEFAULT 1, ``y`.
+    """
+    schema = CsvSchema(
+        columns=[
+            CsvColumn(
+                column_name="x` DEFAULT 1, `y",
+                source_name="x",
+                inferred_type="String",
+                final_type="String",
+                nullable=False,
+                sample_values=[],
+                notes="",
+            )
+        ]
+    )
+
+    with pytest.raises(ValueError, match="Unsafe ClickHouse column identifier"):
+        build_create_local_table_sql(
+            database="sandbox",
+            table="orders_local",
+            cluster="clickhouse",
+            schema=schema,
+            order_by="x",
+        )
+
+
 def test_build_distributed_ddl_uses_local_table() -> None:
     sql = build_create_distributed_table_sql(
         database="sandbox",

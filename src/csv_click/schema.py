@@ -214,7 +214,18 @@ class _ColumnStats:
 
 
 def normalize_identifier(value: str) -> str:
-    normalized = re.sub(r"[^0-9a-zA-Z_]+", "_", value.strip().lower())
+    """Заголовок в имя колонки ClickHouse. Буквы и цифры ЛЮБОГО письма остаются.
+
+    `\\W` в Python юникодный, и это здесь главное: ASCII-класс стирал заголовок
+    целиком из кириллицы до `_`, а `strip("_")` — до пустой строки, так что
+    выгрузка падала на «empty column name» на файле с нормальной шапкой. Для
+    этого проекта кириллическая шапка — обычный случай, а не край.
+
+    Имя уезжает в бэктиках везде: DDL зовёт `quote_column_identifier`, список
+    колонок INSERT бэктикает драйвер, а ключ JSONEachRow пишется сырым UTF-8 —
+    эталонный `to_json` вызывается с `force_ascii=False`, поэтому байты сходятся.
+    """
+    normalized = re.sub(r"\W+", "_", value.strip().lower())
     normalized = re.sub(r"_+", "_", normalized).strip("_")
     if not normalized:
         raise CsvSchemaError("CSV header contains an empty column name")
