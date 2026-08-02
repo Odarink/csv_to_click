@@ -953,6 +953,58 @@ def _format_load_error(exc: Exception) -> str:
     return f"Unexpected load error: {message}"
 
 
+def _handle_tables_after_failed_load(
+    client,
+    config: ClickHouseConfig,
+    distributed_table: str,
+    log_callback,
+    stats: LoadStats,
+) -> None:
+    """Убрать за неудавшейся загрузкой - но только то, что ещё пусто.
+
+    Чистка задумана как откат создания таблиц, и она безопасна ровно до первой
+    вставки. Дальше это уничтожение работы: один транзиентный 5xx на 900-м
+    блоке из 1000 стирал всё залитое, и повторять пришлось бы с нуля.
+
+    Решение принимается по ПОДТВЕРЖДЁННЫМ блокам, и только по ним.
+    `blocks_unconfirmed` для этого не годится: туда попадают и отменённые при
+    гашении блоки, которые не отправлялись вовсе (`cancel_pending`), и упавшие
+    до отправки - на создании клиента воркера или на сжатии. Обрыв связи сразу
+    после DDL давал на параллельном пути `blocks_unconfirmed=N` при пустых
+    таблицах, и пара оставалась навсегда, хотя раньше откатывалась сама.
+    Отличить «сервер отверг» от «ответ не дошёл» тоже нельзя: драйвер бросает
+    `OperationalError` (подкласс `DatabaseError`) и на то, и на другое.
+
+    Цена решения названа честно: если единственный блок всё-таки долетел, он
+    уйдёт вместе с таблицей. Это блок из начала файла, и перезалив с нуля
+    дешевле, чем каждый раз дропать руками пустую пару после отказа кодека.
+    """
+    if stats.blocks:
+        table_names = build_table_names(distributed_table)
+        what_is_inside = (
+            f"{stats.rows} rows in {stats.blocks} confirmed block(s) are already there"
+        )
+        if stats.blocks_unconfirmed:
+            what_is_inside += (
+                f", and {stats.blocks_unconfirmed} more block(s) were never confirmed, "
+                "so the real count can be higher"
+            )
+        log_callback(
+            f"Load failed and the target tables are KEPT: {what_is_inside}. "
+            f"Check {config.database}.{table_names.distributed} and drop both it and "
+            f"{config.database}.{table_names.local} yourself before reloading - the "
+            "next run refuses a name that already exists."
+        )
+        return
+    if stats.blocks_unconfirmed:
+        log_callback(
+            f"{stats.blocks_unconfirmed} block(s) never came back confirmed and no block "
+            "did, so the tables are treated as empty and dropped. If one of them did "
+            "land after all, it goes with the table - reload from the start."
+        )
+    _cleanup_after_failed_load(client, config, distributed_table, log_callback)
+
+
 def _cleanup_after_failed_load(
     client,
     config: ClickHouseConfig,
@@ -1212,7 +1264,7 @@ def _create_and_load(
         # их уничтожать.
         if tables_created and client is not None and not load_completed:
             try:
-                _cleanup_after_failed_load(client, config, distributed_table, log)
+                _handle_tables_after_failed_load(client, config, distributed_table, log, stats)
             except Exception as cleanup_exc:
                 log(f"Cleanup error: {cleanup_exc}")
         error_message = str(exc)
@@ -1223,7 +1275,7 @@ def _create_and_load(
         # их уничтожать.
         if tables_created and client is not None and not load_completed:
             try:
-                _cleanup_after_failed_load(client, config, distributed_table, log)
+                _handle_tables_after_failed_load(client, config, distributed_table, log, stats)
             except Exception as cleanup_exc:
                 log(f"Cleanup error: {cleanup_exc}")
         if load_completed:

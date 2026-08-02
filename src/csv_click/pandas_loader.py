@@ -1379,7 +1379,10 @@ def _convert_series(series: pd.Series, clickhouse_type: str) -> pd.Series:
         # Decimal остаётся Decimal: to_json кодирует его как строку "1.50", то
         # есть ровно так же, как это делал построчный путь через str().
         return series.map(lambda value: convert_value(_value_to_string(value), clickhouse_type)).astype("object")
-    if inner_type == "Date":
+    if inner_type in {"Date", "Date32"}:
+        # `Date32` отличается от `Date` только диапазоном, а формат у них общий:
+        # без этой ветки колонка уходила сырым текстом, и `19600102` уезжало
+        # так же, как записано, вместо канонического `1960-01-02`.
         return _format_temporal(series, nullable, "D", "T", "date")
     if inner_type == "DateTime":
         # Разделитель пробел, а не 'T', и без дробных секунд: это канонический

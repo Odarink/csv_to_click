@@ -139,8 +139,10 @@ def test_numeric_zero_one_column_infers_uint_not_bool(tmp_path: Path) -> None:
         (["1e5", "2e5"], "Decimal(18, 2)"),
         (["2024-01-05", "2024-02-06"], "Date"),
         # Год с ведущими нулями - сентинел `DateTime.MinValue` из выгрузок .NET.
-        # Разбор даты ничего не теряет, и она обязана остаться датой.
-        (["0001-01-01", "0999-12-31"], "Date"),
+        # Разбор даты ничего не теряет, поэтому числом колонка не становится;
+        # но первый год нашей эры не вмещает ни `Date`, ни `Date32`, и текстом
+        # он хотя бы доедет без подмены (см. `_date_type`).
+        (["0001-01-01", "0999-12-31"], "String"),
         (["true", "false"], "Bool"),
     ],
 )
@@ -341,6 +343,150 @@ def test_missing_marker_beside_text_keeps_the_column_not_nullable(tmp_path: Path
     schema = analyze_csv_schema(csv_path)
 
     assert schema.columns[0].final_type == "String"
+
+
+@pytest.mark.parametrize(
+    ("value", "want_type"),
+    [
+        # ClickHouse `Date` начинается с 1970-01-01 и кончается 2149-06-06.
+        ("1970-01-01", "Date"),
+        ("2149-06-06", "Date"),
+        # За его границами вмещает `Date32`: 1900-01-01 .. 2299-12-31. Это годы
+        # рождения и сентинелы вроде 1900-01-01 из выгрузок .NET.
+        ("1900-01-01", "Date32"),
+        ("1950-06-15", "Date32"),
+        ("1969-12-31", "Date32"),
+        ("2149-06-07", "Date32"),
+        ("2299-12-31", "Date32"),
+        # Дальше не вмещает ни один тип даты.
+        ("2300-01-01", "String"),
+        ("1899-12-31", "String"),
+    ],
+)
+def test_date_type_holds_the_dates_in_the_column(
+    tmp_path: Path, value: str, want_type: str
+) -> None:
+    """Дата вне диапазона типа - тихая порча: локально всё проходит.
+
+    Ни инференс, ни строгая проверка не смотрели на границы, поэтому 1950 год
+    уезжал в `Date`, который начинается с 1970-го.
+    """
+    from csv_click.pandas_loader import (
+        ReadOptions,
+        schema_to_mappings,
+        validate_csv_with_pandas_chunks,
+    )
+
+    csv_path = write_csv(tmp_path / "dates.csv", f"dt\n2024-01-05\n{value}\n")
+
+    schema = analyze_csv_schema(csv_path)
+
+    assert schema.columns[0].final_type == want_type
+    validate_csv_with_pandas_chunks(
+        csv_path, ReadOptions(batch_size=10), schema_to_mappings(schema)
+    )
+
+
+@pytest.mark.parametrize("date_type", ["Date", "Date32"])
+def test_date_types_refuse_a_value_that_is_not_a_date(date_type: str) -> None:
+    """Каждый тип из выпадающего списка обязан проверять значения.
+
+    `Date32` появился в списке вместе с этой правкой, а ветки в конвертере не
+    получил и молча принимал любой текст: строгая проверка на такой колонке не
+    проверяла ничего.
+    """
+    from csv_click.schema import convert_value
+
+    with pytest.raises(CsvSchemaError):
+        convert_value("hello", date_type)
+    with pytest.raises(CsvSchemaError):
+        convert_value("hello", f"Nullable({date_type})")
+
+
+def test_date32_column_refuses_a_form_clickhouse_cannot_read(tmp_path: Path) -> None:
+    """Неделя по ISO разбирается Python-ом, но не ClickHouse.
+
+    До появления `Date32` такая колонка была `Date`, и строгая проверка её
+    отвергала. Тип не должен превращать громкий отказ в тихую отправку.
+    """
+    from csv_click.pandas_loader import (
+        ReadOptions,
+        schema_to_mappings,
+        validate_csv_with_pandas_chunks,
+    )
+
+    csv_path = write_csv(tmp_path / "isoweek.csv", "dt\n1950-06-15\n1960-W02-3\n")
+    schema = analyze_csv_schema(csv_path)
+
+    with pytest.raises(CsvSchemaError):
+        validate_csv_with_pandas_chunks(
+            csv_path, ReadOptions(batch_size=10), schema_to_mappings(schema)
+        )
+
+
+def test_date_bounds_come_from_the_whole_column_not_the_last_row(tmp_path: Path) -> None:
+    """Границы накапливаются: выходящая дата может стоять где угодно в файле."""
+    csv_path = write_csv(
+        tmp_path / "unordered.csv", "dt\n1950-06-15\n2024-01-05\n2024-02-06\n"
+    )
+
+    schema = analyze_csv_schema(csv_path)
+
+    assert schema.columns[0].final_type == "Date32"
+
+
+def test_date_beyond_date32_anywhere_in_the_column_forces_string(tmp_path: Path) -> None:
+    csv_path = write_csv(
+        tmp_path / "beyond.csv", "dt\n2024-01-05\n2300-01-01\n2024-02-06\n"
+    )
+
+    schema = analyze_csv_schema(csv_path)
+
+    assert schema.columns[0].final_type == "String"
+
+
+@pytest.mark.parametrize(
+    "value",
+    ["2024-01-05T10:00:00+03:00", "2024-01-05T10:00:00Z", "2024-01-05T10:00:00-05:00"],
+)
+def test_timezone_offset_does_not_infer_a_naive_datetime(tmp_path: Path, value: str) -> None:
+    """Офсет пояса путь загрузки не разбирает: формат жёсткий, без зоны.
+
+    Инференс всё равно выбирал `DateTime`, и загрузка падала на первом блоке -
+    причём сообщение называло соседнюю, исправную строку.
+    """
+    from csv_click.pandas_loader import (
+        ReadOptions,
+        schema_to_mappings,
+        validate_csv_with_pandas_chunks,
+    )
+
+    csv_path = write_csv(tmp_path / "stamps.csv", f"ts\n2024-01-05T09:00:00+03:00\n{value}\n")
+
+    schema = analyze_csv_schema(csv_path)
+
+    assert schema.columns[0].final_type == "String"
+    assert "zone" in schema.columns[0].notes.lower(), schema.columns[0].notes
+    validate_csv_with_pandas_chunks(
+        csv_path, ReadOptions(batch_size=10), schema_to_mappings(schema)
+    )
+
+
+def test_plain_datetime_still_infers_datetime(tmp_path: Path) -> None:
+    from csv_click.pandas_loader import (
+        ReadOptions,
+        schema_to_mappings,
+        validate_csv_with_pandas_chunks,
+    )
+
+    csv_path = write_csv(tmp_path / "plain.csv", "ts\n2024-01-05 09:00:00\n2024-02-06 10:30:00\n")
+
+    schema = analyze_csv_schema(csv_path)
+
+    assert schema.columns[0].final_type == "DateTime"
+    validate_csv_with_pandas_chunks(
+        csv_path, ReadOptions(batch_size=10), schema_to_mappings(schema)
+    )
 
 
 def test_one_zero_cell_does_not_widen_the_column(tmp_path: Path) -> None:

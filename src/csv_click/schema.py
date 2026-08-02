@@ -42,6 +42,7 @@ CLICKHOUSE_TYPE_OPTIONS = [
     "Decimal(38, 10)",
     "Decimal(76, 10)",
     "Date",
+    "Date32",
     "DateTime",
     "Bool",
     "Nullable(String)",
@@ -54,6 +55,7 @@ CLICKHOUSE_TYPE_OPTIONS = [
     "Nullable(Decimal(38, 10))",
     "Nullable(Decimal(76, 10))",
     "Nullable(Date)",
+    "Nullable(Date32)",
     "Nullable(DateTime)",
     "Nullable(Bool)",
 ]
@@ -157,6 +159,13 @@ class _ColumnStats:
     #: Цифр в целой части самого длинного значения. Вместе со scale даёт
     #: precision: без него `Decimal(18, 2)` доставался числу с 20 целыми цифрами.
     max_decimal_int_digits: int = 0
+    #: Границы дат колонки. Тип обязан их вмещать: `Date` начинается с 1970-го,
+    #: и год рождения 1950 уезжал в него молча.
+    min_date: date | None = None
+    max_date: date | None = None
+    #: В отметке времени был офсет пояса. Путь загрузки разбирает жёсткий формат
+    #: без зоны, поэтому наивный `DateTime` такой колонке не годится.
+    has_timezone_offset: bool = False
     sample_values: list[str] | None = None
 
     def add_value(self, value: str) -> None:
@@ -198,8 +207,15 @@ class _ColumnStats:
         decimal_shape = _decimal_shape(raw)
         self.all_decimal = self.all_decimal and decimal_shape is not None
         self.all_float = self.all_float and float_kind is not None
-        self.all_date = self.all_date and _is_date(raw)
-        self.all_datetime = self.all_datetime and _is_datetime(raw)
+        date_value = _date_value(raw) if self.all_date else None
+        self.all_date = self.all_date and date_value is not None
+        if date_value is not None:
+            self.min_date = min(self.min_date or date_value, date_value)
+            self.max_date = max(self.max_date or date_value, date_value)
+        datetime_value = _datetime_value(raw) if self.all_datetime else None
+        self.all_datetime = self.all_datetime and datetime_value is not None
+        if datetime_value is not None:
+            self.has_timezone_offset = self.has_timezone_offset or datetime_value.tzinfo is not None
         if not self.has_lossy_numeric_text and (
             self.all_uint or self.all_int or self.all_decimal or self.all_float
         ):
@@ -329,11 +345,14 @@ def convert_value(value: str, clickhouse_type: str) -> object:
             return Decimal(raw)
         except InvalidOperation as exc:
             raise CsvSchemaError("expected Decimal") from exc
-    if inner_type == "Date":
+    if inner_type in {"Date", "Date32"}:
+        # Оба типа проверяются одинаково: разница между ними только в диапазоне,
+        # который выбирает инференс. Забыть здесь `Date32` значило бы, что
+        # строгая проверка на такой колонке не проверяет ничего.
         try:
             return date.fromisoformat(raw)
         except ValueError as exc:
-            raise CsvSchemaError("expected Date in YYYY-MM-DD format") from exc
+            raise CsvSchemaError(f"expected {inner_type} in YYYY-MM-DD format") from exc
     if inner_type == "DateTime":
         try:
             return datetime.fromisoformat(raw)
@@ -427,12 +446,48 @@ def _infer_type(stats: _ColumnStats) -> tuple[str, str]:
             return _decimal_type(stats, scale=10, widths=(38, 76))
         return "Float64", "Decimal scale is too high; fallback to Float64"
     if stats.all_date:
-        return "Date", ""
+        return _date_type(stats)
     if stats.all_datetime:
+        if stats.has_timezone_offset:
+            # Конвертация разбирает `%Y-%m-%d %H:%M:%S`, зоны в нём нет, и
+            # загрузка падала на первом блоке. Смещение - часть значения:
+            # выбросить его молча значило бы сдвинуть время на часы.
+            return "String", (
+                "Timestamps carry a time zone offset, which the load path cannot "
+                "parse; fallback to String"
+            )
         return "DateTime", ""
     if stats.all_float:
         return "Float64", ""
     return "String", "Mixed or unsupported values; fallback to String"
+
+
+#: Границы типов дат ClickHouse. Значение вне диапазона сервер не примет, а до
+#: сервера всё выглядит исправным: и разбор, и строгая проверка идут по Python
+#: `date`, у которого границы свои.
+DATE_RANGE: tuple[date, date] = (date(1970, 1, 1), date(2149, 6, 6))
+DATE32_RANGE: tuple[date, date] = (date(1900, 1, 1), date(2299, 12, 31))
+
+
+def _date_type(stats: _ColumnStats) -> tuple[str, str]:
+    """`Date`, `Date32` или `String` - смотря какие даты в колонке.
+
+    Расширение только вверх: 1950 год и сентинел `1900-01-01` из выгрузок .NET
+    в `Date` не влезают, а всё остальное остаётся тем же типом, что и раньше.
+    """
+    if stats.min_date is None or stats.max_date is None:
+        return "Date", ""
+    if DATE_RANGE[0] <= stats.min_date and stats.max_date <= DATE_RANGE[1]:
+        return "Date", ""
+    if DATE32_RANGE[0] <= stats.min_date and stats.max_date <= DATE32_RANGE[1]:
+        return "Date32", (
+            f"Dates from {stats.min_date} to {stats.max_date} do not fit Date "
+            f"({DATE_RANGE[0]}..{DATE_RANGE[1]}); widened to Date32"
+        )
+    return "String", (
+        f"Dates from {stats.min_date} to {stats.max_date} do not fit Date32 "
+        f"({DATE32_RANGE[0]}..{DATE32_RANGE[1]}); fallback to String"
+    )
 
 
 def _decimal_type(stats: _ColumnStats, scale: int, widths: tuple[int, ...]) -> tuple[str, str]:
@@ -589,20 +644,18 @@ def _float_kind(value: str) -> str | None:
     return "finite"
 
 
-def _is_date(value: str) -> bool:
+def _date_value(value: str) -> date | None:
     try:
-        date.fromisoformat(value)
+        return date.fromisoformat(value)
     except ValueError:
-        return False
-    return True
+        return None
 
 
-def _is_datetime(value: str) -> bool:
+def _datetime_value(value: str) -> datetime | None:
     try:
-        datetime.fromisoformat(value)
+        return datetime.fromisoformat(value)
     except ValueError:
-        return False
-    return True
+        return None
 
 
 def _split_sample_values(value: object) -> list[str]:
