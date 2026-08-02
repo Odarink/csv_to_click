@@ -20,6 +20,7 @@ import pytest
 import csv_click.app as app
 from csv_click.load_stats import DRIVER_LOGGER_NAME, DRIVER_RETRY_MESSAGE
 from csv_click.clickhouse import ClickHouseConfig
+from csv_click.errors import CsvSchemaError
 from csv_click.pandas_loader import (
     ReadOptions,
     SchemaMapping,
@@ -324,7 +325,7 @@ def test_failed_load_still_persists_the_run_record_with_partial_counters(
     monkeypatch.setattr(
         app,
         "_cleanup_after_failed_load",
-        lambda client, config, distributed_table, log: cleanups.append(distributed_table),
+        lambda *args, **kwargs: cleanups.append(kwargs.get("distributed_table", args[2])),
     )
 
     class FailsOnSecondBlock(FakeRawClient):
@@ -335,7 +336,11 @@ def test_failed_load_still_persists_the_run_record_with_partial_counters(
 
     load_environment.run(FailsOnSecondBlock())
 
-    assert cleanups == ["orders"]
+    # Первый блок уже в таблице: удалять её из-за сбоя на втором - значит
+    # уничтожить залитое. Один транзиентный 5xx на 900-м блоке из 1000 стоил бы
+    # всей работы.
+    assert cleanups == [], "таблицы с залитыми строками удалены из-за сбоя загрузки"
+    assert "kept" in load_environment.streamlit.rendered_log.lower()
     record = read_single_record(load_environment.records)
     assert record["outcome"] == "failed"
     assert "HTTP/proxy read limit" in record["error"]
@@ -343,6 +348,155 @@ def test_failed_load_still_persists_the_run_record_with_partial_counters(
     assert record["stats"]["blocks"] == 1
     assert record["stats"]["insert_wall_s"] > 0
     assert record["config"]["batch_size"] == 2
+
+
+def test_failure_before_the_first_block_still_drops_the_empty_tables(
+    load_environment,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Пока в таблицах ничего нет, чистка - это откат создания, и она нужна.
+
+    Иначе после неудачной попытки остаётся пустая пара таблиц, и следующая
+    загрузка того же имени упирается в `ExistingTableError`.
+    """
+    cleanups: list[str] = []
+    monkeypatch.setattr(
+        app,
+        "_cleanup_after_failed_load",
+        lambda *args, **kwargs: cleanups.append(kwargs.get("distributed_table", args[2])),
+    )
+
+    def fails_before_sending_anything(**kwargs):
+        raise CsvSchemaError("Cannot convert chunk 1, column 'ID', value 'x' to UInt64")
+
+    monkeypatch.setattr(app, "load_csv_via_raw_insert", fails_before_sending_anything)
+
+    load_environment.run(FakeRawClient())
+
+    assert cleanups == ["orders"]
+    record = read_single_record(load_environment.records)
+    assert record["stats"]["blocks"] == 0
+    assert record["stats"]["blocks_unconfirmed"] == 0
+
+
+def test_an_unconfirmed_block_without_a_confirmed_one_still_drops(
+    load_environment,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Ни один блок не подтверждён - таблицы считаются пустыми и удаляются.
+
+    `blocks_unconfirmed` не отвечает на вопрос «есть ли данные»: туда попадают
+    и блоки, которые не отправлялись вовсе. Держаться за него значило бы
+    оставлять пустую пару после каждого отказа кодека.
+    """
+    cleanups: list[str] = []
+    monkeypatch.setattr(
+        app,
+        "_cleanup_after_failed_load",
+        lambda *args, **kwargs: cleanups.append(kwargs.get("distributed_table", args[2])),
+    )
+
+    class LosesTheAnswer(FakeRawClient):
+        def raw_insert(self, **kwargs):
+            super().raw_insert(**kwargs)
+            raise RuntimeError("Connection aborted before the answer arrived")
+
+    load_environment.run(LosesTheAnswer())
+
+    record = read_single_record(load_environment.records)
+    assert record["stats"]["blocks"] == 0
+    assert record["stats"]["blocks_unconfirmed"] >= 1
+    assert cleanups == ["orders"]
+    # Оператор обязан узнать про размен: долетевший блок ушёл вместе с таблицей.
+    assert "never came back confirmed" in load_environment.streamlit.rendered_log
+
+
+class _RecordingClient:
+    """Считает DROP-запросы. `drop_target_tables` ходит в клиент только через `query`."""
+
+    def __init__(self) -> None:
+        self.queries: list[str] = []
+
+    def query(self, sql: str):  # noqa: ANN201
+        self.queries.append(sql)
+        return None
+
+
+@pytest.mark.parametrize(
+    ("stats_kwargs", "want_drops"),
+    [
+        # Ничего не ушло: чистка - это откат создания, и она нужна.
+        ({}, 2),
+        # Подтверждённые блоки: данные в таблице, и терять их нельзя.
+        ({"rows": 449_000_000, "blocks": 900}, 0),
+        ({"rows": 100, "blocks": 2, "blocks_unconfirmed": 3}, 0),
+        # Ни одного подтверждённого: в этот счётчик попадают и блоки, которые
+        # не отправлялись, поэтому таблицы считаются пустыми.
+        ({"blocks_unconfirmed": 1}, 2),
+        ({"blocks_unconfirmed": 7}, 2),
+    ],
+)
+def test_tables_are_dropped_until_a_block_is_confirmed(
+    stats_kwargs: dict[str, int], want_drops: int
+) -> None:
+    from csv_click.load_stats import LoadStats
+
+    client = _RecordingClient()
+
+    app._handle_tables_after_failed_load(
+        client,
+        ClickHouseConfig(database="sandbox", cluster="clickhouse"),
+        "orders",
+        lambda _line: None,
+        LoadStats(**stats_kwargs),
+    )
+
+    assert len(client.queries) == want_drops
+
+
+def test_kept_tables_message_names_both_tables_and_what_is_inside() -> None:
+    from csv_click.load_stats import LoadStats
+
+    lines: list[str] = []
+
+    app._handle_tables_after_failed_load(
+        _RecordingClient(),
+        ClickHouseConfig(database="sandbox", cluster="clickhouse"),
+        "orders",
+        lines.append,
+        LoadStats(rows=4_000, blocks=2),
+    )
+
+    message = "\n".join(lines)
+    assert "sandbox.orders" in message
+    assert "sandbox.orders_local" in message
+    assert "4000 rows" in message
+    assert "2 confirmed" in message
+
+
+def test_dropping_after_unconfirmed_blocks_names_the_tradeoff() -> None:
+    """Удаляя пару, надо сказать: долетевший блок ушёл вместе с ней.
+
+    Сообщение не должно утверждать, что сервер не ответил: драйвер бросает один
+    и тот же `OperationalError` и на отказ, и на обрыв, а `blocks_unconfirmed`
+    считает ещё и блоки, которые не отправлялись.
+    """
+    from csv_click.load_stats import LoadStats
+
+    lines: list[str] = []
+
+    app._handle_tables_after_failed_load(
+        _RecordingClient(),
+        ClickHouseConfig(database="sandbox", cluster="clickhouse"),
+        "orders",
+        lines.append,
+        LoadStats(blocks_unconfirmed=1),
+    )
+
+    message = "\n".join(lines)
+    assert "0 rows" not in message
+    assert "got no answer from the server" not in message
+    assert "reload from the start" in message
 
 
 def test_a_stripped_summary_header_is_reported_instead_of_a_zero_server_share(
