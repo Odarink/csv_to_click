@@ -40,12 +40,14 @@ def test_streamlit_widget_keys_are_not_reused_for_custom_session_state() -> None
 
 
 def test_main_renders_csv_mapping_types_before_database_settings() -> None:
+    """Поток шагов живёт в `_render_load_flow`: `main` оборачивает его, чтобы
+    строка пути заполнялась ПОСЛЕ блоков, которые меняют состояние."""
     source = Path("src/csv_click/app.py").read_text(encoding="utf-8")
     tree = ast.parse(source)
     main_func = next(
         node
         for node in tree.body
-        if isinstance(node, ast.FunctionDef) and node.name == "main"
+        if isinstance(node, ast.FunctionDef) and node.name == "_render_load_flow"
     )
 
     calls = [
@@ -416,8 +418,10 @@ def test_create_and_load_persists_the_run_record_even_when_the_load_fails() -> N
 
 def test_create_and_load_passes_load_workers_to_loader() -> None:
     source = Path("src/csv_click/app.py").read_text(encoding="utf-8")
+    # Поток шагов - в `_render_load_flow`; `main` теперь только обёртка вокруг
+    # него ради строки пути, которая заполняется после блоков.
     main_match = re.search(
-        r"def main\(.*?\n(?=def _)",
+        r"def _render_load_flow\(.*?\n(?=def _)",
         source,
         flags=re.DOTALL,
     )
