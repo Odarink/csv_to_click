@@ -387,6 +387,121 @@ def test_date_type_holds_the_dates_in_the_column(
     )
 
 
+@pytest.mark.parametrize(
+    ("value", "want_type"),
+    [
+        # Обычные числа тип не меняют.
+        ("42", "UInt64"),
+        ("-7", "Int64"),
+        # Ровно границы 64 бит.
+        ("18446744073709551615", "UInt64"),
+        ("-9223372036854775808", "Int64"),
+        # На единицу дальше - и уже не влезает.
+        ("18446744073709551616", "Decimal(38, 0)"),
+        ("-9223372036854775809", "Decimal(38, 0)"),
+        ("9" * 20, "Decimal(38, 0)"),
+        ("9" * 38, "Decimal(38, 0)"),
+        # Шире 38 цифр держит только Decimal256.
+        ("9" * 39, "Decimal(76, 0)"),
+        ("-" + "9" * 76, "Decimal(76, 0)"),
+        # Ровно на границах. `Decimal(38, 0)` держит |x| < 10**38, поэтому само
+        # 10**38 в него уже не влезает - ни с плюсом, ни с минусом.
+        ("1" + "0" * 38, "Decimal(76, 0)"),
+        ("-1" + "0" * 38, "Decimal(76, 0)"),
+        ("1" + "0" * 76, "String"),
+        ("-1" + "0" * 76, "String"),
+        # Дальше не вмещает ни один числовой тип.
+        ("9" * 77, "String"),
+    ],
+)
+def test_integer_type_holds_the_value(tmp_path: Path, value: str, want_type: str) -> None:
+    """Целое вне 64 бит роняло загрузку голым `OverflowError`.
+
+    Ни имени колонки, ни значения в сообщении: это не `CsvSchemaError`, а ошибка
+    из недр pandas. Причём строгая проверка по csv-пути такое значение
+    пропускала - падал уже путь загрузки, посреди файла.
+    """
+    from csv_click.pandas_loader import (
+        ReadOptions,
+        schema_to_mappings,
+        validate_csv_with_pandas_chunks,
+    )
+
+    csv_path = write_csv(tmp_path / "ints.csv", f"n\n1\n{value}\n")
+
+    schema = analyze_csv_schema(csv_path)
+
+    assert schema.columns[0].final_type == want_type
+    validate_csv_with_pandas_chunks(
+        csv_path, ReadOptions(batch_size=10), schema_to_mappings(schema)
+    )
+
+
+def test_type_choice_does_not_depend_on_the_decimal_context(tmp_path: Path) -> None:
+    """Границы типов не должны зависеть от точности контекста `decimal`.
+
+    Считанные как `Decimal(10) ** 38 - 1`, они молча округлялись до 10**38:
+    контексту по умолчанию хватает 28 значащих цифр, а результату нужно 38.
+    Колонка с 39-значным числом получала `Decimal(38, 0)`, который держит 38.
+    Контекст - глобальная настройка процесса, и менять её может кто угодно.
+    """
+    import decimal
+
+    csv_path = write_csv(tmp_path / "boundary.csv", "n\n1\n" + "1" + "0" * 38 + "\n")
+
+    with decimal.localcontext() as ctx:
+        ctx.prec = 5
+        schema = analyze_csv_schema(csv_path)
+
+    assert schema.columns[0].final_type == "Decimal(76, 0)"
+
+
+def test_integer_bounds_come_from_the_whole_column_not_the_last_row(tmp_path: Path) -> None:
+    """Границы накапливаются: выходящее значение может стоять где угодно."""
+    csv_path = write_csv(tmp_path / "unordered_ints.csv", "n\n" + "9" * 20 + "\n1\n2\n")
+
+    schema = analyze_csv_schema(csv_path)
+
+    assert schema.columns[0].final_type == "Decimal(38, 0)"
+
+
+def test_negative_bound_from_the_first_row_still_widens(tmp_path: Path) -> None:
+    csv_path = write_csv(tmp_path / "negative_first.csv", "n\n-9223372036854775809\n1\n")
+
+    schema = analyze_csv_schema(csv_path)
+
+    assert schema.columns[0].final_type == "Decimal(38, 0)"
+
+
+def test_a_widened_integer_reaches_the_wire_exactly(tmp_path: Path) -> None:
+    """Расширение бессмысленно, если значение всё равно портится по пути."""
+    from csv_click.pandas_loader import (
+        chunk_to_json_lines,
+        convert_chunk_to_schema,
+        schema_to_mappings,
+    )
+
+    huge = "9" * 30
+    csv_path = write_csv(tmp_path / "huge_ints.csv", f"n\n1\n{huge}\n")
+    schema = analyze_csv_schema(csv_path)
+
+    chunk = pd.DataFrame({"n": ["1", huge]}, dtype="object")
+    payload = chunk_to_json_lines(
+        convert_chunk_to_schema(chunk, schema_to_mappings(schema), 1), ["n"]
+    ).decode()
+
+    assert huge in payload, payload
+
+
+def test_widened_integer_column_says_why_in_notes(tmp_path: Path) -> None:
+    csv_path = write_csv(tmp_path / "wide_int.csv", "n\n1\n" + "9" * 20 + "\n")
+
+    schema = analyze_csv_schema(csv_path)
+
+    notes = schema.columns[0].notes.lower()
+    assert "uint64" in notes, notes
+
+
 @pytest.mark.parametrize("date_type", ["Date", "Date32"])
 def test_date_types_refuse_a_value_that_is_not_a_date(date_type: str) -> None:
     """Каждый тип из выпадающего списка обязан проверять значения.

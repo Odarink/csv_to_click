@@ -36,6 +36,8 @@ CLICKHOUSE_TYPE_OPTIONS = [
     "Int64",
     "UInt64",
     "Float64",
+    "Decimal(38, 0)",
+    "Decimal(76, 0)",
     "Decimal(18, 2)",
     "Decimal(38, 2)",
     "Decimal(76, 2)",
@@ -49,6 +51,8 @@ CLICKHOUSE_TYPE_OPTIONS = [
     "Nullable(Int64)",
     "Nullable(UInt64)",
     "Nullable(Float64)",
+    "Nullable(Decimal(38, 0))",
+    "Nullable(Decimal(76, 0))",
     "Nullable(Decimal(18, 2))",
     "Nullable(Decimal(38, 2))",
     "Nullable(Decimal(76, 2))",
@@ -166,6 +170,11 @@ class _ColumnStats:
     #: В отметке времени был офсет пояса. Путь загрузки разбирает жёсткий формат
     #: без зоны, поэтому наивный `DateTime` такой колонке не годится.
     has_timezone_offset: bool = False
+    #: Границы целых значений колонки. Нужны точные величины, а не длина: в 20
+    #: цифр `UInt64` попадает лишь частично, и число вне диапазона роняло
+    #: загрузку `OverflowError` из недр pandas.
+    min_integer: Decimal | None = None
+    max_integer: Decimal | None = None
     sample_values: list[str] | None = None
 
     def add_value(self, value: str) -> None:
@@ -224,9 +233,15 @@ class _ColumnStats:
             # нечего: на текстовой колонке это снимает вызов с каждого значения.
             self.has_lossy_numeric_text = _loses_text_as_number(raw)
         if decimal_shape is not None:
-            int_digits, decimal_scale = decimal_shape
+            int_digits, decimal_scale, parsed = decimal_shape
             self.max_decimal_scale = max(self.max_decimal_scale, decimal_scale)
             self.max_decimal_int_digits = max(self.max_decimal_int_digits, int_digits)
+            if decimal_scale == 0:
+                # Границы целых берутся из ТОГО ЖЕ разбора: числовые ветки должны
+                # знать не только длину значения, но и само значение - границы
+                # `UInt64` и `Int64` на круглое число цифр не попадают.
+                self.min_integer = parsed if self.min_integer is None else min(self.min_integer, parsed)
+                self.max_integer = parsed if self.max_integer is None else max(self.max_integer, parsed)
 
 
 def normalize_identifier(value: str) -> str:
@@ -436,9 +451,9 @@ def _infer_type(stats: _ColumnStats) -> tuple[str, str]:
         # начинается с ведущего нуля, но её разбор ничего не теряет.
         return "String", "Leading zeros, a plus sign or non-ASCII digits would be lost; fallback to String"
     if stats.all_uint:
-        return "UInt64", ""
+        return _integer_type(stats, "UInt64", UINT64_RANGE)
     if stats.all_int:
-        return "Int64", ""
+        return _integer_type(stats, "Int64", INT64_RANGE)
     if stats.all_decimal:
         if stats.max_decimal_scale <= 2:
             return _decimal_type(stats, scale=2, widths=(18, 38, 76))
@@ -467,6 +482,55 @@ def _infer_type(stats: _ColumnStats) -> tuple[str, str]:
 #: `date`, у которого границы свои.
 DATE_RANGE: tuple[date, date] = (date(1970, 1, 1), date(2149, 6, 6))
 DATE32_RANGE: tuple[date, date] = (date(1900, 1, 1), date(2299, 12, 31))
+
+#: Границы целых типов. У Python целые неограниченные, поэтому и инференс, и
+#: строгая проверка пропускали значение, на котором загрузка потом падала
+#: `OverflowError` из недр pandas - без имени колонки и без самого значения.
+#:
+#: Именно `int`, а не `Decimal`: арифметика и даже унарный минус в `decimal`
+#: идут через контекст, которому по умолчанию хватает 28 значащих цифр. Границы
+#: `Decimal` считались как `Decimal(10) ** 38 - 1` и молча округлялись до
+#: 10**38, так что 39-значное число получало тип на 38 разрядов. Сравнение
+#: `Decimal` с `int` точное и от контекста не зависит.
+UINT64_RANGE: tuple[int, int] = (0, 2**64 - 1)
+INT64_RANGE: tuple[int, int] = (-(2**63), 2**63 - 1)
+#: Ширины `Decimal`, которыми целое можно догнать: Decimal128 и Decimal256.
+#: Дробной части нет, поэтому вся точность уходит под цифры.
+INTEGER_DECIMAL_WIDTHS: tuple[int, ...] = (38, 76)
+
+
+def _integer_type(
+    stats: _ColumnStats,
+    native_type: str,
+    native_range: tuple[int, int],
+) -> tuple[str, str]:
+    """`UInt64`/`Int64`, а если значения не влезают - `Decimal` без дробной части.
+
+    Ширина растёт только при необходимости: колонка, которой хватало 64 бит,
+    остаётся тем же типом. Дальше идут Decimal128 и Decimal256, потому что их
+    ветка в конвертере уже есть и значение доезжает точной строкой. Свыше 76
+    цифр числового типа не существует, и колонка становится текстом - потерять
+    точность молча хуже, чем получить неудобный тип.
+    """
+    if stats.min_integer is None or stats.max_integer is None:
+        return native_type, ""
+    low, high = native_range
+    if low <= stats.min_integer and stats.max_integer <= high:
+        return native_type, ""
+    for precision in INTEGER_DECIMAL_WIDTHS:
+        # Целочисленная арифметика: `Decimal(10) ** precision - 1` округлялся
+        # контекстом до 10**precision, и тип оказывался на разряд уже значения.
+        limit = 10**precision - 1
+        if -limit <= stats.min_integer and stats.max_integer <= limit:
+            return f"Decimal({precision}, 0)", (
+                f"Values from {stats.min_integer} to {stats.max_integer} do not fit "
+                f"{native_type}; widened to Decimal({precision}, 0)"
+            )
+    return "String", (
+        f"Values from {stats.min_integer} to {stats.max_integer} exceed the "
+        f"{INTEGER_DECIMAL_WIDTHS[-1]} digits any ClickHouse number holds; "
+        f"fallback to String to keep them exact ({native_type} would overflow)"
+    )
 
 
 def _date_type(stats: _ColumnStats) -> tuple[str, str]:
@@ -596,8 +660,8 @@ def _loses_text_as_number(value: str) -> bool:
     return len(digits) > 1 and digits[0] == "0" and digits[1].isdigit()
 
 
-def _decimal_shape(value: str) -> tuple[int, int] | None:
-    """``(цифр в целой части, знаков после запятой)`` или ``None`` - не Decimal.
+def _decimal_shape(value: str) -> tuple[int, int, Decimal] | None:
+    """``(цифр в целой части, знаков после запятой, значение)`` или ``None``.
 
     Обе величины из ОДНОГО разбора: инференс зовёт эту функцию на каждое
     значение файла, и второй `Decimal()` стоил бы ровно столько же, сколько
@@ -622,8 +686,8 @@ def _decimal_shape(value: str) -> tuple[int, int] | None:
         # `0E+30` отчитывался о 31 цифре: одна такая ячейка расширяла тип целой
         # колонки, а `0E+79` уводил её в String. Ноль не занимает разрядов, и
         # такую запись даёт обычное вычитание равных Decimal.
-        return 0, scale
-    return max(parsed.adjusted() + 1, 0), scale
+        return 0, scale, parsed
+    return max(parsed.adjusted() + 1, 0), scale, parsed
 
 
 def _float_kind(value: str) -> str | None:
