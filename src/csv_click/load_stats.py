@@ -98,6 +98,11 @@ class LoadStats:
     blocks: int = 0
     blocks_without_server_time: int = 0
     src_bytes: int = 0
+    #: Сколько байт файла-источника уже прочитано продюсером. Вместе с
+    #: ``src_bytes`` даёт прогресс на файле любого размера: общее число строк
+    #: большого CSV неизвестно, а размер в байтах известен всегда. Чтение
+    #: опережает вставку на блоки в полёте и упреждающий буфер pandas.
+    src_read_bytes: int = 0
     raw_bytes: int = 0
     wire_bytes: int = 0
     read_s: float = 0.0

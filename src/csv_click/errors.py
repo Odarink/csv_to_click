@@ -25,3 +25,7 @@ class CsvLoadError(CsvClickError):
 class CsvReadCancelled(CsvClickError):
     """Raised when the user stops CSV schema reading."""
 
+
+class CsvLoadCancelled(CsvClickError):
+    """Raised when the operator cancels a running load."""
+
