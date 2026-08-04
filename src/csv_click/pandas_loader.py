@@ -970,11 +970,12 @@ def load_csv_via_raw_insert(
     загрузка упадёт на середине: исключение уносит возвращаемое значение, но не
     переданный объект.
 
-    ``cancel_callback`` опрашивается между чанками и перед каждым блоком —
-    тот же контракт, что у :func:`analyze_csv_with_pandas_chunks`. Ответ
-    ``True`` поднимает :class:`CsvLoadCancelled`; блоки, уже отданные воркерам,
-    дорабатывают и попадают либо в подтверждённые, либо в
-    ``blocks_unconfirmed`` — новые на сервер не уходят.
+    ``cancel_callback`` опрашивается перед каждым блоком (первый блок нового
+    чанка покрывает и границу чанков) — контракт как у
+    :func:`analyze_csv_with_pandas_chunks`. Ответ ``True`` поднимает
+    :class:`CsvLoadCancelled`; блоки, уже отданные воркерам, дорабатывают и
+    попадают либо в подтверждённые, либо в ``blocks_unconfirmed`` — новые на
+    сервер не уходят.
     """
     if worker_count <= 0:
         raise ValueError("worker_count must be positive")
@@ -1015,7 +1016,6 @@ def load_csv_via_raw_insert(
         )
     )
     for chunk_number, (chunk, read_s) in enumerate(chunks, start=1):
-        _raise_if_load_cancelled(cancel_callback)
         stats.read_s += read_s
         convert_started = time.perf_counter()
         converted = convert_chunk_to_schema(chunk, mappings, chunk_number)
@@ -1231,7 +1231,6 @@ def _load_csv_via_raw_insert_parallel(
                 )
             )
             for chunk_number, (chunk, read_s) in enumerate(chunks, start=1):
-                _raise_if_load_cancelled(cancel_callback)
                 stats.read_s += read_s
                 convert_started = time.perf_counter()
                 converted = convert_chunk_to_schema(chunk, mappings, chunk_number)
@@ -1309,11 +1308,13 @@ def _note_read_bytes(stats: LoadStats) -> Callable[[int], None]:
 
 
 def _raise_if_load_cancelled(cancel_callback: Callable[[], bool] | None) -> None:
-    """Проверка отмены между чанками и перед каждым блоком.
+    """Проверка отмены перед каждым блоком.
 
-    Хвост НЕ проверяется намеренно: когда файл дочитан и все блоки отданы
-    воркерам, отменять уже нечего — гашение только подождало бы те же вставки
-    и записало доехавшие блоки в неподтверждённые.
+    Отдельной проверки на границе чанков нет намеренно: первый блок нового
+    чанка проходит эту же, а мутация, убиравшая границу чанков, выживала —
+    поведение неотличимо. Хвост тоже не проверяется: когда файл дочитан и все
+    блоки отданы воркерам, гашение только подождало бы те же вставки и
+    записало доехавшие блоки в неподтверждённые.
     """
     if cancel_callback and cancel_callback():
         raise CsvLoadCancelled("The load was cancelled by the operator")

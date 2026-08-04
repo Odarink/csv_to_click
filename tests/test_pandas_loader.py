@@ -1421,16 +1421,49 @@ def test_cancel_before_the_first_block_sends_nothing(tmp_path: Path) -> None:
     assert stats.source_fully_read is False
 
 
-def test_cancel_mid_file_on_the_parallel_path_counts_confirmed_and_cancelled(tmp_path: Path) -> None:
-    """Отмена на пути с воркерами — том, которым грузит оператор.
+def test_cancel_between_blocks_of_a_single_chunk(tmp_path: Path) -> None:
+    """Отмена обязана срабатывать и ВНУТРИ чанка, между его блоками.
 
-    Блоки, которые сервер успел подтвердить, засчитываются; не отправленные
-    гасятся и попадают в blocks_unconfirmed — иначе запись о прогоне утверждала
-    бы, что отправлено всё прочитанное. Вставка намеренно медленная, чтобы к
-    моменту отмены в очереди пула гарантированно лежали неначатые блоки.
+    Рабочий профиль — batch 500 тыс. строк, из одного чанка выходит несколько
+    блоков по лимиту payload. Проверка только на границе чанков дочитала бы
+    чанк до конца и на однофайловом чанке вернулась бы успехом вместо отмены.
     """
-    csv_path = tmp_path / "cancel_parallel.csv"
-    csv_path.write_text("ID\n" + "".join(f"{index}\n" for index in range(10)), encoding="utf_8")
+    csv_path = tmp_path / "cancel_single_chunk.csv"
+    csv_path.write_text("ID\n" + "".join(f"{index}\n" for index in range(8)), encoding="utf_8")
+    mappings = [SchemaMapping("ID", "ID", True, "UInt64", False)]
+    stats = LoadStats()
+    client = FakeRawClient()
+    cancelled = False
+
+    def cancel_on_first_block(block) -> None:
+        nonlocal cancelled
+        cancelled = True
+
+    with pytest.raises(CsvLoadCancelled):
+        load_csv_via_raw_insert(
+            client=client,
+            csv_path=csv_path,
+            # Один чанк на весь файл; лимит в 10 байт (строка `{"ID":0}` — 8)
+            # заставляет резать его на блок в одну строку.
+            read_options=ReadOptions(batch_size=100),
+            max_insert_payload_bytes=10,
+            database="sandbox",
+            table="target_table",
+            mappings=mappings,
+            worker_count=1,
+            progress_callback=cancel_on_first_block,
+            cancel_callback=lambda: cancelled,
+            stats=stats,
+        )
+
+    assert stats.blocks == 1
+    assert len(client.calls) == 1
+    assert stats.source_fully_read is False
+
+
+def test_cancel_between_blocks_of_a_single_chunk_on_the_parallel_path(tmp_path: Path) -> None:
+    csv_path = tmp_path / "cancel_single_chunk_parallel.csv"
+    csv_path.write_text("ID\n" + "".join(f"{index}\n" for index in range(8)), encoding="utf_8")
     mappings = [SchemaMapping("ID", "ID", True, "UInt64", False)]
     stats = LoadStats()
     cancelled = False
@@ -1448,7 +1481,8 @@ def test_cancel_mid_file_on_the_parallel_path_counts_confirmed_and_cancelled(tmp
         load_csv_via_raw_insert(
             client=FakeRawClient(),
             csv_path=csv_path,
-            read_options=ReadOptions(batch_size=1),
+            read_options=ReadOptions(batch_size=100),
+            max_insert_payload_bytes=10,
             database="sandbox",
             table="target_table",
             mappings=mappings,
@@ -1460,7 +1494,56 @@ def test_cancel_mid_file_on_the_parallel_path_counts_confirmed_and_cancelled(tmp
         )
 
     assert stats.source_fully_read is False
-    assert stats.blocks >= 1, "подтверждённые блоки потеряны при отмене"
-    assert stats.rows == stats.blocks
-    assert stats.blocks_unconfirmed >= 1, "погашенные блоки не посчитаны"
-    assert stats.blocks + stats.blocks_unconfirmed < 10, "отмена не остановила чтение файла"
+    assert stats.blocks + stats.blocks_unconfirmed < 8, "отмена не остановила нарезку чанка"
+
+
+def test_cancel_mid_file_on_the_parallel_path_counts_confirmed_and_cancelled(tmp_path: Path) -> None:
+    """Отмена на пути с воркерами — том, которым грузит оператор.
+
+    Блоки, которые сервер успел подтвердить, засчитываются; не отправленные
+    гасятся и попадают в blocks_unconfirmed — иначе запись о прогоне утверждала
+    бы, что отправлено всё прочитанное.
+
+    Отмена взводится СЧЁТЧИКОМ проверок, а не progress_callback: колбэк требует
+    завершённого блока, а к тому моменту освободившиеся воркеры мгновенно
+    разбирают очередь, и отменять уже нечего — тест зависел от того, вернёт ли
+    `wait(FIRST_COMPLETED)` один блок или оба сразу. Долгая вставка держит обоих
+    воркеров занятыми: к четвёртой проверке в очереди лежит ровно один
+    неначатый блок, и исход детерминирован.
+    """
+    csv_path = tmp_path / "cancel_parallel.csv"
+    csv_path.write_text("ID\n" + "".join(f"{index}\n" for index in range(10)), encoding="utf_8")
+    mappings = [SchemaMapping("ID", "ID", True, "UInt64", False)]
+    stats = LoadStats()
+    checks = 0
+
+    class SlowClient(FakeRawClient):
+        def raw_insert(self, **kwargs):
+            time.sleep(0.5)
+            return super().raw_insert(**kwargs)
+
+    def cancel_from_the_fourth_check() -> bool:
+        nonlocal checks
+        checks += 1
+        return checks >= 4
+
+    with pytest.raises(CsvLoadCancelled):
+        load_csv_via_raw_insert(
+            client=FakeRawClient(),
+            csv_path=csv_path,
+            read_options=ReadOptions(batch_size=1),
+            database="sandbox",
+            table="target_table",
+            mappings=mappings,
+            worker_count=2,
+            client_factory=SlowClient,
+            cancel_callback=cancel_from_the_fourth_check,
+            stats=stats,
+        )
+
+    assert stats.source_fully_read is False
+    # Блоки 1 и 2 в момент отмены уже в воркерах: cancel_pending дожидается их
+    # и засчитывает; блок 3 не начат — гасится и попадает в неподтверждённые.
+    assert stats.blocks == 2, "подтверждённые блоки потеряны при отмене"
+    assert stats.rows == 2
+    assert stats.blocks_unconfirmed == 1, "погашенный блок не посчитан"

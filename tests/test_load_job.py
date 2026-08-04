@@ -345,6 +345,71 @@ def test_registry_holds_one_running_job_per_process(job_environment, monkeypatch
     assert current_load_job() is second
 
 
+def test_cancel_during_preflight_stops_before_connect(job_environment, monkeypatch) -> None:
+    """Отмена срабатывает на границе фаз: полная строгая проверка файла до
+    50 МБ занимает время, и отменивший не должен ждать connect и DDL."""
+    connected: list[object] = []
+    holder: dict[str, LoadJob] = {}
+
+    def cancels_during_validation(*args, **kwargs):
+        holder["job"].request_cancel()
+        return 3
+
+    monkeypatch.setattr(load_job, "validate_csv_with_pandas_chunks", cancels_during_validation)
+    job = job_environment.make_job(FakeRawClient())
+    holder["job"] = job
+    monkeypatch.setattr(load_job, "get_client", lambda config: connected.append(config))
+
+    job.run()
+
+    assert job.outcome == "cancelled"
+    assert connected == [], "после отмены в preflight не должно быть connect"
+    assert job.tables_fate == TABLES_NOT_CREATED
+
+
+def test_cancel_during_connect_stops_before_ddl(job_environment, monkeypatch) -> None:
+    created: list[dict] = []
+    holder: dict[str, LoadJob] = {}
+
+    def cancels_during_connect(client):
+        holder["job"].request_cancel()
+
+    monkeypatch.setattr(load_job, "test_connection", cancels_during_connect)
+    monkeypatch.setattr(load_job, "create_tables", lambda **kwargs: created.append(kwargs))
+    job = job_environment.make_job(FakeRawClient())
+    holder["job"] = job
+
+    job.run()
+
+    assert job.outcome == "cancelled"
+    assert created == [], "после отмены на connect таблицы не должны создаваться"
+    assert job.tables_fate == TABLES_NOT_CREATED
+
+
+def test_cancel_during_ddl_drops_the_created_tables_and_never_loads(
+    job_environment, monkeypatch
+) -> None:
+    loaded: list[dict] = []
+    holder: dict[str, LoadJob] = {}
+
+    def cancels_during_ddl(**kwargs):
+        holder["job"].request_cancel()
+
+    monkeypatch.setattr(load_job, "create_tables", cancels_during_ddl)
+    monkeypatch.setattr(
+        load_job, "load_csv_via_raw_insert", lambda **kwargs: loaded.append(kwargs)
+    )
+    job = job_environment.make_job(FakeRawClient())
+    holder["job"] = job
+
+    job.run()
+
+    assert job.outcome == "cancelled"
+    assert loaded == [], "после отмены на DDL загрузка не должна начинаться"
+    assert job.tables_fate == TABLES_DROPPED_AS_EMPTY
+    assert len(job_environment.dropped) == 1
+
+
 # --- поведение, переехавшее из test_create_and_load.py -------------------------------
 
 
