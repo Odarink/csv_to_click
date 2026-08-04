@@ -553,20 +553,34 @@ def write_run_record(
     csv_path: Path,
     outcome: str,
     timestamp: datetime,
+    tables: dict[str, object],
     error: str | None = None,
     directory: Path = DEFAULT_RUN_LOG_DIR,
 ) -> Path:
-    """Сохраняет конфигурацию и счётчики прогона в файл и возвращает путь."""
+    """Сохраняет конфигурацию и счётчики прогона в файл и возвращает путь.
+
+    ``tables`` — оба имени и судьба таблиц (``fate``): после ``514466c`` сбой
+    оставляет либо удалённые, либо оставленные с данными таблицы, и оператор из
+    присланного файла обязан их различать. Параметр без умолчания намеренно:
+    запись без судьбы таблиц — ровно та немота, которую этот блок закрывает.
+    """
     directory.mkdir(parents=True, exist_ok=True)
 
     stats_record = asdict(stats)
     stats_record["server_share"] = stats.server_share
+    # Производные приборы пишутся готовыми: server_share при нескольких
+    # воркерах всегда null, и эти два приходилось считать вручную. None там,
+    # где считать нельзя, — это НЕ ноль, см. докстринги свойств.
+    stats_record["worker_occupancy"] = stats.worker_occupancy
+    stats_record["server_share_of_insert"] = stats.server_share_of_insert
+    stats_record["producer_unattributed_s"] = stats.producer_unattributed_s
     record = {
         "outcome": outcome,
         "error": error,
         "finished_at": timestamp.isoformat(),
         "platform": platform.platform(),
         "config": asdict(config),
+        "tables": tables,
         "stats": stats_record,
         "source": describe_source_file(csv_path),
         "libraries": library_versions(),

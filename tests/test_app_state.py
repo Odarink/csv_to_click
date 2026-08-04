@@ -77,51 +77,60 @@ def test_connection_form_no_longer_collects_csv_path_or_read_options() -> None:
     assert '"Encoding"' not in form_source
 
 
-def test_create_and_load_uses_confirmed_type_rows_for_mappings() -> None:
+def test_start_load_uses_confirmed_type_rows_for_mappings() -> None:
     source = Path("src/csv_click/app.py").read_text(encoding="utf-8")
     match = re.search(
-        r"def _create_and_load\(.*?\n(?=if __name__)",
+        r"def _start_load\(.*?\n(?=def _)",
         source,
         flags=re.DOTALL,
     )
 
     assert match is not None
-    create_and_load_source = match.group(0)
-    assert 'st.session_state["type_rows"]' in create_and_load_source
-    assert 'st.session_state["schema_rows"]' not in create_and_load_source
+    start_load_source = match.group(0)
+    assert 'st.session_state["type_rows"]' in start_load_source
+    assert 'st.session_state["schema_rows"]' not in start_load_source
 
 
-def test_create_and_load_renders_progress_and_accumulated_log() -> None:
+def test_running_load_renders_progress_from_the_job() -> None:
+    """Интерфейс ЧИТАЕТ задачу по таймеру, а не загрузка пишет в интерфейс:
+    RerunException из st.* не должен уметь дотянуться до продюсера."""
     source = Path("src/csv_click/app.py").read_text(encoding="utf-8")
     match = re.search(
-        r"def _create_and_load\(.*?\n(?=if __name__)",
+        r"def _render_running_load\(.*?\n(?=def _)",
         source,
         flags=re.DOTALL,
     )
 
     assert match is not None
-    create_and_load_source = match.group(0)
-    assert "st.progress(0)" in create_and_load_source
-    assert "log_container = st.empty()" in create_and_load_source
-    assert "_append_load_log" in create_and_load_source
-    assert "_render_load_log" in create_and_load_source
+    running_source = match.group(0)
+    assert "st.fragment(run_every=LOAD_PROGRESS_POLL_S)" in running_source
+    assert "load_progress_line(" in running_source
+    assert "st.progress(" in running_source
+    assert '"Cancel load"' in running_source
+    assert "request_cancel()" in running_source
+    assert "_render_load_log" in running_source
 
 
-def test_create_and_load_rechecks_effective_encoding_before_insert() -> None:
-    source = Path("src/csv_click/app.py").read_text(encoding="utf-8")
+def test_start_load_rechecks_effective_encoding_before_the_job() -> None:
+    """Подбор кодировки остаётся на потоке скрипта: он пишет в session_state,
+    которого у фонового потока нет. Валидация типов уезжает в задачу."""
+    app_source = Path("src/csv_click/app.py").read_text(encoding="utf-8")
     match = re.search(
-        r"def _create_and_load\(.*?\n(?=if __name__)",
-        source,
+        r"def _start_load\(.*?\n(?=def _)",
+        app_source,
         flags=re.DOTALL,
     )
 
     assert match is not None
-    create_and_load_source = match.group(0)
-    assert "choose_read_options_for_preview" in create_and_load_source
-    assert "effective_read_options" in create_and_load_source
-    assert "validate_csv_with_pandas_chunks(" in create_and_load_source
-    assert "max_insert_payload_bytes = _effective_insert_payload_bytes(max_insert_payload_mb)" in create_and_load_source
-    assert "read_options=effective_read_options" in create_and_load_source
+    start_load_source = match.group(0)
+    assert "choose_read_options_for_preview" in start_load_source
+    assert "effective_read_options" in start_load_source
+    assert 'st.session_state["csv_read_options"] = effective_read_options' in start_load_source
+    assert "read_options=effective_read_options" in start_load_source
+
+    job_source = Path("src/csv_click/load_job.py").read_text(encoding="utf-8")
+    assert "validate_csv_with_pandas_chunks(" in job_source
+    assert "choose_read_options_for_preview" not in job_source
 
 
 def test_connection_form_uses_persisted_settings_and_no_table_specific_defaults() -> None:
@@ -322,143 +331,116 @@ def test_analyze_csv_uses_sample_inference_unless_full_scan_is_selected() -> Non
     assert "cancel_callback=_csv_read_cancel_requested" in analyze_source
 
 
-def test_create_and_load_passes_max_insert_payload_to_loader() -> None:
-    source = Path("src/csv_click/app.py").read_text(encoding="utf-8")
+def _load_job_run_source() -> str:
+    """Тело LoadJob.run() до реестра: сюда переехала бывшая _create_and_load."""
+    source = Path("src/csv_click/load_job.py").read_text(encoding="utf-8")
     match = re.search(
-        r"def _create_and_load\(.*?\n(?=if __name__)",
+        r"def run\(self\) -> None:.*?\n(?=# --- реестр)",
         source,
         flags=re.DOTALL,
     )
-
     assert match is not None
-    create_and_load_source = match.group(0)
-    assert "max_insert_payload_mb: int" in create_and_load_source
-    assert "max_insert_payload_bytes = _effective_insert_payload_bytes(max_insert_payload_mb)" in create_and_load_source
-    assert "block.wire_bytes" in create_and_load_source
+    return match.group(0)
+
+
+def test_load_job_passes_max_insert_payload_to_loader() -> None:
+    run_source = _load_job_run_source()
+    job_source = Path("src/csv_click/load_job.py").read_text(encoding="utf-8")
+    assert "_effective_insert_payload_bytes(self.max_insert_payload_mb)" in job_source
+    assert "block.wire_bytes" in job_source
 
     # Именно аргументы вызова загрузчика: тот же kwarg передаётся и в две
     # функции preflight-валидации, поэтому пин на подстроку по всей функции
     # оставался бы зелёным даже после его пропажи из вызова загрузчика.
     loader_call = re.search(
         r"load_csv_via_raw_insert\(\n(.*?)\n\s*\)\n",
-        create_and_load_source,
+        run_source,
         flags=re.DOTALL,
     )
     assert loader_call is not None
     loader_arguments = loader_call.group(1)
-    assert "max_insert_payload_bytes=max_insert_payload_bytes" in loader_arguments
-    assert "progress_callback=on_progress" in loader_arguments
+    assert "max_insert_payload_bytes=self.max_insert_payload_bytes" in loader_arguments
+    assert "progress_callback=self._on_block" in loader_arguments
     assert "stats=stats" in loader_arguments
+    # Отмена доезжает до продюсера: без этого kwarg кнопка Cancel мертва.
+    assert "cancel_callback=self._cancel.is_set" in loader_arguments
 
 
-def test_create_and_load_uses_payload_safety_headroom() -> None:
-    source = Path("src/csv_click/app.py").read_text(encoding="utf-8")
+def test_load_job_uses_payload_safety_headroom() -> None:
+    source = Path("src/csv_click/load_job.py").read_text(encoding="utf-8")
     match = re.search(
-        r"def _effective_insert_payload_bytes\(.*?\n(?=def _)",
-        source,
-        flags=re.DOTALL,
-    )
-    create_match = re.search(
-        r"def _create_and_load\(.*?\n(?=if __name__)",
+        r"def _effective_insert_payload_bytes\(.*?\n(?=def )",
         source,
         flags=re.DOTALL,
     )
 
     assert match is not None
-    assert create_match is not None
     helper_source = match.group(0)
-    create_and_load_source = create_match.group(0)
+    run_source = _load_job_run_source()
     assert "INSERT_PAYLOAD_SAFETY_RATIO = 0.9" in source
     assert "max_insert_payload_mb * 1024 * 1024" in helper_source
     assert "INSERT_PAYLOAD_SAFETY_RATIO" in helper_source
-    assert "Effective insert payload limit" in create_and_load_source
-    assert "Load settings: batch size" in create_and_load_source
+    assert "Effective insert payload limit" in run_source
+    assert "Load settings: batch size" in run_source
 
 
-def test_create_and_load_times_preflight_connect_ddl_and_insert_separately() -> None:
-    source = Path("src/csv_click/app.py").read_text(encoding="utf-8")
-    match = re.search(
-        r"def _create_and_load\(.*?\n(?=if __name__)",
-        source,
-        flags=re.DOTALL,
-    )
-
-    assert match is not None
-    create_and_load_source = match.group(0)
-    assert "stats.preflight_s = " in create_and_load_source
-    assert "stats.connect_s = " in create_and_load_source
-    assert "stats.ddl_s = " in create_and_load_source
-    assert "stats.insert_wall_s = time.perf_counter() - insert_started" in create_and_load_source
-    assert "stats.driver_retries = driver_retries.count" in create_and_load_source
+def test_load_job_times_preflight_connect_ddl_and_insert_separately() -> None:
+    run_source = _load_job_run_source()
+    assert "stats.preflight_s = " in run_source
+    assert "stats.connect_s = " in run_source
+    assert "stats.ddl_s = " in run_source
+    assert "stats.insert_wall_s = time.perf_counter() - insert_started" in run_source
+    assert "stats.driver_retries = driver_retries.count" in run_source
     # insert_started ставится строго перед загрузкой, иначе server % считался бы
     # от времени, в которое входят preflight, connect и DDL.
-    assert create_and_load_source.index("insert_started = time.perf_counter()") > create_and_load_source.index(
+    assert run_source.index("insert_started = time.perf_counter()") > run_source.index(
         "stats.ddl_s = "
     )
 
 
-def test_create_and_load_persists_the_run_record_even_when_the_load_fails() -> None:
+def test_load_job_persists_the_run_record_even_when_the_load_fails() -> None:
+    job_source = Path("src/csv_click/load_job.py").read_text(encoding="utf-8")
+    run_source = _load_job_run_source()
+    # Конфигурация прогона собирается в конструкторе, на потоке скрипта:
+    # запись обязана уцелеть при любом раннем падении внутри run().
+    assert "self.run_config = RunConfig(" in job_source
+    assert "write_run_record(" in run_source
+    # Запись обязана уходить из finally самого run() (отступ метода — 8
+    # пробелов, в отличие от внутреннего finally вокруг вставки): конфигурация
+    # упавшего прогона нужна именно для диагностики падения.
+    finally_index = run_source.index("\n        finally:")
+    assert run_source.index("write_run_record(") > finally_index
+
+
+def test_load_job_passes_load_workers_to_loader() -> None:
     source = Path("src/csv_click/app.py").read_text(encoding="utf-8")
-    match = re.search(
-        r"def _create_and_load\(.*?\n(?=if __name__)",
-        source,
-        flags=re.DOTALL,
-    )
-
-    assert match is not None
-    create_and_load_source = match.group(0)
-    assert "run_config = RunConfig(" in create_and_load_source
-    assert "write_run_record(" in create_and_load_source
-    # Запись обязана уходить из finally самой функции (отступ ровно 4 пробела,
-    # в отличие от внутреннего finally вокруг вставки): конфигурация упавшего
-    # прогона нужна именно для диагностики падения.
-    finally_index = create_and_load_source.index("\n    finally:")
-    assert create_and_load_source.index("write_run_record(") > finally_index
-
-
-def test_create_and_load_passes_load_workers_to_loader() -> None:
-    source = Path("src/csv_click/app.py").read_text(encoding="utf-8")
-    # Поток шагов - в `_render_load_flow`; `main` теперь только обёртка вокруг
-    # него ради строки пути, которая заполняется после блоков.
+    # Поток шагов - в `_render_load_flow`; кнопка передаёт ручки в _start_load,
+    # а тот отдаёт их задаче.
     main_match = re.search(
         r"def _render_load_flow\(.*?\n(?=def _)",
         source,
         flags=re.DOTALL,
     )
-    create_match = re.search(
-        r"def _create_and_load\(.*?\n(?=if __name__)",
-        source,
-        flags=re.DOTALL,
-    )
 
     assert main_match is not None
-    assert create_match is not None
     main_source = main_match.group(0)
-    create_and_load_source = create_match.group(0)
+    run_source = _load_job_run_source()
     assert 'load_workers=params["load_workers"]' in main_source
-    assert "load_workers: int" in create_and_load_source
-    assert "worker_count=load_workers" in create_and_load_source
-    assert "client_factory=lambda: get_client(config)" in create_and_load_source
+    assert "worker_count=self.load_workers" in run_source
+    assert "client_factory=lambda: get_client(self.config)" in run_source
 
 
-def test_create_and_load_uses_sample_validation_for_large_files() -> None:
-    source = Path("src/csv_click/app.py").read_text(encoding="utf-8")
-    match = re.search(
-        r"def _create_and_load\(.*?\n(?=if __name__)",
-        source,
-        flags=re.DOTALL,
-    )
-
-    assert match is not None
-    create_and_load_source = match.group(0)
+def test_load_job_uses_sample_validation_for_large_files() -> None:
+    source = Path("src/csv_click/load_job.py").read_text(encoding="utf-8")
+    run_source = _load_job_run_source()
     assert "LARGE_CSV_PRECHECK_THRESHOLD_BYTES = 50 * 1024 * 1024" in source
     assert "SAMPLE_PRECHECK_ROWS = 200_000" in source
-    assert "Path(csv_path).stat().st_size" in create_and_load_source
-    assert "validate_csv_with_pandas_chunks(" in create_and_load_source
-    assert "validate_csv_sample_with_pandas_chunks(" in create_and_load_source
-    assert "Strict validation finished:" in create_and_load_source
-    assert "Sample validation finished: first" in create_and_load_source
-    assert "File is larger than 50 MB; using sample validation" in create_and_load_source
+    assert "Path(self.csv_path).stat().st_size" in run_source
+    assert "validate_csv_with_pandas_chunks(" in run_source
+    assert "validate_csv_sample_with_pandas_chunks(" in run_source
+    assert "Strict validation finished:" in run_source
+    assert "Sample validation finished: first" in run_source
+    assert "File is larger than 50 MB; using sample validation" in run_source
 
 
 def test_app_renders_inline_help_for_each_ui_step() -> None:

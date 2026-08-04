@@ -2,9 +2,7 @@ from __future__ import annotations
 
 import os
 import sys
-import time
-from dataclasses import dataclass, replace
-from datetime import datetime, timezone
+from dataclasses import dataclass
 from pathlib import Path
 
 if __package__ in {None, ""}:
@@ -18,19 +16,26 @@ from csv_click.clickhouse import (
     build_create_distributed_table_sql,
     build_create_local_table_sql,
     build_table_names,
-    create_tables,
-    drop_target_tables,
     get_client,
     test_connection,
 )
 from csv_click.errors import (
     CertificateError,
     ClickHouseConnectionError,
-    CsvClickError,
     CsvReadCancelled,
     CsvSchemaError,
-    ExistingTableError,
 )
+from csv_click.load_job import (
+    TABLES_CLEANUP_FAILED,
+    TABLES_CREATED,
+    TABLES_DROPPED_AS_EMPTY,
+    TABLES_KEPT_WITH_DATA,
+    TABLES_NOT_CREATED,
+    LoadJob,
+    current_load_job,
+    start_load_job,
+)
+from csv_click.load_stats import LoadStats
 from csv_click.pandas_loader import (
     COMPRESSION_CODECS,
     DEFAULT_SCHEMA_SAMPLE_ROWS,
@@ -38,27 +43,14 @@ from csv_click.pandas_loader import (
     analyze_csv_with_pandas_sample,
     analyze_csv_with_pandas_chunks,
     choose_read_options_for_preview,
-    load_csv_via_raw_insert,
     mappings_from_editor_rows,
     mappings_to_editor_rows,
     mappings_to_schema,
     schema_to_mappings,
-    validate_csv_with_pandas_chunks,
-    validate_csv_sample_with_pandas_chunks,
 )
 from csv_click.schema import (
     CLICKHOUSE_TYPE_OPTIONS,
     CsvSchema,
-)
-from csv_click.load_stats import (
-    BlockProgress,
-    DriverRetryCounter,
-    LoadStats,
-    RunConfig,
-    arrow_pool_high_water_bytes,
-    describe_connection_path,
-    format_load_stats_lines,
-    write_run_record,
 )
 from csv_click.settings import AppSettings, load_app_settings, save_app_settings
 
@@ -159,6 +151,10 @@ def main() -> None:
     st.session_state[RENDERED_STEPS_KEY] = []
     try:
         _render_load_flow()
+        # Панель загрузки живёт ВНЕ потока шагов: после F5 session_state пуст и
+        # поток обрывается на первом шаге, а идущая в фоне заливка и итог
+        # последней обязаны остаться на экране.
+        _render_load_panel()
     finally:
         path_slot.caption(step_path_line(current_step_key()))
         _fill_step_help_slots()
@@ -185,16 +181,13 @@ CHOICE_STATE_KEYS = [
     "order_by_choice",
     "sharding_column_choice",
 ]
-LARGE_CSV_PRECHECK_THRESHOLD_BYTES = 50 * 1024 * 1024
-SAMPLE_PRECHECK_ROWS = 200_000
-INSERT_PAYLOAD_SAFETY_RATIO = 0.9
-#: Как часто прогресс загрузки трогает интерфейс. Каждый `st.*`-вызов уходит по
-#: вебсокету и способен бросить RerunException, то есть убить загрузку: на 381
-#: блоке рабочего прогона это 1143 таких вызова вместо трёх сотен.
-LOAD_UI_MIN_INTERVAL_S = 1.0
 #: Сколько последних строк лога уходит в сокет. Полный лог копится в памяти, а
 #: отправка его целиком на каждый блок и была той самой O(n²).
 LOAD_LOG_TAIL_LINES = 400
+#: Как часто фрагмент прогресса перечитывает состояние задачи. Загрузка больше
+#: не пишет в интерфейс сама — интерфейс читает её состояние по таймеру, и
+#: RerunException физически не может дотянуться до продюсера.
+LOAD_PROGRESS_POLL_S = 1.0
 
 
 def _render_load_flow() -> None:
@@ -262,7 +255,7 @@ def _render_load_flow() -> None:
         st.code(ddl_distributed, language="sql")
 
     if st.button("Create tables and load", type="primary", use_container_width=True):
-        _create_and_load(
+        _start_load(
             config=config,
             csv_path=csv_path,
             read_options=read_options,
@@ -270,7 +263,6 @@ def _render_load_flow() -> None:
             distributed_table=distributed_table,
             order_by=params["order_by"],
             partition_by=params["partition_by"],
-            batch_size=params["batch_size"],
             max_insert_payload_mb=params["max_insert_payload_mb"],
             load_workers=params["load_workers"],
             insert_compression=params["insert_compression"],
@@ -849,11 +841,6 @@ def _read_options_from_settings(settings: AppSettings) -> ReadOptions:
     )
 
 
-def _effective_insert_payload_bytes(max_insert_payload_mb: int) -> int:
-    configured_bytes = max_insert_payload_mb * 1024 * 1024
-    return max(1, int(configured_bytes * INSERT_PAYLOAD_SAFETY_RATIO))
-
-
 def _test_connection(config: ClickHouseConfig) -> None:
     try:
         client = get_client(config)
@@ -1061,10 +1048,6 @@ def _validate_mapping_rows(rows: list[dict[str, object]]) -> None:
         raise CsvSchemaError("Duplicate target column names: " + ", ".join(duplicates))
 
 
-def _append_load_log(log_messages: list[str], message: str) -> None:
-    log_messages.append(f"{time.strftime('%H:%M:%S')} {message}")
-
-
 def _render_load_log(log_container, log_messages: list[str]) -> None:
     tail = log_messages[-LOAD_LOG_TAIL_LINES:]
     hidden = len(log_messages) - len(tail)
@@ -1074,87 +1057,49 @@ def _render_load_log(log_container, log_messages: list[str]) -> None:
     log_container.code(text, language="text")
 
 
-def _format_load_error(exc: Exception) -> str:
-    message = str(exc)
-    normalized = message.lower()
-    if "unknown_table" in normalized or "does not exist" in normalized:
-        return (
-            "ClickHouse load failed during load step because the target table is not visible "
-            f"after DDL creation: {message}"
-        )
-    return f"Unexpected load error: {message}"
+def load_progress_line(stats: LoadStats) -> tuple[float, str]:
+    """Доля и подпись прогресса чтения файла.
 
-
-def _handle_tables_after_failed_load(
-    client,
-    config: ClickHouseConfig,
-    distributed_table: str,
-    log_callback,
-    stats: LoadStats,
-) -> None:
-    """Убрать за неудавшейся загрузкой - но только то, что ещё пусто.
-
-    Чистка задумана как откат создания таблиц, и она безопасна ровно до первой
-    вставки. Дальше это уничтожение работы: один транзиентный 5xx на 900-м
-    блоке из 1000 стирал всё залитое, и повторять пришлось бы с нуля.
-
-    Решение принимается по ПОДТВЕРЖДЁННЫМ блокам, и только по ним.
-    `blocks_unconfirmed` для этого не годится: туда попадают и отменённые при
-    гашении блоки, которые не отправлялись вовсе (`cancel_pending`), и упавшие
-    до отправки - на создании клиента воркера или на сжатии. Обрыв связи сразу
-    после DDL давал на параллельном пути `blocks_unconfirmed=N` при пустых
-    таблицах, и пара оставалась навсегда, хотя раньше откатывалась сама.
-    Отличить «сервер отверг» от «ответ не дошёл» тоже нельзя: драйвер бросает
-    `OperationalError` (подкласс `DatabaseError`) и на то, и на другое.
-
-    Цена решения названа честно: если единственный блок всё-таки долетел, он
-    уйдёт вместе с таблицей. Это блок из начала файла, и перезалив с нуля
-    дешевле, чем каждый раз дропать руками пустую пару после отказа кодека.
+    Доля считается по прочитанным БАЙТАМ: общее число строк большого CSV
+    неизвестно, а размер известен всегда - прежний прогресс по строкам был
+    мёртв для файлов крупнее 50 МБ. Подпись говорит явно, что это прочитано
+    из файла, а не подтверждено сервером: чтение опережает вставку на блоки
+    в полёте и упреждающий буфер pandas.
     """
-    if stats.blocks:
-        table_names = build_table_names(distributed_table)
-        what_is_inside = (
-            f"{stats.rows} rows in {stats.blocks} confirmed block(s) are already there"
-        )
-        if stats.blocks_unconfirmed:
-            what_is_inside += (
-                f", and {stats.blocks_unconfirmed} more block(s) were never confirmed, "
-                "so the real count can be higher"
-            )
-        log_callback(
-            f"Load failed and the target tables are KEPT: {what_is_inside}. "
-            f"Check {config.database}.{table_names.distributed} and drop both it and "
-            f"{config.database}.{table_names.local} yourself before reloading - the "
-            "next run refuses a name that already exists."
-        )
-        return
-    if stats.blocks_unconfirmed:
-        log_callback(
-            f"{stats.blocks_unconfirmed} block(s) never came back confirmed and no block "
-            "did, so the tables are treated as empty and dropped. If one of them did "
-            "land after all, it goes with the table - reload from the start."
-        )
-    _cleanup_after_failed_load(client, config, distributed_table, log_callback)
-
-
-def _cleanup_after_failed_load(
-    client,
-    config: ClickHouseConfig,
-    distributed_table: str,
-    log_callback,
-) -> None:
-    table_names = build_table_names(distributed_table)
-    log_callback("Load failed after table creation. Dropping target tables.")
-    drop_target_tables(
-        client=client,
-        config=config,
-        distributed_table=table_names.distributed,
-        local_table=table_names.local,
-        log_callback=log_callback,
+    if stats.src_bytes <= 0:
+        return 0.0, "Reading the source file..."
+    fraction = min(1.0, stats.src_read_bytes / stats.src_bytes)
+    read_mb = stats.src_read_bytes / 1024 / 1024
+    total_mb = stats.src_bytes / 1024 / 1024
+    return fraction, (
+        f"Read {read_mb:.0f} of {total_mb:.0f} MB from the file ({fraction * 100:.0f}%); "
+        "reading runs ahead of confirmed inserts."
     )
 
 
-def _create_and_load(
+#: Подписи судьбы таблиц - человеческим языком то, что запись прогона держит
+#: в tables.fate. Оператор видит их и на экране, и (значением fate) в JSON.
+TABLES_FATE_CAPTIONS = {
+    TABLES_CREATED: "Both target tables are on the cluster with the loaded rows.",
+    TABLES_NOT_CREATED: "No tables were created by this run.",
+    TABLES_KEPT_WITH_DATA: (
+        "The target tables are KEPT with the rows that already landed; "
+        "check the log and drop them yourself before reloading."
+    ),
+    TABLES_DROPPED_AS_EMPTY: "The target tables were dropped as empty.",
+    TABLES_CLEANUP_FAILED: (
+        "Dropping the target tables FAILED; they are probably still there - see the log."
+    ),
+}
+
+
+def tables_fate_caption(fate: str) -> str:
+    """Подпись судьбы таблиц. Незнакомый fate показывается как есть, не молчит."""
+    return TABLES_FATE_CAPTIONS.get(fate, f"Tables fate: {fate}")
+
+
+def _start_load(
+    *,
     config: ClickHouseConfig,
     csv_path: str,
     read_options: ReadOptions,
@@ -1162,71 +1107,22 @@ def _create_and_load(
     distributed_table: str,
     order_by: str,
     partition_by: str | None,
-    batch_size: int,
+    sharding_key: str,
     max_insert_payload_mb: int,
     load_workers: int,
+    insert_compression: str,
     strict_preflight: bool,
-    sharding_key: str,
-    insert_compression: str = "off",
 ) -> None:
-    progress = st.progress(0)
-    status = st.empty()
-    metrics = st.empty()
-    log_container = st.empty()
-    log_messages: list[str] = []
-    start = time.time()
-    inserted_rows = 0
-    client = None
-    tables_created = False
-    max_insert_payload_bytes = _effective_insert_payload_bytes(max_insert_payload_mb)
-    # Отметка пула PyArrow монотонна и живёт весь процесс Streamlit, поэтому
-    # снимаем её и до, и после: этой загрузке принадлежит только прирост.
-    stats = LoadStats(arrow_bytes_at_start=arrow_pool_high_water_bytes())
-    # Собирается до try, чтобы запись о прогоне уцелела при любом раннем падении.
-    run_config = RunConfig(
-        batch_size=read_options.batch_size,
-        max_insert_payload_mb=max_insert_payload_mb,
-        effective_insert_payload_bytes=max_insert_payload_bytes,
-        load_workers=load_workers,
-        insert_compression=insert_compression,
-        strict_preflight=strict_preflight,
-        schema_inference_mode=st.session_state.get(
-            "schema_analysis_mode",
-            SCHEMA_INFERENCE_SAMPLE,
-        ),
-        separator=read_options.separator,
-        encoding=read_options.encoding,
-        database=config.database,
-        table=distributed_table,
-        cluster=config.cluster,
-        order_by=order_by,
-        partition_by=partition_by,
-        sharding_key=sharding_key,
-    )
-    outcome = "failed"
-    error_message: str | None = None
-    # Ставится сразу после возврата загрузчика, до любого `st.*`: дальше уже
-    # нельзя ни объявлять провал загрузки, ни удалять таблицы.
-    load_completed = False
-    ui_last_update: float | None = None
+    """Собирает и запускает фоновую задачу загрузки.
 
-    def ui_due() -> bool:
-        """Пора ли трогать интерфейс. Первый вызов проходит всегда."""
-        nonlocal ui_last_update
-        now = time.perf_counter()
-        if ui_last_update is not None and now - ui_last_update < LOAD_UI_MIN_INTERVAL_S:
-            return False
-        ui_last_update = now
-        return True
-
-    def log(message: str, *, flush: bool = True) -> None:
-        _append_load_log(log_messages, message)
-        # flush=False только у прогресса загрузки: строка копится и уедет со
-        # следующей отрисовкой. Все остальные сообщения, включая ошибки,
-        # показываются сразу.
-        if flush:
-            _render_load_log(log_container, log_messages)
-
+    Всё, что трогает session_state, происходит здесь, на потоке скрипта и ДО
+    старта: у фонового потока нет ScriptRunContext, и st.* оттуда не работает.
+    Сама загрузка - в csv_click.load_job, без единого обращения к Streamlit.
+    """
+    active = current_load_job()
+    if active is not None and active.is_running:
+        st.warning("A load is already running. Cancel it or wait for it to finish.")
+        return
     try:
         mappings = mappings_from_editor_rows(st.session_state["type_rows"])
         effective_read_options, _, encoding_warning = choose_read_options_for_preview(
@@ -1234,215 +1130,109 @@ def _create_and_load(
             read_options,
             nrows=20,
         )
-        if encoding_warning:
-            log(encoding_warning.message)
-        st.session_state["csv_read_options"] = effective_read_options
-        run_config = replace(
-            run_config,
-            batch_size=effective_read_options.batch_size,
-            separator=effective_read_options.separator,
-            encoding=effective_read_options.encoding,
+    except CsvSchemaError as exc:
+        st.error(f"CSV schema error: {exc}")
+        return
+    st.session_state["csv_read_options"] = effective_read_options
+    job = LoadJob(
+        config=config,
+        csv_path=csv_path,
+        read_options=effective_read_options,
+        schema=schema,
+        mappings=mappings,
+        distributed_table=distributed_table,
+        order_by=order_by,
+        partition_by=partition_by,
+        sharding_key=sharding_key,
+        max_insert_payload_mb=max_insert_payload_mb,
+        load_workers=load_workers,
+        insert_compression=insert_compression,
+        strict_preflight=strict_preflight,
+        schema_inference_mode=st.session_state.get(
+            "schema_analysis_mode",
+            SCHEMA_INFERENCE_SAMPLE,
+        ),
+        encoding_warning=encoding_warning.message if encoding_warning else None,
+    )
+    if not start_load_job(job):
+        # Реестр перепроверяет под локом: две сессии могли нажать одновременно.
+        st.warning("A load is already running. Cancel it or wait for it to finish.")
+
+
+def _render_load_panel() -> None:
+    """Живой прогресс или итог последней загрузки этого процесса.
+
+    Рисуется из состояния задачи на КАЖДОМ прогоне, а не из одноразовых
+    st.empty(): именно так итог переживает любые перерисовки - раньше поля
+    0b/8a после rerun были видны только в JSON-записи.
+    """
+    job = current_load_job()
+    if job is None:
+        return
+    if job.is_running:
+        _render_running_load(job)
+    else:
+        _render_finished_load(job)
+
+
+def _render_running_load(job: LoadJob) -> None:
+    """Опрос задачи раз в секунду фрагментом.
+
+    Интерфейс читает задачу, а не загрузка дёргает интерфейс: RerunException
+    из st.* больше не достаёт до продюсера, и случайный клик не убивает
+    часовую заливку. Клик по кнопке внутри фрагмента перерисовывает только
+    фрагмент.
+    """
+
+    @st.fragment(run_every=LOAD_PROGRESS_POLL_S)
+    def _load_progress_fragment() -> None:
+        current = current_load_job() or job
+        if not current.is_running:
+            # Задача закончилась между тиками: один полный прогон, и итог
+            # рисуется обычным путём, уже вне фрагмента.
+            st.rerun(scope="app")
+            return
+        st.info(current.phase)
+        fraction, caption = load_progress_line(current.stats)
+        st.progress(fraction)
+        st.caption(caption)
+        st.metric("Inserted rows", current.stats.rows)
+        if st.button(
+            "Cancel load",
+            key="cancel_load_button",
+            type="secondary",
+            disabled=current.cancel_requested,
+        ):
+            current.request_cancel()
+        if current.cancel_requested:
+            st.warning(
+                "Cancelling: blocks already in flight will finish and be counted, "
+                "nothing new goes out."
+            )
+        _render_load_log(st.empty(), current.log_lines())
+
+    _load_progress_fragment()
+
+
+def _render_finished_load(job: LoadJob) -> None:
+    """Итог завершённой задачи; переживает перерисовки, пока не начата новая."""
+    if job.outcome == "ok":
+        st.success(f"Load finished: {job.stats.rows} rows in {job.stats.total_s:.2f} sec")
+        if job.error_message:
+            # Загрузка прошла, но отчёт о ней сломался - это надо видеть.
+            st.warning(job.error_message)
+    elif job.outcome == "cancelled":
+        st.warning(
+            f"Load cancelled: {job.stats.rows} rows in {job.stats.blocks} block(s) "
+            "had already landed before the stop."
         )
-        total_rows = 0
-        stats.src_bytes = Path(csv_path).stat().st_size
-        configured_insert_payload_bytes = max_insert_payload_mb * 1024 * 1024
-        configured_insert_payload_mb = configured_insert_payload_bytes / 1024 / 1024
-        effective_insert_payload_mb = max_insert_payload_bytes / 1024 / 1024
-        log(
-            "Load settings: batch size "
-            f"{effective_read_options.batch_size}, load workers {load_workers}, "
-            f"configured max insert payload {configured_insert_payload_mb:.2f} MB, "
-            f"effective insert payload {effective_insert_payload_mb:.2f} MB."
-        )
-        if max_insert_payload_bytes < configured_insert_payload_bytes:
-            log(
-                "Effective insert payload limit is lower than the configured UI value "
-                "to stay below ClickHouse HTTP/proxy read limits."
-            )
-        preflight_started = time.perf_counter()
-        if strict_preflight:
-            file_size_bytes = stats.src_bytes
-            if file_size_bytes > LARGE_CSV_PRECHECK_THRESHOLD_BYTES:
-                sample_rows = max(SAMPLE_PRECHECK_ROWS, effective_read_options.batch_size)
-                warning_message = (
-                    "File is larger than 50 MB; using sample validation for the first "
-                    f"{sample_rows} rows instead of full strict validation."
-                )
-                st.warning(warning_message)
-                log(warning_message)
-                status.info("Validating first CSV rows against selected types...")
-                validated_rows = validate_csv_sample_with_pandas_chunks(
-                    csv_path,
-                    effective_read_options,
-                    mappings,
-                    max_insert_payload_bytes=max_insert_payload_bytes,
-                    sample_rows=sample_rows,
-                )
-                log(f"Sample validation finished: first {validated_rows} rows only.")
-            else:
-                log("Validating CSV chunks against selected types.")
-                status.info("Validating CSV chunks against selected types...")
-                total_rows = validate_csv_with_pandas_chunks(
-                    csv_path,
-                    effective_read_options,
-                    mappings,
-                    max_insert_payload_bytes=max_insert_payload_bytes,
-                )
-                log(f"Strict validation finished: {total_rows} rows.")
-        stats.preflight_s = time.perf_counter() - preflight_started
-
-        log("Connecting to ClickHouse.")
-        status.info("Connecting to ClickHouse...")
-        connect_started = time.perf_counter()
-        client = get_client(config)
-        test_connection(client)
-        stats.connect_s = time.perf_counter() - connect_started
-        # Соединение сейчас простаивает в пуле — единственный момент, когда из
-        # него можно достать адреса. Отвечает на вопрос «прогон шёл через
-        # туннель или напрямую», без которого сравнение «до/после» бессмысленно.
-        stats.connection_path = describe_connection_path(client)
-        log("ClickHouse connection OK.")
-
-        log("Checking existing tables and creating DDL.")
-        status.info("Checking existing tables and creating DDL...")
-        ddl_started = time.perf_counter()
-        create_tables(
-            client=client,
-            config=config,
-            schema=schema,
-            distributed_table=distributed_table,
-            order_by=order_by,
-            partition_by=partition_by,
-            sharding_key=sharding_key,
-            log_callback=log,
-        )
-        stats.ddl_s = time.perf_counter() - ddl_started
-        tables_created = True
-        log("Target tables are created and visible on cluster.")
-
-        log("Loading CSV chunks through JSONEachRow.")
-        status.info("Loading CSV chunks through JSONEachRow...")
-
-        def on_progress(block: BlockProgress) -> None:
-            nonlocal inserted_rows
-            inserted_rows = block.rows_total
-            payload_mb = block.wire_bytes / 1024 / 1024
-            due = ui_due()
-            log(
-                f"Loaded chunk {block.chunk_number}, block {block.block_number}: "
-                f"{block.block_rows} rows, {payload_mb:.2f} MB, total {block.rows_total}.",
-                flush=due,
-            )
-            if not due:
-                return
-            if total_rows:
-                progress.progress(min(1.0, inserted_rows / total_rows))
-            metrics.metric("Inserted rows", inserted_rows)
-            status.info(
-                f"Loaded chunk {block.chunk_number}, block {block.block_number}: "
-                f"{block.block_rows} rows"
-            )
-
-        driver_retries = DriverRetryCounter()
-        insert_started = time.perf_counter()
-        try:
-            with driver_retries:
-                load_csv_via_raw_insert(
-                    client=client,
-                    csv_path=csv_path,
-                    read_options=effective_read_options,
-                    database=config.database,
-                    table=distributed_table,
-                    mappings=mappings,
-                    max_insert_payload_bytes=max_insert_payload_bytes,
-                    worker_count=load_workers,
-                    client_factory=lambda: get_client(config),
-                    progress_callback=on_progress,
-                    compression=insert_compression,
-                    stats=stats,
-                )
-        finally:
-            # insert_wall_s замеряется строго вокруг загрузки: preflight, connect
-            # и DDL в него не входят, иначе server % считался бы от чужого времени.
-            stats.insert_wall_s = time.perf_counter() - insert_started
-            stats.driver_retries = driver_retries.count
-
-        # Данные в ClickHouse. Дальше идут только `st.*`-вызовы, а каждый из них
-        # бросает RerunException, если пользователь тронул интерфейс: без этих
-        # двух строк запись объявляла бы прерванной загрузку, которая прошла, а
-        # `except Exception` ниже удалял бы обе залитые таблицы.
-        load_completed = True
-        outcome = "ok"
-        inserted_rows = stats.rows
-        progress.progress(1.0)
-        # Плитка обновляется по троттлингу, и последние блоки в неё не попадают:
-        # без этой строки она навсегда осталась бы с промежуточным числом.
-        metrics.metric("Inserted rows", inserted_rows)
-        elapsed = time.time() - start
-        log(f"Load finished: {inserted_rows} rows in {elapsed:.2f} sec.")
-        for line in format_load_stats_lines(stats):
-            log(line)
-        status.success(f"Load finished: {inserted_rows} rows in {elapsed:.2f} sec")
-    except CertificateError as exc:
-        error_message = f"Certificate error: {exc}"
-        log(error_message)
-        status.error(error_message)
-    except ExistingTableError as exc:
-        error_message = f"Existing table error: {exc}"
-        log(error_message)
-        status.error(error_message)
-    except (CsvSchemaError, ClickHouseConnectionError, CsvClickError) as exc:
-        # Не при `load_completed`: строки уже в таблицах, и сбой отчёта не повод
-        # их уничтожать.
-        if tables_created and client is not None and not load_completed:
-            try:
-                _handle_tables_after_failed_load(client, config, distributed_table, log, stats)
-            except Exception as cleanup_exc:
-                log(f"Cleanup error: {cleanup_exc}")
-        error_message = str(exc)
-        log(error_message)
-        status.error(error_message)
-    except Exception as exc:
-        # Не при `load_completed`: строки уже в таблицах, и сбой отчёта не повод
-        # их уничтожать.
-        if tables_created and client is not None and not load_completed:
-            try:
-                _handle_tables_after_failed_load(client, config, distributed_table, log, stats)
-            except Exception as cleanup_exc:
-                log(f"Cleanup error: {cleanup_exc}")
-        if load_completed:
-            # Загрузка прошла, сломался отчёт. Прогонять текст через
-            # `_format_load_error` нельзя: он объясняет сбой ЗАГРУЗКИ и,
-            # например, обычную ошибку сокета выдаёт за невидимую таблицу.
-            error_message = f"The load finished, but reporting it failed: {exc}"
-        else:
-            error_message = _format_load_error(exc)
-        log(error_message)
-        status.error(error_message)
-    finally:
-        stats.total_s = time.time() - start
-        stats.arrow_bytes = arrow_pool_high_water_bytes()
-        if outcome == "failed" and error_message is None:
-            # Сюда попадает BaseException мимо except Exception — прежде всего
-            # RerunException и StopException Streamlit, которые может бросить
-            # любой st.*-вызов внутри on_progress или log. Без этой ветки запись
-            # утверждала бы «failed» с пустой причиной.
-            outcome = "interrupted"
-            error_message = (
-                "the Streamlit script was interrupted (rerun or stop) before the load finished"
-            )
-        try:
-            record_path = write_run_record(
-                config=run_config,
-                stats=stats,
-                csv_path=Path(csv_path),
-                outcome=outcome,
-                error=error_message,
-                timestamp=datetime.now(timezone.utc),
-            )
-            log(f"Run record saved to {record_path}")
-        except OSError as write_exc:
-            log(f"Could not save the run record: {write_exc}")
+    else:
+        st.error(job.error_message or "The load failed before it could explain itself.")
+    st.caption(tables_fate_caption(job.tables_fate))
+    if job.record_path is not None:
+        st.caption(f"Run record: `{job.record_path}`")
+    with st.expander("Load log", expanded=job.outcome != "ok"):
+        st.code("\n".join(job.log_lines()), language="text")
 
 
 if __name__ == "__main__":

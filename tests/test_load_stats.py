@@ -463,6 +463,7 @@ def test_write_run_record_persists_knob_positions_and_stats(tmp_path: Path) -> N
         csv_path=csv_path,
         outcome="ok",
         timestamp=RUN_TIMESTAMP,
+        tables={"distributed": "orders", "local": "orders_local", "fate": "created"},
         directory=tmp_path / "runs",
     )
 
@@ -498,6 +499,7 @@ def test_write_run_record_keeps_failure_details_and_survives_missing_source(tmp_
         outcome="failed",
         error="read limit is reached",
         timestamp=RUN_TIMESTAMP,
+        tables={"distributed": "orders", "local": "orders_local", "fate": "kept_with_data"},
         directory=tmp_path / "runs",
     )
 
@@ -520,10 +522,84 @@ def test_write_run_record_sanitizes_the_table_name_used_for_the_file(tmp_path: P
         csv_path=tmp_path / "gone.csv",
         outcome="failed",
         timestamp=RUN_TIMESTAMP,
+        tables={"distributed": "orders 2024/q1", "local": "orders 2024/q1_local", "fate": "not_created"},
         directory=tmp_path / "runs",
     )
 
     assert record_path.name == "20260726T143012Z-orders_2024_q1.json"
+
+
+def test_write_run_record_names_the_tables_and_their_fate(tmp_path: Path) -> None:
+    """Оператор из присланного файла обязан различать «удалены» и «оставлены
+    с данными» — после 514466c исходов два, и без этого блока их не отличить."""
+    record_path = write_run_record(
+        config=make_run_config(),
+        stats=LoadStats(),
+        csv_path=tmp_path / "gone.csv",
+        outcome="failed",
+        timestamp=RUN_TIMESTAMP,
+        tables={"distributed": "orders", "local": "orders_local", "fate": "kept_with_data"},
+        directory=tmp_path / "runs",
+    )
+
+    record = json.loads(record_path.read_text(encoding="utf-8"))
+    assert record["tables"] == {
+        "distributed": "orders",
+        "local": "orders_local",
+        "fate": "kept_with_data",
+    }
+
+
+def test_write_run_record_carries_the_derived_instruments(tmp_path: Path) -> None:
+    """worker_occupancy и server_share_of_insert приходилось считать вручную по
+    присланному файлу: server_share при нескольких воркерах всегда null."""
+    stats = LoadStats(
+        rows=8,
+        blocks=4,
+        worker_count=2,
+        insert_wall_s=2.0,
+        insert_busy_s=3.0,
+        server_ns=600_000_000,
+        read_s=0.5,
+        convert_s=0.25,
+        serialize_s=0.25,
+        producer_stall_s=0.5,
+    )
+
+    record_path = write_run_record(
+        config=make_run_config(),
+        stats=stats,
+        csv_path=tmp_path / "gone.csv",
+        outcome="ok",
+        timestamp=RUN_TIMESTAMP,
+        tables={"distributed": "orders", "local": "orders_local", "fate": "created"},
+        directory=tmp_path / "runs",
+    )
+
+    record = json.loads(record_path.read_text(encoding="utf-8"))
+    assert record["stats"]["worker_occupancy"] == pytest.approx(0.75)
+    assert record["stats"]["server_share_of_insert"] == pytest.approx(0.2)
+    assert record["stats"]["producer_unattributed_s"] == pytest.approx(0.5)
+    # Два воркера: отношение суммы серверных времён к одним стенным часам долей
+    # не является, и запись обязана держать null, а не выдумывать число.
+    assert record["stats"]["server_share"] is None
+
+
+def test_write_run_record_writes_null_not_zero_for_uncomputable_instruments(tmp_path: Path) -> None:
+    record_path = write_run_record(
+        config=make_run_config(),
+        stats=LoadStats(),
+        csv_path=tmp_path / "gone.csv",
+        outcome="failed",
+        timestamp=RUN_TIMESTAMP,
+        tables={"distributed": "orders", "local": "orders_local", "fate": "not_created"},
+        directory=tmp_path / "runs",
+    )
+
+    record = json.loads(record_path.read_text(encoding="utf-8"))
+    assert record["stats"]["worker_occupancy"] is None
+    assert record["stats"]["server_share_of_insert"] is None
+    assert record["stats"]["producer_unattributed_s"] is None
 
 
 def test_two_records_in_the_same_second_do_not_overwrite_each_other(tmp_path: Path) -> None:
@@ -535,6 +611,7 @@ def test_two_records_in_the_same_second_do_not_overwrite_each_other(tmp_path: Pa
         "csv_path": tmp_path / "gone.csv",
         "outcome": "failed",
         "timestamp": RUN_TIMESTAMP,
+        "tables": {"distributed": "orders", "local": "orders_local", "fate": "not_created"},
         "directory": tmp_path / "runs",
     }
 
