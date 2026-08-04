@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import re
 import ssl
 import time
@@ -18,8 +19,32 @@ from csv_click.schema import CsvSchema
 
 DEFAULT_HOST = "tp17.wb-bank.ru"
 DEFAULT_PORT = 443
-DEFAULT_CLIENT_CERT = "/home/jovyan/tsh/clickhouse-prod.crt"
-DEFAULT_CLIENT_KEY = "/home/jovyan/tsh/clickhouse-prod.key"
+#: Где `tsh` кладёт сертификаты в JupyterHub, где работает автор.
+NOTEBOOK_CERT_DIR = "/home/jovyan/tsh"
+
+
+def default_client_paths(
+    *,
+    windows: bool | None = None,
+    home: Path | None = None,
+) -> tuple[str, str]:
+    """Пути к клиентскому сертификату и ключу по умолчанию, по платформе.
+
+    Раньше здесь стояли `/home/jovyan/...` для любой машины. В JupyterHub это
+    верно, а на Windows - бессмысленное значение, которое пользователь обязан
+    заметить и заменить сам. Аргументы существуют ради тестов: платформу нельзя
+    выбрать, а проверить надо оба варианта.
+    """
+    is_windows = os.name == "nt" if windows is None else windows
+    if not is_windows:
+        # Строкой, а не `Path`: путь для чужой машины, и на Windows `Path` вернул
+        # бы его с обратными слэшами - `\home\jovyan\tsh\...`.
+        return f"{NOTEBOOK_CERT_DIR}/clickhouse-prod.crt", f"{NOTEBOOK_CERT_DIR}/clickhouse-prod.key"
+    base = (home or Path.home()) / "tsh"
+    return str(base / "clickhouse-prod.crt"), str(base / "clickhouse-prod.key")
+
+
+DEFAULT_CLIENT_CERT, DEFAULT_CLIENT_KEY = default_client_paths()
 
 
 class ClickHouseClient(Protocol):

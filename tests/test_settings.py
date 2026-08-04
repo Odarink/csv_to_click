@@ -1,7 +1,39 @@
+import json
 from pathlib import Path
 
-from csv_click.clickhouse import DEFAULT_CLIENT_CERT, DEFAULT_CLIENT_KEY
+from csv_click.clickhouse import DEFAULT_CLIENT_CERT, DEFAULT_CLIENT_KEY, default_client_paths
 from csv_click.settings import AppSettings, load_app_settings, save_app_settings
+
+
+def test_client_paths_follow_the_platform() -> None:
+    """Пути были зашиты линуксовыми, и на Windows-машине коллеги бессмысленны.
+
+    Автор работает в JupyterHub, где `/home/jovyan/tsh` верен, поэтому вариант
+    остаётся - меняется только выбор между ними.
+    """
+    windows_cert, windows_key = default_client_paths(windows=True, home=Path(r"C:\Users\analyst"))
+    assert windows_cert.startswith(r"C:\Users\analyst")
+    assert windows_cert.endswith("clickhouse-prod.crt")
+    assert windows_key.endswith("clickhouse-prod.key")
+    assert "jovyan" not in windows_cert
+
+    linux_cert, linux_key = default_client_paths(windows=False)
+    assert linux_cert == "/home/jovyan/tsh/clickhouse-prod.crt"
+    assert linux_key == "/home/jovyan/tsh/clickhouse-prod.key"
+
+
+def test_a_configured_certificate_path_wins_over_the_platform_default(tmp_path: Path) -> None:
+    """У кого путь уже настроен, тот не должен заметить этой правки вовсе."""
+    settings_path = tmp_path / "settings.json"
+    settings_path.write_text(
+        json.dumps({"client_cert": "D:/certs/my.crt", "client_key": "D:/certs/my.key"}),
+        encoding="utf-8",
+    )
+
+    settings = load_app_settings(settings_path)
+
+    assert settings.client_cert == "D:/certs/my.crt"
+    assert settings.client_key == "D:/certs/my.key"
 
 
 def test_load_app_settings_uses_notebook_defaults_when_file_is_missing(tmp_path: Path) -> None:

@@ -3,7 +3,7 @@ from __future__ import annotations
 import os
 import sys
 import time
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -63,6 +63,107 @@ from csv_click.load_stats import (
 from csv_click.settings import AppSettings, load_app_settings, save_app_settings
 
 
+@dataclass(frozen=True)
+class LoadStep:
+    key: str
+    title: str
+
+
+#: Единственный источник правды о шагах. Заголовки и строка пути берутся отсюда,
+#: а не пишутся руками: иначе нумерация разъедется при первой вставке шага.
+LOAD_STEPS: tuple[LoadStep, ...] = (
+    LoadStep("csv", "Read CSV"),
+    LoadStep("mapping", "Column mapping"),
+    LoadStep("types", "Type review"),
+    LoadStep("params", "ClickHouse and load parameters"),
+    LoadStep("load", "Create tables and load"),
+)
+
+
+def _step_number(key: str) -> int | None:
+    for index, step in enumerate(LOAD_STEPS, start=1):
+        if step.key == key:
+            return index
+    return None
+
+
+def step_heading(key: str) -> str:
+    """Заголовок блока с номером: «Step 2 of 5 — Column mapping».
+
+    Раньше заголовки были не связаны между собой, и сколько шагов всего, узнать
+    было нельзя. А поскольку следующий блок появляется только после
+    подтверждения предыдущего, отсутствие блока читалось как «интерфейс пропал».
+    """
+    number = _step_number(key)
+    if number is None:
+        return key
+    return f"Step {number} of {len(LOAD_STEPS)} — {LOAD_STEPS[number - 1].title}"
+
+
+def step_path_line(current_key: str) -> str:
+    """Одна строка пути: что пройдено, где мы, что впереди.
+
+    Строка, а не `st.progress`: полоса показывает долю, но не названия, а вопрос
+    пользователя - «что дальше». Неизвестный ключ не роняет экран: строка просто
+    остаётся без отметки «вы здесь».
+    """
+    current = _step_number(current_key)
+    parts: list[str] = []
+    for index, step in enumerate(LOAD_STEPS, start=1):
+        if current is not None and index < current:
+            parts.append(f"{index}. {step.title} ✓")
+        elif current is not None and index == current:
+            parts.append(f"**{index}. {step.title} ← вы здесь**")
+        else:
+            parts.append(f"{index}. {step.title}")
+    return " · ".join(parts)
+
+
+#: Шаги, отрисованные за этот прогон. Ключ к тому, чтобы страница не врала о
+#: позиции: спрашивать не флаги, а то, что реально попало на экран.
+RENDERED_STEPS_KEY = "rendered_steps"
+
+
+def _mark_step_rendered(step_key: str) -> None:
+    if step_key:
+        st.session_state.setdefault(RENDERED_STEPS_KEY, []).append(step_key)
+
+
+def current_step_key() -> str:
+    """Самый глубокий шаг, который РЕАЛЬНО отрисовался за этот прогон.
+
+    Выводить шаг из подтверждающих флагов оказалось нельзя: блок ниже может
+    упасть на проверке - дубликат имени колонки, неверный `custom_type` - и
+    вернуть `None`, не сняв флаг. Тогда страница заканчивалась вторым шагом,
+    а строка сверху ставила галочки на втором и третьем и объявляла четвёртый.
+    Флаг говорит «это подтверждали», а не «это сейчас на экране».
+
+    Заодно так появляется последний шаг: у него своего флага нет вовсе, и по
+    флагам он не мог стать текущим никогда.
+    """
+    rendered = st.session_state.get(RENDERED_STEPS_KEY) or []
+    numbered = [(_step_number(key) or 0, key) for key in rendered]
+    if not numbered:
+        return LOAD_STEPS[0].key
+    return max(numbered)[1]
+
+
+def main() -> None:
+    st.set_page_config(page_title="CSV to ClickHouse", layout="wide")
+    st.title("CSV to ClickHouse")
+    # Место занимается сразу, а заполняется в конце: состояние меняют сами блоки,
+    # которые рисуются ниже. Нарисованная до них строка отставала на шаг - после
+    # «Apply types» показывала третий, когда на экране уже стоял четвёртый.
+    path_slot = st.empty()
+    st.session_state[HELP_SLOTS_KEY] = []
+    st.session_state[RENDERED_STEPS_KEY] = []
+    try:
+        _render_load_flow()
+    finally:
+        path_slot.caption(step_path_line(current_step_key()))
+        _fill_step_help_slots()
+
+
 SCHEMA_INFERENCE_SAMPLE = "Fast sample, 100000 rows"
 SCHEMA_INFERENCE_FULL_SCAN = "Full scan"
 SCHEMA_INFERENCE_OPTIONS = [SCHEMA_INFERENCE_SAMPLE, SCHEMA_INFERENCE_FULL_SCAN]
@@ -96,10 +197,7 @@ LOAD_UI_MIN_INTERVAL_S = 1.0
 LOAD_LOG_TAIL_LINES = 400
 
 
-def main() -> None:
-    st.set_page_config(page_title="CSV to ClickHouse", layout="wide")
-    st.title("CSV to ClickHouse")
-
+def _render_load_flow() -> None:
     csv_context = _render_csv_path_step()
     if not csv_context:
         return
@@ -154,6 +252,7 @@ def main() -> None:
         st.error(f"DDL parameter error: {exc}")
         return
 
+    st.subheader(step_heading("load"))
     _render_final_actions_help()
 
     if st.button("Preview DDL", use_container_width=True):
@@ -180,9 +279,36 @@ def main() -> None:
         )
 
 
-def _render_step_help(title: str, body: str) -> None:
-    with st.expander(title, expanded=False):
-        st.markdown(body)
+#: Отложенные подсказки текущего прогона: место занято, содержимое допишется в
+#: конце. Живут в `session_state`, а не в модуле: у процесса может быть несколько
+#: сессий, и общий на всех список смешал бы их подсказки.
+HELP_SLOTS_KEY = "help_slots"
+
+
+def _render_step_help(title: str, body: str, step_key: str = "") -> None:
+    """Объяснение шага. Раскрыто, только если это ТЕКУЩИЙ шаг.
+
+    Тексты были и раньше, и они по делу - но все лежали свёрнутыми, и человек,
+    не знавший, что внутри объяснение, туда не заглядывал. Раскрывать все нельзя:
+    экран превращается в простыню.
+
+    Место занимается сейчас, а раскрытие решается в конце прогона: состояние
+    меняют сами блоки, которые рисуются ниже. Решая на месте, подсказка первого
+    шага оставалась раскрытой после того, как человек уже ушёл на второй, - и
+    раскрытыми оказывались две.
+    """
+    slot = st.empty()
+    # Подсказка есть у каждого шага и рисуется в его начале, поэтому она же -
+    # единственная надёжная отметка «этот блок на экране».
+    _mark_step_rendered(step_key)
+    st.session_state.setdefault(HELP_SLOTS_KEY, []).append((slot, title, body, step_key))
+
+
+def _fill_step_help_slots() -> None:
+    current = current_step_key()
+    for slot, title, body, step_key in st.session_state.get(HELP_SLOTS_KEY, []):
+        with slot.expander(title, expanded=bool(step_key) and step_key == current):
+            st.markdown(body)
 
 
 def _render_csv_path_help() -> None:
@@ -205,6 +331,7 @@ CSV из Windows часто подходит `cp1251` или `windows-1251`.
 После `Read CSV` приложение прочитает preview, подберет эффективные настройки
 чтения и определит начальную схему колонок.
 """,
+        step_key="csv",
     )
 
 
@@ -221,6 +348,7 @@ def _render_column_mapping_help() -> None:
 Пустые `target_name` и дублирующиеся целевые имена не допускаются. После проверки
 нажмите `Apply column mapping`, чтобы перейти к типам.
 """,
+        step_key="mapping",
     )
 
 
@@ -250,6 +378,7 @@ def _render_type_review_help() -> None:
 без ошибки. Если такие колонки возможны, берите `Full scan` или ставьте
 `String` руками.
 """,
+        step_key="types",
     )
 
 
@@ -274,6 +403,7 @@ def _render_clickhouse_params_help() -> None:
 Пример: ORDER BY = customer_id, `PARTITION BY = toYYYYMM(dt)`,
 `sharding key = customer_id`.
 """,
+        step_key="params",
     )
 
 
@@ -294,6 +424,7 @@ Preview DDL только показывает SQL и ничего не созд�
 Загрузка блокируется, если distributed или local таблица уже существует. Для
 `my_table` проверяются `my_table` и `my_table_local`.
 """,
+        step_key="load",
     )
 
 
@@ -362,7 +493,7 @@ def _remembered_selectbox(label: str, options: list[str], state_key: str) -> str
 def _render_connection_and_load_form(schema: CsvSchema) -> dict[str, object] | None:
     settings = _get_app_settings()
     target_names = _schema_target_names(schema)
-    st.subheader("ClickHouse and load parameters")
+    st.subheader(step_heading("params"))
     _render_clickhouse_params_help()
     left, right = st.columns(2)
     with left:
@@ -541,6 +672,7 @@ def _render_csv_path_step() -> dict[str, object] | None:
         "csv_read_options",
         _read_options_from_settings(_get_app_settings()),
     )
+    st.subheader(step_heading("csv"))
     _render_csv_path_help()
     with st.form("csv_path_form"):
         csv_col, button_col = st.columns([5, 1])
@@ -795,7 +927,7 @@ def _render_column_mapping_editor() -> list[dict[str, object]] | None:
     if not schema_rows:
         return None
 
-    st.subheader("Column mapping")
+    st.subheader(step_heading("mapping"))
     _render_column_mapping_help()
     mapping_rows = st.session_state.get("mapping_rows") or _schema_rows_to_mapping_rows(schema_rows)
     edited = st.data_editor(
@@ -835,7 +967,7 @@ def _render_type_editor() -> CsvSchema | None:
     if not rows:
         return None
 
-    st.subheader("Type review")
+    st.subheader(step_heading("types"))
     _render_type_review_help()
     edited = st.data_editor(
         pd.DataFrame(rows),

@@ -4,13 +4,13 @@ setlocal EnableExtensions
 cd /d "%~dp0"
 set "PROJECT_DIR=%CD%\"
 set "VENV_PYTHON=%PROJECT_DIR%.venv\Scripts\python.exe"
-set "APP_PATH=src\csv_click\app.py"
 
 echo CSV to ClickHouse loader
 echo Project: %PROJECT_DIR%
 echo.
 
 call :find_uv
+if not defined UV_CMD call :install_uv
 if not defined UV_CMD goto :uv_not_found
 
 echo Installing the locked environment
@@ -25,11 +25,13 @@ echo Checking runtime imports
 if errorlevel 1 goto :import_failed
 
 echo.
-echo Starting Streamlit on http://localhost:8501
+echo Starting the application
+rem Порт, версию копии и запуск Streamlit решает csv_click.launcher: у модуля
+rem есть тесты, которые его ИСПОЛНЯЮТ, а этот файл проверяется только чтением.
 set "PYTHONPATH=%PROJECT_DIR%src"
-echo Running: python -m streamlit run src\csv_click\app.py --server.address 127.0.0.1 --server.port 8501
-"%VENV_PYTHON%" -m streamlit run "%APP_PATH%" --server.address 127.0.0.1 --server.port 8501
-if errorlevel 1 goto :streamlit_failed
+echo Running: python -m csv_click.launcher
+"%VENV_PYTHON%" -m csv_click.launcher
+if errorlevel 1 goto :launch_failed
 goto :eof
 
 :find_uv
@@ -53,15 +55,55 @@ for %%L in ("py -3.12" "py" "python") do (
 )
 goto :eof
 
+:install_uv
+rem Раньше здесь печатался совет, и на этом всё заканчивалось. Пользователь без
+rem прав администратора - аналитик: команду он скопирует, но это лишний шаг, на
+rem котором он останавливается и идёт спрашивать. Ставим сами тем Python, который
+rem найдём; после установки uv.exe лежит ВНЕ PATH, поэтому ищем заново.
+for %%L in ("py -3.12" "py" "python") do (
+    if not defined UV_CMD (
+        %%~L -c "import sys" >nul 2>nul
+        if not errorlevel 1 (
+            rem Факт запоминается сразу: без него итог винил отсутствие Python,
+            rem хотя строкой выше сам сообщал, что нашёл рабочий.
+            set "PYTHON_FOUND=%%~L"
+            echo uv is missing. Installing it with %%~L
+            %%~L -m pip install --user uv
+            if errorlevel 1 (
+                echo   pip could not install uv with %%~L
+            ) else (
+                call :find_uv
+            )
+        )
+    )
+)
+goto :eof
+
 :uv_not_found
 echo.
-echo ERROR: uv was not found, neither on PATH nor in the Python user scripts directory.
+if defined PYTHON_FOUND goto :uv_install_failed
+echo ERROR: uv is missing and there is no working Python to install it with.
 echo The environment is installed from uv.lock so that library versions cannot
 echo drift between two loads. Install uv, reopen this folder, and run loader.bat again.
 echo.
 echo Without administrator rights:
 echo   py -3.12 -m pip install --user uv
 echo With administrator rights:
+echo   winget install --source winget -e --id astral-sh.uv
+pause
+exit /b 1
+
+:uv_install_failed
+rem Python есть и работает - повторять ту же команду руками бессмысленно, она
+rem только что не сработала. Причина почти всегда в доступе к индексу пакетов:
+rem на этих машинах стоит корпоративный перехват TLS.
+echo ERROR: Python works (%PYTHON_FOUND%), but uv could not be installed.
+echo The message from pip above says why. The usual causes:
+echo   1. No access to the package index, or a proxy in front of it.
+echo   2. pip is missing in this interpreter.
+echo   3. --user is refused because this interpreter is inside a virtual environment.
+echo.
+echo Ask for uv to be installed centrally, or with administrator rights run:
 echo   winget install --source winget -e --id astral-sh.uv
 pause
 exit /b 1
@@ -88,9 +130,10 @@ echo ERROR: required Python packages are not importable.
 pause
 exit /b 1
 
-:streamlit_failed
+:launch_failed
+rem Не «упал Streamlit»: модуль может выйти с ошибкой ещё до его запуска -
+rem например, когда все порты в его диапазоне заняты. Причину печатает он сам.
 echo.
-echo ERROR: Streamlit stopped with an error.
-echo If port 8501 is busy, close the process that uses it and run loader.bat again.
+echo ERROR: the application stopped with an error. The reason is printed above.
 pause
 exit /b 1

@@ -41,15 +41,98 @@ def test_loader_bat_offers_an_install_route_without_admin_rights() -> None:
     assert loader.index("Without administrator rights") < loader.index("With administrator rights")
 
 
-def test_loader_bat_launches_streamlit_from_the_project_venv() -> None:
+def test_loader_bat_hands_the_launch_to_the_python_module() -> None:
+    """Всё, что можно проверить исполнением, живёт в `csv_click.launcher`.
+
+    В `.bat` осталось только то, что обязано работать ДО появления `.venv`, и
+    проверяется оно чтением текста. Выбор порта, версия и запуск Streamlit ушли
+    в модуль, у которого есть настоящие тесты.
+    """
     lines = loader_lines()
 
-    launch = [line for line in lines if line.startswith('"%VENV_PYTHON%" -m streamlit run')]
+    launch = [line for line in lines if line.startswith('"%VENV_PYTHON%" -m csv_click.launcher')]
     assert len(launch) == 1
-    assert '"%APP_PATH%"' in launch[0]
-    assert "--server.address 127.0.0.1" in launch[0]
-    assert "--server.port 8501" in launch[0]
     assert 'set "PYTHONPATH=%PROJECT_DIR%src"' in lines
+    # Порт и адрес выбирает модуль: захардкоженные здесь, они разошлись бы с ним.
+    assert not [line for line in lines if "--server.port" in line]
+
+
+def test_loader_bat_does_not_blame_python_when_python_worked() -> None:
+    """Установка uv может провалиться при живом Python: индекс недоступен.
+
+    На целевых машинах есть корпоративный перехват TLS - README сам приводит
+    падение winget с `0x8a15005e`. Тогда `pip install` возвращает ненулевой код,
+    а загрузчик печатал «no working Python either», хотя тремя строками выше сам
+    сообщал, что Python нашёл. И предлагал ту же команду, которая только что не
+    сработала.
+    """
+    loader = Path("loader.bat").read_text(encoding="utf-8")
+    lines = loader_lines()
+
+    # Факт «рабочий Python найден» запоминается там же, где он установлен.
+    assert any(line.startswith('set "PYTHON_FOUND=') for line in lines)
+    not_found_block = loader[loader.index("\n:uv_not_found") :]
+    assert "no working Python either" not in not_found_block
+    # Ветка обязана различать два исхода, а не печатать один текст на оба.
+    assert "if defined PYTHON_FOUND" in not_found_block
+
+
+def test_loader_bat_checks_whether_pip_succeeded() -> None:
+    install_block_start = Path("loader.bat").read_text(encoding="utf-8").index("\n:install_uv")
+    loader = Path("loader.bat").read_text(encoding="utf-8")
+    install_block = loader[install_block_start : loader.index("\n:uv_not_found")]
+
+    after_pip = install_block[install_block.index("pip install --user uv") :]
+    # Именно `errorlevel 1`: в cmd проверка means «код >= указанного», поэтому
+    # порог 9009 выглядит как проверка, но пропускает обычный провал pip.
+    assert "if errorlevel 1 (" in after_pip, (
+        "код возврата pip не проверяется на единице, и провал выглядит как успех"
+    )
+
+
+def test_loader_bat_does_not_claim_streamlit_failed_before_it_started() -> None:
+    """Модуль может выйти с ошибкой ДО запуска Streamlit - например, когда все
+    порты заняты. Утверждать в этом случае, что упал Streamlit, значит послать
+    искать не там; совет про 8501 устарел вместе с фиксированным портом."""
+    loader = Path("loader.bat").read_text(encoding="utf-8")
+    # Метка переименована вместе со смыслом: падает не Streamlit, а запуск.
+    assert ":streamlit_failed" not in loader
+    failure_block = loader[loader.index("\n:launch_failed") :]
+
+    assert "Streamlit stopped with an error" not in failure_block
+    assert "8501" not in failure_block
+
+
+def test_loader_bat_has_no_dead_variables() -> None:
+    """`APP_PATH` осиротел, когда запуск переехал в модуль."""
+    loader = Path("loader.bat").read_text(encoding="utf-8")
+
+    assert "APP_PATH" not in loader
+
+
+def test_loader_bat_installs_uv_itself_when_python_is_available() -> None:
+    """Раньше загрузчик печатал команду и выходил, хотя мог выполнить её сам.
+
+    Пользователь без прав администратора - аналитик, а не инженер: копирование
+    команды в консоль это лишний шаг, на котором он останавливается и идёт
+    спрашивать.
+    """
+    loader = Path("loader.bat").read_text(encoding="utf-8")
+    lines = loader_lines()
+
+    assert ":install_uv" in loader
+    assert "call :install_uv" in lines[lines.index("call :find_uv") + 1]
+    executed = [
+        line for line in lines
+        if "pip install --user uv" in line and not line.startswith(("rem ", "echo"))
+    ]
+    assert executed, "нет строки, которая РЕАЛЬНО ставит uv, а не печатает совет"
+    # Метки ищутся с начала строки: `:install_uv` встречается и внутри
+    # `call :install_uv`, а `:uv_not_found` - внутри `goto :uv_not_found`, и по
+    # первому вхождению «блок» вырождался в две строки основного потока.
+    install_block = loader[loader.index("\n:install_uv") : loader.index("\n:uv_not_found")]
+    # После установки uv.exe лежит вне PATH, поэтому поиск повторяется.
+    assert "call :find_uv" in install_block
 
 
 def test_loader_bat_tells_the_operator_how_to_install_uv() -> None:
@@ -69,14 +152,16 @@ def test_loader_bat_no_longer_resolves_dependencies_at_launch() -> None:
     assert "pip install -r" not in loader
     assert "python -m venv .venv" not in loader
     assert not Path("requirements.txt").exists()
-    # Единственная исполняемая строка с pip — установка самого uv; ставить им
-    # зависимости проекта нельзя, иначе версии снова поплывут между прогонами.
+    # pip разрешён РОВНО для установки самого uv; ставить им зависимости проекта
+    # нельзя, иначе версии снова поплывут между прогонами. `echo` с той же
+    # командой - подсказка пользователю, а не исполнение, и в счёт не идёт.
     pip_commands = [
         line for line in loader_lines()
-        if "pip install" in line and not line.startswith("rem ")
+        if "pip install" in line and not line.startswith(("rem ", "echo"))
     ]
-    assert len(pip_commands) == 1
-    assert pip_commands[0].endswith("pip install --user uv")
+    assert pip_commands, "загрузчик больше не ставит uv"
+    for command in pip_commands:
+        assert command.endswith("pip install --user uv"), command
 
 
 def test_loader_bat_uses_locked_rather_than_frozen() -> None:
