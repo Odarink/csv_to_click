@@ -297,6 +297,7 @@ ENGINE = Distributed('<cluster>', '<database>', '<local_table>', <sharding_key>)
 - Пустые значения приводят к выбору `Nullable(...)` при автоопределении схемы.
 - Поддерживаемые итоговые типы, и `Nullable(...)` для каждого из них:
   - `String`, `Int64`, `UInt64`, `Float64`;
+  - `Decimal(38, 0)`, `Decimal(76, 0)` — целые, не влезающие в 64 бита;
   - `Decimal(18, 2)`, `Decimal(38, 2)`, `Decimal(76, 2)`, `Decimal(38, 10)`,
     `Decimal(76, 10)`;
   - `Date`, `Date32`, `DateTime`, `Bool`.
