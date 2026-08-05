@@ -1,0 +1,16 @@
+{
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "p=\".venv/Scripts/python.exe\"; [ -x \"$p\" ] || p=python; \"$p\" docs/codemap/tools/check_codemap.py 2>/dev/null || true",
+            "timeout": 15,
+            "statusMessage": "Проверяю свежесть карты кода"
+          }
+        ]
+      }
+    ]
+  }
+}
