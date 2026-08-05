@@ -5,6 +5,7 @@ from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from dataclasses import dataclass
 import io
 from pathlib import Path
+import re
 import threading
 import time
 from typing import Iterator, TypeVar
@@ -76,7 +77,17 @@ class SchemaMapping:
 #: Типы, которые pandas разбирает при чтении быстрее и без потерь. Всё
 #: остальное читается текстом: там значима исходная запись — ведущие нули в
 #: String, хвостовой ноль в `1.50` для Decimal, литералы вроде `NA`.
-NATIVELY_PARSED_TYPES: frozenset[str] = frozenset({"Int64", "UInt64", "Float64"})
+#: Int128/256 сюда не входят намеренно: у pandas нет таких dtype, а
+#: `to_numeric` прогнал бы значение через float64 и потерял точность — они
+#: остаются текстом, JSONEachRow принимает целые в кавычках.
+NATIVELY_PARSED_TYPES: frozenset[str] = frozenset(
+    {"Int8", "Int16", "Int32", "Int64", "UInt8", "UInt16", "UInt32", "UInt64", "Float64"}
+)
+
+#: Целочисленные типы, у которых имя pandas-dtype совпадает с ClickHouse
+#: побуквенно: их держит целочисленная ветка конвертера — с проверкой
+#: целочисленности и границ через безопасный astype.
+_PANDAS_INTEGER_TYPE_RE = re.compile(r"^U?Int(8|16|32|64)$")
 
 #: Что `to_json` экранирует обратным слэшем внутри строки. Прямой слэш — не
 #: описка, а наследие ujson: `a/b` уезжает как `a\/b`. Снято выполнением, не
@@ -429,7 +440,7 @@ def _schema_from_stats(source_names: list[str], stats: dict[str, _ColumnStats]) 
                 source_name=source_name,
                 inferred_type=inferred_type,
                 final_type=final_type,
-                nullable=final_type.startswith("Nullable("),
+                nullable=unwrap_nullable(final_type)[0],
                 sample_values=stats[source_name].sample_values or [],
                 notes=notes,
             )
@@ -444,7 +455,7 @@ def schema_to_mappings(schema: CsvSchema) -> list[SchemaMapping]:
             target_name=column.column_name,
             include=True,
             final_type=column.final_type,
-            nullable=column.final_type.startswith("Nullable("),
+            nullable=unwrap_nullable(column.final_type)[0],
             inferred_type=column.inferred_type,
             sample_values=tuple(column.sample_values),
             notes=column.notes,
@@ -474,7 +485,7 @@ def mappings_to_schema(mappings: list[SchemaMapping]) -> CsvSchema:
                 source_name=mapping.source_name,
                 inferred_type=mapping.inferred_type or final_type,
                 final_type=final_type,
-                nullable=final_type.startswith("Nullable("),
+                nullable=unwrap_nullable(final_type)[0],
                 sample_values=list(mapping.sample_values),
                 notes=mapping.notes,
             )
@@ -493,7 +504,7 @@ def mappings_to_editor_rows(mappings: list[SchemaMapping]) -> list[dict[str, obj
             "inferred_type": mapping.inferred_type or mapping.final_type,
             "final_type": mapping.final_type,
             "custom_type": "",
-            "nullable": mapping.final_type.startswith("Nullable("),
+            "nullable": unwrap_nullable(mapping.final_type)[0],
             "sample_values": ", ".join(mapping.sample_values),
             "notes": mapping.notes,
         }
@@ -514,7 +525,7 @@ def mappings_from_editor_rows(rows: list[dict[str, object]]) -> list[SchemaMappi
                 target_name=str(row["target_name"]),
                 include=bool(row.get("include", True)),
                 final_type=final_type,
-                nullable=final_type.startswith("Nullable("),
+                nullable=unwrap_nullable(final_type)[0],
                 inferred_type=str(row.get("inferred_type") or final_type),
                 sample_values=tuple(_split_sample_values(row.get("sample_values", ""))),
                 notes=str(row.get("notes", "")),
@@ -1441,6 +1452,12 @@ def _missing_mask(series: pd.Series, na_markers: bool) -> pd.Series:
 
 def _convert_series(series: pd.Series, clickhouse_type: str) -> pd.Series:
     nullable, inner_type = unwrap_nullable(clickhouse_type)
+    if inner_type.startswith("LowCardinality(") and inner_type.endswith(")"):
+        # LowCardinality — свойство ХРАНЕНИЯ, а не значений: ветку конвертера
+        # (маркеры пропусков, числа, даты) выбирает базовый тип. Без этого
+        # 'NA' в LowCardinality(Nullable(String)) молча превращался в null, а
+        # LowCardinality(Int32) уезжал строками.
+        inner_type = inner_type.removeprefix("LowCardinality(").removesuffix(")")
     # В String-колонке `NA` и `null` - обычный текст, ради чего фаза 3b и
     # делалась; во всех остальных типах это по-прежнему пропуск.
     missing = _missing_mask(series, na_markers=inner_type != "String")
@@ -1457,19 +1474,25 @@ def _convert_series(series: pd.Series, clickhouse_type: str) -> pd.Series:
         return values.mask(missing, filler)
     # Остальным типам пустая ячейка это отсутствие значения; ниже её ждут как NaN.
     series = series.astype("object").mask(missing, None)
-    if inner_type in {"Int64", "UInt64"}:
+    if _PANDAS_INTEGER_TYPE_RE.match(inner_type):
         converted = pd.to_numeric(series, errors="raise")
         if not nullable and converted.isna().any():
             raise CsvSchemaError("empty value is not allowed for non-nullable integer")
         # Целочисленный dtype с поддержкой пропусков: to_json печатает из него
-        # и целые, и null сам, без построчного боксинга в Python int.
+        # и целые, и null сам, без построчного боксинга в Python int. Имя
+        # pandas-dtype совпадает с именем типа ClickHouse побуквенно, включая
+        # узкие: раньше Int32/UInt16 проваливались в текстовую ветку и уезжали
+        # строками — из float-кадра это была строка '1.0', которую ClickHouse
+        # отклоняет при парсинге JSONEachRow.
         try:
-            return converted.astype("UInt64" if inner_type == "UInt64" else "Int64")
+            return converted.astype(inner_type)
         except (TypeError, ValueError) as exc:
             # Раньше здесь стоял int(value), который молча ОБРЕЗАЛ дробную
-            # часть: 1.7 в Int64-колонке уезжало единицей.
+            # часть: 1.7 в Int64-колонке уезжало единицей. Безопасный astype
+            # ловит и выход за границы узкого типа: 300 в Int8 — падение с
+            # именем виновника, не тихое переполнение.
             raise CsvSchemaError(
-                f"value is not a whole number and cannot be stored as {inner_type}: {exc}"
+                f"value does not fit {inner_type} or is not a whole number: {exc}"
             ) from exc
     if inner_type == "Float64":
         converted = pd.to_numeric(series, errors="raise")
@@ -1576,11 +1599,38 @@ def _value_to_string(value) -> str:
     return "" if pd.isna(value) else str(value).strip()
 
 
+#: Обёртки, которые ClickHouse запрещает заворачивать в Nullable снаружи.
+#: Nullable для них живёт на элементе: Array(Nullable(String)) валиден,
+#: Nullable(Array(String)) роняет CREATE TABLE.
+_UNNULLABLE_WRAPPER_RE = re.compile(r"^(Array|Map|Tuple|Nested)\(")
+
+
 def _normalize_nullable_type(clickhouse_type: str, nullable: bool) -> str:
-    if nullable and not clickhouse_type.startswith("Nullable("):
+    """Согласует галку nullable с текстом типа.
+
+    Слепое `Nullable(...)` снаружи давало невалидный DDL на обёртках (F6/V1
+    инвентаря): у LowCardinality Nullable живёт ВНУТРИ —
+    `LowCardinality(Nullable(String))`, а у Array/Map/Tuple/Nested места для
+    внешнего Nullable нет вовсе — там честный отказ до создания таблиц.
+    """
+    if clickhouse_type.startswith("LowCardinality(") and clickhouse_type.endswith(")"):
+        inner = clickhouse_type.removeprefix("LowCardinality(").removesuffix(")")
+        return f"LowCardinality({_normalize_nullable_type(inner, nullable)})"
+    if clickhouse_type.startswith("Nullable(") and clickhouse_type.endswith(")"):
+        # Явно набранная форма разбирается, а не пропускается как есть: отказ
+        # нельзя обходить, напечатав Nullable(Array(...)) руками, а
+        # Nullable(LowCardinality(X)) имеет однозначный валидный смысл —
+        # LowCardinality(Nullable(X)) — и нормализуется в него.
+        inner = clickhouse_type.removeprefix("Nullable(").removesuffix(")")
+        return _normalize_nullable_type(inner, nullable)
+    if nullable and _UNNULLABLE_WRAPPER_RE.match(clickhouse_type):
+        raise CsvSchemaError(
+            f"ClickHouse does not support Nullable({clickhouse_type}); "
+            "make the element type Nullable instead, e.g. Array(Nullable(String)), "
+            "and uncheck nullable for the column."
+        )
+    if nullable:
         return f"Nullable({clickhouse_type})"
-    if not nullable and clickhouse_type.startswith("Nullable("):
-        return clickhouse_type.removeprefix("Nullable(").removesuffix(")")
     return clickhouse_type
 
 
