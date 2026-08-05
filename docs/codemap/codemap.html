@@ -1,0 +1,4438 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>csv_to_click — карта кода</title>
+<style>
+:root{
+  --bg:#0f1216; --panel:#161b22; --panel2:#1c2330; --line:#2a3342;
+  --text:#dfe6ee; --muted:#8b98a9; --faint:#5c6875;
+  --entry:#e2b34a; --ui:#5aa2e8; --core:#a58cf2; --io:#4fc2b0;
+  --config:#7fa66a; --ext:#7d8794; --db:#e8875a; --test:#c96f8f; --doc:#98a4b5;
+  --data:#cfd6de;
+  --hl-up:#e2b34a; --hl-down:#4fc2b0; --hl-flow:#f0f4f8;
+}
+*{box-sizing:border-box; margin:0; padding:0;}
+html,body{height:100%;}
+body{
+  background:var(--bg); color:var(--text);
+  font:14px/1.45 "Segoe UI", system-ui, -apple-system, sans-serif;
+  display:flex; flex-direction:column; overflow:hidden;
+}
+header{
+  display:flex; align-items:baseline; gap:16px; flex-wrap:wrap;
+  padding:10px 18px; border-bottom:1px solid var(--line); background:var(--panel);
+}
+header h1{font-size:17px; font-weight:600;}
+header .meta{color:var(--muted); font-size:12.5px;}
+header .meta code{color:var(--text); background:var(--panel2); padding:1px 6px; border-radius:4px; font-size:12px;}
+#toolbar{
+  display:flex; align-items:center; gap:10px; flex-wrap:wrap;
+  padding:8px 18px; border-bottom:1px solid var(--line); background:var(--panel);
+}
+#search{
+  background:var(--panel2); border:1px solid var(--line); border-radius:6px;
+  color:var(--text); padding:5px 10px; width:230px; outline:none; font-size:13px;
+}
+#search:focus{border-color:var(--ui);}
+.flowchip{
+  border:1px solid var(--line); background:var(--panel2); color:var(--text);
+  border-radius:14px; padding:4px 12px; cursor:pointer; font-size:12.5px;
+}
+.flowchip:hover{border-color:var(--muted);}
+.flowchip.active{background:var(--hl-flow); color:#10131a; border-color:var(--hl-flow); font-weight:600;}
+#filters{display:flex; gap:10px; align-items:center; color:var(--muted); font-size:12.5px; flex-wrap:wrap;}
+#filters label{display:flex; gap:4px; align-items:center; cursor:pointer; user-select:none;}
+#main{flex:1; display:flex; min-height:0;}
+#canvasWrap{flex:1; position:relative; min-width:0;}
+svg{width:100%; height:100%; display:block; cursor:grab;}
+svg.panning{cursor:grabbing;}
+#legend{
+  position:absolute; left:14px; bottom:14px; background:rgba(22,27,34,.92);
+  border:1px solid var(--line); border-radius:8px; padding:10px 14px; font-size:12px; color:var(--muted);
+}
+#legend .row{display:flex; align-items:center; gap:8px; margin:3px 0;}
+#legend .sw{width:11px; height:11px; border-radius:3px; flex:none;}
+#legend .lrow{display:flex; align-items:center; gap:8px; margin:3px 0;}
+#legend .lsw{width:22px; height:0; border-top:2px solid; flex:none;}
+#hint{position:absolute; right:14px; bottom:14px; color:var(--faint); font-size:11.5px; text-align:right;}
+#panel{
+  width:390px; flex:none; border-left:1px solid var(--line); background:var(--panel);
+  overflow-y:auto; padding:16px 18px; display:none;
+}
+#panel.open{display:block;}
+#panel h2{font-size:15.5px; margin-bottom:2px; display:flex; align-items:center; gap:8px;}
+#panel h2 .dot{width:10px; height:10px; border-radius:3px; display:inline-block; flex:none;}
+#panel .path{color:var(--muted); font-size:12px; font-family:Consolas,monospace; margin-bottom:10px; word-break:break-all;}
+#panel h3{font-size:12px; text-transform:uppercase; letter-spacing:.6px; color:var(--faint); margin:14px 0 6px;}
+#panel ul{list-style:none;}
+#panel li{padding:4px 0; border-bottom:1px solid rgba(42,51,66,.5); font-size:13px;}
+#panel li:last-child{border-bottom:none;}
+#panel code{font-family:Consolas,monospace; font-size:12px; color:#bcd0e8; background:var(--panel2); padding:1px 5px; border-radius:4px;}
+#panel .ev{color:var(--faint); font-size:11.5px; font-family:Consolas,monospace;}
+#panel .sub{color:var(--muted); font-size:12px;}
+#panel .rel{cursor:pointer;}
+#panel .rel:hover code{color:#fff;}
+#panel .closebtn{float:right; background:none; border:none; color:var(--muted); font-size:18px; cursor:pointer;}
+#panel .flowref{cursor:pointer; color:var(--ui);}
+#panel .flowref:hover{text-decoration:underline;}
+#flowbar{
+  display:none; padding:8px 18px; border-bottom:1px solid var(--line);
+  background:var(--panel2); font-size:13px; color:var(--text);
+}
+#flowbar.open{display:block;}
+#flowbar b{color:var(--hl-flow);}
+#flowbar .steps{color:var(--muted); margin-top:3px; font-size:12.5px;}
+#flowbar .steps b{color:var(--text); font-weight:600;}
+.node{cursor:pointer;}
+.node rect{
+  fill:var(--panel2); stroke-width:1.6; rx:8;
+  transition:opacity .15s;
+}
+.node text{fill:var(--text); font-size:13px; font-weight:600; pointer-events:none;}
+.node .sub{fill:var(--muted); font-size:10.5px; font-weight:400;}
+.node .stepnum{fill:#10131a; font-size:11px; font-weight:700;}
+.edge{fill:none; stroke-width:1.5; transition:opacity .15s;}
+.edge.imports{stroke:#4a5568; stroke-dasharray:5 4;}
+.edge.calls{stroke:#7d8794;}
+.edge.reads{stroke:var(--io);}
+.edge.writes{stroke:var(--db);}
+.edge.publishes,.edge.subscribes{stroke:var(--core); stroke-dasharray:2 4;}
+.dim{opacity:.12;}
+.semi{opacity:.35;}
+.node.hl-up rect{stroke:var(--hl-up)!important; stroke-width:2.6;}
+.node.hl-down rect{stroke:var(--hl-down)!important; stroke-width:2.6;}
+.node.hl-sel rect{stroke:#fff!important; stroke-width:3;}
+.node.hl-test rect{stroke:var(--test)!important; stroke-width:2.6;}
+.node.hl-flow rect{stroke:var(--hl-flow)!important; stroke-width:2.8;}
+.edge.hl{stroke-width:3!important; opacity:1!important;}
+.edge.hl-flowedge{stroke:var(--hl-flow)!important; stroke-width:3!important; opacity:1!important;}
+.boundary{fill:none; stroke:var(--line); stroke-dasharray:7 5; rx:14;}
+.boundary-label{fill:var(--faint); font-size:11px; letter-spacing:.8px; text-transform:uppercase;}
+</style>
+</head>
+<body>
+<header>
+  <h1>csv_to_click</h1>
+  <span class="meta">карта кода · сгенерирована 2026-08-05T18:22:48+03:00 · коммит <code title="70eda36da4e5c6406d5593da175dda9a0ed4616b">70eda36</code> · ветка <code>docs/codemap</code></span>
+  <span class="meta">19 модулей · 89 связей · 5 потоков</span>
+</header>
+<div id="toolbar">
+  <input id="search" type="search" placeholder="Поиск: модуль, путь, символ…" autocomplete="off">
+  <span style="color:var(--faint)">Потоки:</span>
+  <span id="flowchips"></span>
+  <span id="filters"></span>
+</div>
+<div id="flowbar"></div>
+<div id="main">
+  <div id="canvasWrap">
+    <svg id="svg" xmlns="http://www.w3.org/2000/svg">
+      <defs>
+        <marker id="arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+          <path d="M0 0 L10 5 L0 10 z" fill="#6b7684"></path>
+        </marker>
+        <marker id="arr-hl" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+          <path d="M0 0 L10 5 L0 10 z" fill="#f0f4f8"></path>
+        </marker>
+      </defs>
+      <g id="viewport"></g>
+    </svg>
+    <div id="legend"></div>
+    <div id="hint">клик по модулю — связи и детали · клик по фону — сброс<br>колесо — масштаб · перетаскивание — панорама/узлы</div>
+  </div>
+  <aside id="panel"></aside>
+</div>
+
+<script id="codemap-data" type="application/json">
+{
+ "generated_at": "2026-08-05T18:22:48+03:00",
+ "generated_from_commit": "70eda36da4e5c6406d5593da175dda9a0ed4616b",
+ "scope": [
+  "src/csv_click",
+  "tests",
+  "benchmarks",
+  "loader.bat",
+  "README.md",
+  "pyproject.toml"
+ ],
+ "nodes": [
+  {
+   "id": "loader_bat",
+   "path": "loader.bat",
+   "role": "entrypoint",
+   "label": "loader.bat",
+   "summary": "Windows double-click bootstrap: finds or installs uv, syncs the locked .venv, smoke-checks imports, then hands off to csv_click.launcher with the venv python.",
+   "entrypoints": [
+    {
+     "symbol": "@echo off",
+     "line": 1,
+     "summary": "Top-level flow: cd to own folder -> find/install uv -> uv sync --locked --extra dev -> import check -> python -m csv_click.launcher; every failure branch pauses and exits 1"
+    },
+    {
+     "symbol": ":find_uv",
+     "line": 37,
+     "summary": "Locates uv.exe: first `where uv` on PATH, then sysconfig scripts dir for 'nt_user' (pip install --user layout) probed via py -3.12 / py / python"
+    },
+    {
+     "symbol": ":install_uv",
+     "line": 58,
+     "summary": "If uv missing, runs `pip install --user uv` with the first working Python launcher, remembers PYTHON_FOUND, then re-runs :find_uv because uv.exe lands outside PATH"
+    }
+   ],
+   "tests": [
+    {
+     "path": "tests/test_loader_bat.py",
+     "verifies": "Text pins on loader.bat: uv sync --locked, :find_uv off-PATH search, self-install of uv via pip --user, correct error branches (pip errorlevel 1, no false 'Python failed'), no dead vars, launch delegated to csv_click.launcher; plus README makes loader.bat the primary Windows path",
+     "node": "tests"
+    }
+   ],
+   "constraints": [
+    {
+     "text": "Always runs from its own directory: cd /d \"%~dp0\" makes the layout independent of invocation cwd",
+     "evidence": {
+      "path": "loader.bat",
+      "symbol": "%~dp0",
+      "line": 4
+     }
+    },
+    {
+     "text": "Expected install layout: venv python at <project>\\.venv\\Scripts\\python.exe, created by uv sync; missing file is a hard error (:venv_missing)",
+     "evidence": {
+      "path": "loader.bat",
+      "symbol": "VENV_PYTHON",
+      "line": 6
+     }
+    },
+    {
+     "text": "Environment installed strictly from lockfile: `uv sync --locked --extra dev`; a stale uv.lock aborts launch on purpose (keeps before/after load timings comparable)",
+     "evidence": {
+      "path": "loader.bat",
+      "symbol": "--locked",
+      "line": 18
+     }
+    },
+    {
+     "text": "Preflight requires streamlit, pandas and clickhouse_connect to be importable from the venv before launch",
+     "evidence": {
+      "path": "loader.bat",
+      "symbol": "clickhouse_connect",
+      "line": 24
+     }
+    },
+    {
+     "text": "src layout assumed: PYTHONPATH is set to %PROJECT_DIR%src so `-m csv_click.launcher` resolves without installing the package",
+     "evidence": {
+      "path": "loader.bat",
+      "symbol": "PYTHONPATH",
+      "line": 31
+     }
+    },
+    {
+     "text": "Python discovery order for finding/installing uv: \"py -3.12\", \"py\", \"python\" (no version check beyond `import sys` succeeding)",
+     "evidence": {
+      "path": "loader.bat",
+      "symbol": "py -3.12",
+      "line": 47
+     }
+    },
+    {
+     "text": "uv fallback location is the per-user scripts dir sysconfig.get_path('scripts','nt_user') — the only install path available without admin rights",
+     "evidence": {
+      "path": "loader.bat",
+      "symbol": "nt_user",
+      "line": 48
+     }
+    },
+    {
+     "text": "No uv version pin: whatever `where uv` or pip installs is used as-is; suggested admin install is winget id astral-sh.uv",
+     "evidence": {
+      "path": "loader.bat",
+      "symbol": "astral-sh.uv",
+      "line": 92
+     }
+    },
+    {
+     "text": "All failure paths `pause` (window stays open for the analyst) and exit /b 1",
+     "evidence": {
+      "path": "loader.bat",
+      "symbol": "exit /b 1",
+      "line": 94
+     }
+    }
+   ],
+   "evidence": {
+    "path": "loader.bat",
+    "symbol": ":find_uv",
+    "line": null
+   }
+  },
+  {
+   "id": "launcher",
+   "path": "src/csv_click/launcher.py",
+   "role": "entrypoint",
+   "label": "launcher.py",
+   "summary": "Post-bootstrap launcher: prints the copy's git version, picks a free localhost port, and execs Streamlit on src/csv_click/app.py using the same interpreter that runs the module.",
+   "entrypoints": [
+    {
+     "symbol": "main",
+     "line": 105,
+     "summary": "Prints version, chooses port, launches streamlit via subprocess.call and returns its exit code; own errors become `ERROR: ...` one-liners and return 1 instead of raising"
+    },
+    {
+     "symbol": "choose_free_port",
+     "line": 30,
+     "summary": "Bind-probes 127.0.0.1 starting at preferred port, returns first free; raises LauncherError after `attempts` misses"
+    },
+    {
+     "symbol": "describe_version",
+     "line": 54,
+     "summary": "Returns `git log -1 --format=%h %cs` output or None; never touches the network, any git failure maps to None"
+    },
+    {
+     "symbol": "streamlit_command",
+     "line": 85,
+     "summary": "Builds [sys.executable, -m, streamlit, run, app_path, --server.address 127.0.0.1, --server.port N]"
+    },
+    {
+     "symbol": "LauncherError",
+     "line": 26,
+     "summary": "Launch error explainable to the user in a single line"
+    },
+    {
+     "symbol": "DEFAULT_PORT",
+     "line": 21,
+     "summary": "8501 — Streamlit default; next free port is taken if busy"
+    },
+    {
+     "symbol": "PORT_ATTEMPTS",
+     "line": 23,
+     "summary": "10 — how many consecutive ports to try before giving up"
+    }
+   ],
+   "tests": [
+    {
+     "path": "tests/test_launcher.py",
+     "verifies": "Launcher module: free-port probing (busy port moves within +10, loud failure when none), git-based version string with date (None outside a repo or on git failure), streamlit command uses sys.executable and 127.0.0.1",
+     "node": "tests"
+    }
+   ],
+   "constraints": [
+    {
+     "text": "Port range is 8501..8510 (DEFAULT_PORT=8501, PORT_ATTEMPTS=10); all busy -> LauncherError, exit code 1",
+     "evidence": {
+      "path": "src/csv_click/launcher.py",
+      "symbol": "DEFAULT_PORT",
+      "line": 21
+     }
+    },
+    {
+     "text": "Port probe deliberately omits SO_REUSEADDR so binding a busy port fails and the check stays meaningful",
+     "evidence": {
+      "path": "src/csv_click/launcher.py",
+      "symbol": "SO_REUSEADDR",
+      "line": 37
+     }
+    },
+    {
+     "text": "Version lookup is offline by design (no origin/@{upstream} comparison); `git log` subprocess capped at timeout=10s, all failures return None rather than a made-up version",
+     "evidence": {
+      "path": "src/csv_click/launcher.py",
+      "symbol": "timeout=10",
+      "line": 75
+     }
+    },
+    {
+     "text": "Streamlit runs under sys.executable — assumed to be .venv python because loader.bat invokes the module with it; prevents launching with a foreign interpreter lacking deps",
+     "evidence": {
+      "path": "src/csv_click/launcher.py",
+      "symbol": "sys.executable",
+      "line": 93
+     }
+    },
+    {
+     "text": "UI is localhost-only: streamlit started with --server.address 127.0.0.1",
+     "evidence": {
+      "path": "src/csv_click/launcher.py",
+      "symbol": "127.0.0.1",
+      "line": 99
+     }
+    },
+    {
+     "text": "Assumes src/csv_click package layout: project root computed as Path(__file__).resolve().parents[2] (used only as cwd for git)",
+     "evidence": {
+      "path": "src/csv_click/launcher.py",
+      "symbol": "parents[2]",
+      "line": 106
+     }
+    },
+    {
+     "text": "App script is the sibling file app.py of launcher.py, resolved via with_name, not imported",
+     "evidence": {
+      "path": "src/csv_click/launcher.py",
+      "symbol": "with_name(\"app.py\")",
+      "line": 107
+     }
+    },
+    {
+     "text": "main() reports failures as printed one-liners plus return code (users are analysts for whom a Python traceback is a dead end)",
+     "evidence": {
+      "path": "src/csv_click/launcher.py",
+      "symbol": "LauncherError",
+      "line": 114
+     }
+    }
+   ],
+   "evidence": {
+    "path": "src/csv_click/launcher.py",
+    "symbol": "def main",
+    "line": 105
+   }
+  },
+  {
+   "id": "main",
+   "path": "src/csv_click/main.py",
+   "role": "entrypoint",
+   "label": "main.py",
+   "summary": "Thin alternative entry: re-exports csv_click.app.main and calls it under a __main__ guard (not part of the loader.bat chain, which goes through csv_click.launcher).",
+   "entrypoints": [
+    {
+     "symbol": "main",
+     "line": 1,
+     "summary": "Imported from csv_click.app and invoked directly when the module is run as a script"
+    }
+   ],
+   "tests": [],
+   "constraints": [
+    {
+     "text": "Runs app.main only under the __main__ guard; importing the module has no side effects beyond importing csv_click.app",
+     "evidence": {
+      "path": "src/csv_click/main.py",
+      "symbol": "\"__main__\"",
+      "line": 4
+     }
+    }
+   ],
+   "evidence": {
+    "path": "src/csv_click/main.py",
+    "symbol": "from csv_click.app import main",
+    "line": 1
+   }
+  },
+  {
+   "id": "app",
+   "path": "src/csv_click/app.py",
+   "role": "ui",
+   "label": "app.py",
+   "summary": "Streamlit UI entrypoint: renders the 5-step CSV-to-ClickHouse wizard (Read CSV, Column mapping, Type review, ClickHouse/load parameters, Create tables and load), owns all session-state contracts, and hosts the once-per-second polling load panel with cancel that lives outside the step flow.",
+   "entrypoints": [
+    {
+     "symbol": "main",
+     "line": 143,
+     "summary": "Page entrypoint: set_page_config, resets HELP_SLOTS_KEY/RENDERED_STEPS_KEY, runs _render_load_flow then _render_load_panel, and in a finally block fills the step-path caption and help expanders so they never lag a step behind."
+    },
+    {
+     "symbol": "LOAD_STEPS",
+     "line": 66,
+     "summary": "Tuple of 5 LoadStep(key,title) — single source of truth for wizard step numbering and titles."
+    },
+    {
+     "symbol": "step_heading",
+     "line": 82,
+     "summary": "Builds 'Step N of 5 — Title' heading from LOAD_STEPS; unknown key returns the key itself."
+    },
+    {
+     "symbol": "step_path_line",
+     "line": 95,
+     "summary": "One-line breadcrumb of all steps with check marks and a bold 'you are here' marker; unknown key just omits the marker."
+    },
+    {
+     "symbol": "current_step_key",
+     "line": 124,
+     "summary": "Deepest step actually rendered this run (from RENDERED_STEPS_KEY), deliberately not derived from confirmation flags."
+    },
+    {
+     "symbol": "load_progress_line",
+     "line": 1091,
+     "summary": "Returns (fraction, caption) for load progress computed from bytes read of the source file, not rows."
+    },
+    {
+     "symbol": "tables_fate_caption",
+     "line": 1127,
+     "summary": "Maps a load_job tables-fate constant to a human caption; unknown fate is shown verbatim, never silent."
+    },
+    {
+     "symbol": "TABLES_FATE_CAPTIONS",
+     "line": 1113,
+     "summary": "Dict from the five load_job TABLES_* fate constants to operator-facing captions."
+    },
+    {
+     "symbol": "main",
+     "line": 1281,
+     "summary": "if __name__ == '__main__': main() — file is runnable directly; lines 8-9 add parent dir to sys.path when run without a package."
+    }
+   ],
+   "tests": [
+    {
+     "path": "tests/test_app_steps.py",
+     "verifies": "Step navigation UI: every step knows its number/total, the single path-line caption tracks the actually-open step through AppTest runs (incl. failed mapping not claiming a later step), exactly one expander open at a time",
+     "node": "tests"
+    },
+    {
+     "path": "tests/test_readme_matches_the_app.py",
+     "verifies": "README-vs-app consistency: every button name in README exists in app.py (AST-extracted), mandatory steps present and in enforced order, README type list matches CLICKHOUSE_TYPE_OPTIONS both ways, no rand() sharding promise",
+     "node": "tests"
+    },
+    {
+     "path": "tests/test_app_form_state.py",
+     "verifies": "Connection/load form widget state via AppTest: ORDER BY / sharding key / table name / PARTITION BY survive a hidden rerun, dropped column warns once and falls back, second consecutive edit applies, reading another CSV clears table-scoped choices",
+     "node": "tests"
+    },
+    {
+     "path": "tests/test_app_load_ui.py",
+     "verifies": "Job-state-to-screen contract (jobs built by state, no threads): running panel shows phase/bytes progress/cancel/log tail, results survive reruns and name tables fate, second start warns instead of replacing, vanished CSV gives an error not a traceback, log tail is bounded (O(n2) fix)",
+     "node": "tests"
+    },
+    {
+     "path": "tests/test_app_state.py",
+     "verifies": "Source-structure pins (no execution): widget keys disjoint from session_state keys, _render_load_flow step order, _start_load uses type_rows and re-checks encoding, LoadJob.run passes payload limit/cancel/progress kwargs to the loader and writes the run record from finally",
+     "node": "tests"
+    }
+   ],
+   "constraints": [
+    {
+     "text": "LOAD_STEPS is the single source of truth for step numbering/titles; headings and the path line derive from it so numbering cannot drift when a step is inserted.",
+     "evidence": {
+      "path": "src/csv_click/app.py",
+      "symbol": "LOAD_STEPS",
+      "line": 66
+     }
+    },
+    {
+     "text": "Current step = deepest step actually rendered this run (RENDERED_STEPS_KEY), not confirmation flags: a downstream block can fail validation and return None without clearing its flag, and the last step has no flag at all.",
+     "evidence": {
+      "path": "src/csv_click/app.py",
+      "symbol": "RENDERED_STEPS_KEY",
+      "line": 116
+     }
+    },
+    {
+     "text": "rendered_steps and help_slots are wiped at the top of every script run in main(); they are per-run scratch, not persistent state.",
+     "evidence": {
+      "path": "src/csv_click/app.py",
+      "symbol": "st.session_state[RENDERED_STEPS_KEY] = []",
+      "line": 151
+     }
+    },
+    {
+     "text": "Help expanders reserve an st.empty() slot during render but the expanded/collapsed decision is deferred to end of run; only the current step's help is expanded.",
+     "evidence": {
+      "path": "src/csv_click/app.py",
+      "symbol": "_fill_step_help_slots",
+      "line": 303
+     }
+    },
+    {
+     "text": "HELP_SLOTS_KEY lives in session_state, not a module global, because one process serves multiple sessions and a shared list would mix their help slots.",
+     "evidence": {
+      "path": "src/csv_click/app.py",
+      "symbol": "HELP_SLOTS_KEY",
+      "line": 281
+     }
+    },
+    {
+     "text": "Fast-sample schema inference reads only the first 100000 rows (DEFAULT_SCHEMA_SAMPLE_ROWS); Full scan reads the whole CSV before type review.",
+     "evidence": {
+      "path": "src/csv_click/app.py",
+      "symbol": "Fast sample, 100000 rows",
+      "line": 163
+     }
+    },
+    {
+     "text": "CSV_READ_STATE_KEYS enumerates the per-file session-state contract (csv_path, schema_rows, mapping_rows, type_rows, mapping_confirmed, types_confirmed, load_params, csv_preview_rows, csv_preview_warning) cleared when a new file is read.",
+     "evidence": {
+      "path": "src/csv_click/app.py",
+      "symbol": "CSV_READ_STATE_KEYS",
+      "line": 166
+     }
+    },
+    {
+     "text": "CHOICE_STATE_KEYS (order_by_choice, sharding_column_choice, distributed_table_choice, partition_by_choice) must survive reruns within one read CSV but must NOT carry over to another file; cleared together with their *_widget twins.",
+     "evidence": {
+      "path": "src/csv_click/app.py",
+      "symbol": "CHOICE_STATE_KEYS",
+      "line": 182
+     }
+    },
+    {
+     "text": "Only the last 400 log lines (LOAD_LOG_TAIL_LINES) go to the socket; the full log stays in memory — resending it whole on each block was the O(n^2).",
+     "evidence": {
+      "path": "src/csv_click/app.py",
+      "symbol": "LOAD_LOG_TAIL_LINES",
+      "line": 190
+     }
+    },
+    {
+     "text": "The progress fragment re-reads job state every 1.0 s (LOAD_PROGRESS_POLL_S); the load never writes to the UI, so RerunException physically cannot reach the producer.",
+     "evidence": {
+      "path": "src/csv_click/app.py",
+      "symbol": "LOAD_PROGRESS_POLL_S",
+      "line": 194
+     }
+    },
+    {
+     "text": "_remembered_selectbox never passes index=: in Streamlit 1.58 index enters widget identity and restoring via index broke the second consecutive choice; value is restored by pre-setting the widget key while key= keeps identity constant.",
+     "evidence": {
+      "path": "src/csv_click/app.py",
+      "symbol": "index=",
+      "line": 445
+     }
+    },
+    {
+     "text": "Choice slots are written ONLY from on_change (an operator action); writing them on render made untouched defaults masquerade as choices.",
+     "evidence": {
+      "path": "src/csv_click/app.py",
+      "symbol": "_remember_choice",
+      "line": 484
+     }
+    },
+    {
+     "text": "If a stored choice's column left the options list, the choice is annulled on the spot (slot popped) with a one-time warning; a returning column does not resurrect the choice, because on_change fires only on value CHANGE.",
+     "evidence": {
+      "path": "src/csv_click/app.py",
+      "symbol": "st.session_state.pop(state_key, None)",
+      "line": 476
+     }
+    },
+    {
+     "text": "_remembered_text_input restores stored value by pre-setting the widget key; deliberate clearing is an action too — an empty string is remembered, not overridden by the previous value.",
+     "evidence": {
+      "path": "src/csv_click/app.py",
+      "symbol": "st.session_state[widget_key] = stored",
+      "line": 503
+     }
+    },
+    {
+     "text": "Load workers are capped at 6 parallel insert workers.",
+     "evidence": {
+      "path": "src/csv_click/app.py",
+      "symbol": "max_value=6",
+      "line": 547
+     }
+    },
+    {
+     "text": "Step gating: each renderer returns None until its confirm ran; mapping gate is the mapping_confirmed flag, types gate is types_confirmed, and _render_load_flow stops at the first None.",
+     "evidence": {
+      "path": "src/csv_click/app.py",
+      "symbol": "mapping_confirmed",
+      "line": 976
+     }
+    },
+    {
+     "text": "Apply column mapping invalidates downstream state: sets types_confirmed=False and pops load_params before rebuilding type_rows.",
+     "evidence": {
+      "path": "src/csv_click/app.py",
+      "symbol": "types_confirmed",
+      "line": 972
+     }
+    },
+    {
+     "text": "load_params is written to session_state unconditionally on every successful params render (not only on Apply); the Apply button additionally persists AppSettings to disk.",
+     "evidence": {
+      "path": "src/csv_click/app.py",
+      "symbol": "st.session_state[\"load_params\"] = params",
+      "line": 653
+     }
+    },
+    {
+     "text": "The load panel renders OUTSIDE the step flow: after F5 session_state is empty and the wizard collapses to step 1, but a background load and the last run's summary must stay on screen.",
+     "evidence": {
+      "path": "src/csv_click/app.py",
+      "symbol": "_render_load_panel",
+      "line": 157
+     }
+    },
+    {
+     "text": "Everything touching session_state happens on the script thread BEFORE job start: the background thread has no ScriptRunContext and st.* does not work from it.",
+     "evidence": {
+      "path": "src/csv_click/app.py",
+      "symbol": "ScriptRunContext",
+      "line": 1150
+     }
+    },
+    {
+     "text": "Single load job per process: checked via current_load_job().is_running before building the job, and re-checked under a lock inside start_load_job (two sessions may click simultaneously).",
+     "evidence": {
+      "path": "src/csv_click/app.py",
+      "symbol": "start_load_job",
+      "line": 1194
+     }
+    },
+    {
+     "text": "Progress fraction is computed from bytes read (src_read_bytes/src_bytes), not rows — total rows of a large CSV are unknown; caption states reading runs ahead of confirmed inserts.",
+     "evidence": {
+      "path": "src/csv_click/app.py",
+      "symbol": "src_read_bytes",
+      "line": 1102
+     }
+    },
+    {
+     "text": "Cancel semantics: blocks already in flight finish and are counted, nothing new goes out; the Cancel button disables itself once cancel_requested.",
+     "evidence": {
+      "path": "src/csv_click/app.py",
+      "symbol": "blocks already in flight will finish and be counted, ",
+      "line": 1246
+     }
+    },
+    {
+     "text": "CSV path must exist on the machine running Streamlit (server-side path), checked before any state mutation.",
+     "evidence": {
+      "path": "src/csv_click/app.py",
+      "symbol": "Path(csv_path).exists()",
+      "line": 836
+     }
+    },
+    {
+     "text": "Preview reads only 20 rows (nrows=20) via choose_read_options_for_preview, both at Read CSV time and re-checked at load start.",
+     "evidence": {
+      "path": "src/csv_click/app.py",
+      "symbol": "nrows=20",
+      "line": 904
+     }
+    },
+    {
+     "text": "When the job finishes between fragment ticks, the fragment triggers exactly one full app rerun so the summary renders outside the fragment.",
+     "evidence": {
+      "path": "src/csv_click/app.py",
+      "symbol": "st.rerun(scope=\"app\")",
+      "line": 1230
+     }
+    },
+    {
+     "text": "Mapping validation: at least one column included, no empty target names, no duplicate target names — enforced before mapping_confirmed is set.",
+     "evidence": {
+      "path": "src/csv_click/app.py",
+      "symbol": "At least one column must be included",
+      "line": 1073
+     }
+    },
+    {
+     "text": "custom_type overrides final_type when filled (type editor column help contract).",
+     "evidence": {
+      "path": "src/csv_click/app.py",
+      "symbol": "If filled, it overrides final_type.",
+      "line": 1003
+     }
+    },
+    {
+     "text": "Insert compression defaults to 'off' because Content-Encoding was never tried against the operator's proxy; measured zstd figure (3.8x fewer bytes for 19 s CPU on 9.5 GB) is stated in the widget help.",
+     "evidence": {
+      "path": "src/csv_click/app.py",
+      "symbol": "Off by default because Content-Encoding has never been tried against ",
+      "line": 563
+     }
+    },
+    {
+     "text": "The step-path caption slot is reserved before the flow and filled in a finally block after all blocks ran, so it can never lag one step behind.",
+     "evidence": {
+      "path": "src/csv_click/app.py",
+      "symbol": "path_slot.caption",
+      "line": 159
+     }
+    },
+    {
+     "text": "CSV-read cancellation is cooperative: csv_read_cancel_requested is polled between analysis phases and passed as cancel_callback into the full-scan analyzer.",
+     "evidence": {
+      "path": "src/csv_click/app.py",
+      "symbol": "cancel_callback=_csv_read_cancel_requested",
+      "line": 912
+     }
+    },
+    {
+     "text": "OSError between 'Read CSV' and the load click (file vanished) is caught in _start_load and shown as an error instead of a raw traceback — the path is existence-checked only on step 1.",
+     "evidence": {
+      "path": "src/csv_click/app.py",
+      "symbol": "CSV file error",
+      "line": 1171
+     }
+    },
+    {
+     "text": "app_settings are lazily loaded once per session and cached in session_state; a failed save (OSError) warns but keeps the old cached settings.",
+     "evidence": {
+      "path": "src/csv_click/app.py",
+      "symbol": "app_settings",
+      "line": 679
+     }
+    }
+   ],
+   "evidence": {
+    "path": "src/csv_click/app.py",
+    "symbol": "def main",
+    "line": 143
+   }
+  },
+  {
+   "id": "settings",
+   "path": "src/csv_click/settings.py",
+   "role": "config",
+   "label": "settings.py",
+   "summary": "Frozen AppSettings dataclass persisted as JSON at ~/.csv_click/settings.json, with lenient load: defaults on missing/corrupt file, unknown keys dropped, legacy batch_size migration.",
+   "entrypoints": [
+    {
+     "symbol": "DEFAULT_SETTINGS_PATH",
+     "line": 16,
+     "summary": "Path.home() / .csv_click / settings.json"
+    },
+    {
+     "symbol": "AppSettings",
+     "line": 20,
+     "summary": "Frozen dataclass: host/port/username/secure/verify/client_cert/client_key (defaults from clickhouse.py), database=sandbox, cluster=clickhouse, batch_size=100_000, max_insert_payload_mb=16, load_workers=1, insert_compression=off, strict_preflight=True, separator=',', encoding=utf_8"
+    },
+    {
+     "symbol": "load_app_settings",
+     "line": 43,
+     "summary": "Reads JSON from settings_path; falls back to defaults on OSError/JSONDecodeError; filters unknown keys; migrates legacy batch_size"
+    },
+    {
+     "symbol": "save_app_settings",
+     "line": 62,
+     "summary": "mkdir -p the parent and write asdict(settings) as UTF-8 indented JSON"
+    }
+   ],
+   "tests": [
+    {
+     "path": "tests/test_settings.py",
+     "verifies": "AppSettings persistence: platform-aware cert path defaults (Windows vs jovyan), configured paths win, save/load round-trip, old default batch_size migrated to 100_000, table-specific fields never saved",
+     "node": "tests"
+    },
+    {
+     "path": "tests/test_app_form_state.py",
+     "verifies": "Connection/load form widget state via AppTest: ORDER BY / sharding key / table name / PARTITION BY survive a hidden rerun, dropped column warns once and falls back, second consecutive edit applies, reading another CSV clears table-scoped choices",
+     "node": "tests"
+    }
+   ],
+   "constraints": [
+    {
+     "text": "AppSettings is frozen (immutable) — updates require constructing a new instance",
+     "evidence": {
+      "path": "src/csv_click/settings.py",
+      "symbol": "frozen=True",
+      "line": 19
+     }
+    },
+    {
+     "text": "Missing, unreadable, or corrupt settings file silently yields all-defaults AppSettings",
+     "evidence": {
+      "path": "src/csv_click/settings.py",
+      "symbol": "json.JSONDecodeError",
+      "line": 48
+     }
+    },
+    {
+     "text": "Unknown JSON keys are dropped on load: only current dataclass field names are accepted",
+     "evidence": {
+      "path": "src/csv_click/settings.py",
+      "symbol": "allowed_fields",
+      "line": 51
+     }
+    },
+    {
+     "text": "Legacy migration: batch_size == 1_000_000 is downgraded to 100_000 when max_insert_payload_mb is absent from the raw JSON",
+     "evidence": {
+      "path": "src/csv_click/settings.py",
+      "symbol": "max_insert_payload_mb",
+      "line": 57
+     }
+    },
+    {
+     "text": "insert_compression defaults to 'off' (values: off, zstd, lz4, gzip) because Content-Encoding was one of the three variables that distinguished the insert() call that broke on this proxy; zstd measured 3.76x fewer bytes",
+     "evidence": {
+      "path": "src/csv_click/settings.py",
+      "symbol": "insert_compression",
+      "line": 37
+     }
+    },
+    {
+     "text": "Batching defaults: batch_size=100_000 rows, max_insert_payload_mb=16, load_workers=1",
+     "evidence": {
+      "path": "src/csv_click/settings.py",
+      "symbol": "batch_size",
+      "line": 30
+     }
+    },
+    {
+     "text": "Password is deliberately NOT a field of AppSettings — it is never persisted to settings.json",
+     "evidence": {
+      "path": "src/csv_click/settings.py",
+      "symbol": "username",
+      "line": 23
+     }
+    }
+   ],
+   "evidence": {
+    "path": "src/csv_click/settings.py",
+    "symbol": "class AppSettings",
+    "line": 20
+   }
+  },
+  {
+   "id": "schema",
+   "path": "src/csv_click/schema.py",
+   "role": "core",
+   "label": "schema.py",
+   "summary": "CSV-to-ClickHouse type mapping: per-value _ColumnStats accumulation, type inference (_infer_type) with exact range-based widening, nullable decision, identifier normalization, ClickHouse type-expression validation, and strict per-value conversion (convert_value); it produces validated type expressions and column names but no DDL itself.",
+   "entrypoints": [
+    {
+     "symbol": "NA_MARKERS",
+     "line": 22,
+     "summary": "frozenset of 19 missing-value spellings mirroring pandas default na_values; the single source of truth for both inference and load."
+    },
+    {
+     "symbol": "CLICKHOUSE_TYPE_OPTIONS",
+     "line": 33,
+     "summary": "The type editor's selectbox list; every type inference can pick must be present here."
+    },
+    {
+     "symbol": "validate_clickhouse_type_expression",
+     "line": 67,
+     "summary": "Rejects unsafe type expressions: ';', '--', '/*', '*/', CR/LF, non-letter start, top-level comma, unbalanced parentheses."
+    },
+    {
+     "symbol": "CsvColumn",
+     "line": 119,
+     "summary": "One inferred column: column_name, source_name, inferred_type, final_type, nullable, sample_values, notes."
+    },
+    {
+     "symbol": "CsvSchema",
+     "line": 130,
+     "summary": "List of CsvColumn with source_names/column_names properties."
+    },
+    {
+     "symbol": "_ColumnStats",
+     "line": 143,
+     "summary": "Per-column accumulator (private but consumed by pandas_loader): type flags, NA/unsendable-float/lossy-text flags, decimal digit and scale maxima, exact integer and date bounds, up to 5 sample values; add_value at line 179."
+    },
+    {
+     "symbol": "normalize_identifier",
+     "line": 246,
+     "summary": "Header to ClickHouse column name: unicode-aware \\W+ -> _, lowercased, digit-leading prefixed col_, empty result raises CsvSchemaError."
+    },
+    {
+     "symbol": "analyze_csv_schema",
+     "line": 267,
+     "summary": "Stdlib csv.DictReader-based full-file inference (utf-8-sig, sniffed dialect) producing CsvSchema."
+    },
+    {
+     "symbol": "convert_value",
+     "line": 307,
+     "summary": "Strict single-value conversion for Int64/UInt64/Float64/Decimal/Date/Date32/DateTime/Bool/String honoring Nullable; used by pandas_loader for Decimal and Bool series."
+    },
+    {
+     "symbol": "unwrap_nullable",
+     "line": 357,
+     "summary": "(nullable, inner_type) that sees Nullable THROUGH LowCardinality: LowCardinality(Nullable(String)) reports nullable=True."
+    },
+    {
+     "symbol": "_infer_type",
+     "line": 374,
+     "summary": "Priority inference: String fallbacks (empty/NA-only, unsendable float, lossy numeric text) -> Bool -> UInt64/Int64 (widened) -> Decimal -> Date/Date32 -> DateTime -> Float64 -> String; returns (type, note)."
+    },
+    {
+     "symbol": "_needs_nullable",
+     "line": 529,
+     "summary": "Nullable if any empty cell, or an NA marker was seen and the inferred type is not String."
+    },
+    {
+     "symbol": "DATE_RANGE",
+     "line": 426,
+     "summary": "ClickHouse Date bounds 1970-01-01..2149-06-06; DATE32_RANGE (line 427) 1900-01-01..2299-12-31."
+    },
+    {
+     "symbol": "UINT64_RANGE",
+     "line": 438,
+     "summary": "Exact int bounds (0, 2**64-1); INT64_RANGE (line 439) (-(2**63), 2**63-1); deliberately int not Decimal to avoid 28-digit context rounding."
+    }
+   ],
+   "tests": [
+    {
+     "path": "tests/test_readme_matches_the_app.py",
+     "verifies": "README-vs-app consistency: every button name in README exists in app.py (AST-extracted), mandatory steps present and in enforced order, README type list matches CLICKHOUSE_TYPE_OPTIONS both ways, no rand() sharding promise",
+     "node": "tests"
+    },
+    {
+     "path": "tests/test_app_form_state.py",
+     "verifies": "Connection/load form widget state via AppTest: ORDER BY / sharding key / table name / PARTITION BY survive a hidden rerun, dropped column warns once and falls back, second consecutive edit applies, reading another CSV clears table-scoped choices",
+     "node": "tests"
+    },
+    {
+     "path": "tests/test_clickhouse.py",
+     "verifies": "ClickHouse layer with fake clients: DDL builders (backtick quoting incl. cyrillic, injection refusal, sharding key required), create_tables drop/verify/rollback ordering incl. TableCleanupError, certificate validation, raw_insert_batch JSONEachRow + compression kwarg, summary_elapsed_ns None-vs-zero",
+     "node": "tests"
+    },
+    {
+     "path": "tests/test_schema.py",
+     "verifies": "Full-file type inference: leading zeros/plus force String, Decimal/integer/date widening at exact boundaries, NaN/inf literal handling matches load-path NA markers, inferred type always in the editor list and passes strict validation, cyrillic identifiers normalize",
+     "node": "tests"
+    }
+   ],
+   "constraints": [
+    {
+     "text": "NA_MARKERS deliberately mirrors pandas default na_values (file is read with keep_default_na=False); inference must consult this exact list, not float()-style nan parsing, or sums vanish silently.",
+     "evidence": {
+      "path": "src/csv_click/schema.py",
+      "symbol": "NA_MARKERS",
+      "line": 22
+     }
+    },
+    {
+     "text": "An NA marker means missing for every type except String, where it stays literal text; the nullable decision is therefore deferred until the type is known.",
+     "evidence": {
+      "path": "src/csv_click/schema.py",
+      "symbol": "has_na_marker",
+      "line": 157
+     }
+    },
+    {
+     "text": "Bool is inferred only when all values are bool-like AND at least one explicit literal (true/false/yes/no/y/n) was seen — a column of pure 0/1 stays numeric.",
+     "evidence": {
+      "path": "src/csv_click/schema.py",
+      "symbol": "has_explicit_bool_literal",
+      "line": 381
+     }
+    },
+    {
+     "text": "nan/infinity spellings outside NA_MARKERS (float() accepts 24 spellings, the loader only 4) force String: to_json would silently emit null for them.",
+     "evidence": {
+      "path": "src/csv_click/schema.py",
+      "symbol": "has_unsendable_float",
+      "line": 383
+     }
+    },
+    {
+     "text": "Values that only look numeric — leading zeros, leading '+', non-ASCII digits — force String because parsing would alter the text irrecoverably (bank accounts, phone numbers).",
+     "evidence": {
+      "path": "src/csv_click/schema.py",
+      "symbol": "_loses_text_as_number",
+      "line": 588
+     }
+    },
+    {
+     "text": "Integer widening uses exact value bounds, not digit count: fits UInt64/Int64 -> native type; else Decimal(38,0) then Decimal(76,0) (limit computed as integer 10**precision - 1, line 465); beyond 76 digits -> String.",
+     "evidence": {
+      "path": "src/csv_click/schema.py",
+      "symbol": "_integer_type",
+      "line": 445
+     }
+    },
+    {
+     "text": "Integer bounds are exact Python int, not Decimal: the default decimal context rounds at 28 significant digits, so Decimal(10)**38 - 1 silently became 10**38.",
+     "evidence": {
+      "path": "src/csv_click/schema.py",
+      "symbol": "UINT64_RANGE",
+      "line": 438
+     }
+    },
+    {
+     "text": "Decimal precision counts ALL significant digits (max_decimal_int_digits + scale); scale is bucketed to 2 (widths 18/38/76) or 10 (widths 38/76); scale > 10 falls back to Float64; > 76 digits falls back to String, never silent Float64 rounding.",
+     "evidence": {
+      "path": "src/csv_click/schema.py",
+      "symbol": "_decimal_type",
+      "line": 500
+     }
+    },
+    {
+     "text": "Date must fit 1970-01-01..2149-06-06, Date32 1900-01-01..2299-12-31; dates outside Date32 fall back to String — the server would reject them while Python date happily holds them.",
+     "evidence": {
+      "path": "src/csv_click/schema.py",
+      "symbol": "DATE_RANGE",
+      "line": 426
+     }
+    },
+    {
+     "text": "Timestamps carrying a timezone offset infer as String: the load path parses a fixed zone-less format, and dropping the offset would silently shift every time.",
+     "evidence": {
+      "path": "src/csv_click/schema.py",
+      "symbol": "has_timezone_offset",
+      "line": 409
+     }
+    },
+    {
+     "text": "Nullable rule: any empty cell -> nullable; an NA marker -> nullable only for non-String types (String keeps the marker as text).",
+     "evidence": {
+      "path": "src/csv_click/schema.py",
+      "symbol": "_needs_nullable",
+      "line": 529
+     }
+    },
+    {
+     "text": "normalize_identifier keeps letters/digits of ANY script (unicode \\W), critical for Cyrillic headers; names are backticked downstream (DDL via quote_column_identifier, INSERT list by the driver) and JSONEachRow keys are raw UTF-8 matching force_ascii=False.",
+     "evidence": {
+      "path": "src/csv_click/schema.py",
+      "symbol": "re.sub(r\"\\W+\", \"_\", value.strip().lower())",
+      "line": 258
+     }
+    },
+    {
+     "text": "unwrap_nullable sees Nullable through LowCardinality because LowCardinality(Nullable(X)) is the only valid nesting; without this the converter treated such columns as non-nullable and crashed on the first missing value.",
+     "evidence": {
+      "path": "src/csv_click/schema.py",
+      "symbol": "unwrap_nullable",
+      "line": 357
+     }
+    },
+    {
+     "text": "_decimal_shape counts integer digits via adjusted()+1 so 1E+30 needs 31 digits; a zero mantissa contributes 0 digits (0E+30 must not widen the column); nan/inf/snan have non-int exponents and are not Decimal.",
+     "evidence": {
+      "path": "src/csv_click/schema.py",
+      "symbol": "_decimal_shape",
+      "line": 606
+     }
+    },
+    {
+     "text": "analyze_csv_schema reads the file as utf-8-sig and sniffs the dialect from the first 8192 characters with delimiters ,;\\t| falling back to excel.",
+     "evidence": {
+      "path": "src/csv_click/schema.py",
+      "symbol": "csv.Sniffer().sniff(sample, delimiters=\",;\\t|\")",
+      "line": 553
+     }
+    },
+    {
+     "text": "convert_value validates strictly per type: Int64/UInt64 by regex, Date/Date32 by date.fromisoformat, DateTime by datetime.fromisoformat, Bool truthy set {true, 1, yes, y}; unknown types pass through as text after expression validation.",
+     "evidence": {
+      "path": "src/csv_click/schema.py",
+      "symbol": "convert_value",
+      "line": 307
+     }
+    }
+   ],
+   "evidence": {
+    "path": "src/csv_click/schema.py",
+    "symbol": "_infer_type",
+    "line": 374
+   }
+  },
+  {
+   "id": "pandas_loader",
+   "path": "src/csv_click/pandas_loader.py",
+   "role": "core",
+   "label": "pandas_loader.py",
+   "summary": "Serialization and loading engine: reads CSV in pandas chunks, converts them to the target ClickHouse column types, serializes to JSONEachRow blocks (Arrow fast path with byte-exact to_json fallback), optionally compresses, and inserts blocks via raw_insert_batch sequentially or through a worker pool with cancel/progress accounting.",
+   "entrypoints": [
+    {
+     "symbol": "ReadOptions",
+     "line": 41,
+     "summary": "Frozen dataclass of CSV read parameters: separator=',', encoding='utf_8', batch_size=100_000 rows per pandas chunk."
+    },
+    {
+     "symbol": "SchemaMapping",
+     "line": 66,
+     "summary": "Frozen dataclass of one editable column mapping: source_name, target_name, include, final_type, nullable, inferred_type, sample_values, notes."
+    },
+    {
+     "symbol": "MojibakeWarning",
+     "line": 60,
+     "summary": "Warning payload with message and suggested encodings for mojibake detection."
+    },
+    {
+     "symbol": "DEFAULT_MAX_INSERT_PAYLOAD_BYTES",
+     "line": 47,
+     "summary": "Default insert block cap: 16 * 1024 * 1024 bytes."
+    },
+    {
+     "symbol": "NATIVELY_PARSED_TYPES",
+     "line": 83,
+     "summary": "Types pandas parses natively (Int8..Int64, UInt8..UInt64, Float64); everything else is read as raw text."
+    },
+    {
+     "symbol": "COMPRESSION_CODECS",
+     "line": 623,
+     "summary": "Wire codecs supported end-to-end: zstd, lz4, gzip (plus COMPRESSION_OFF='off' at line 624)."
+    },
+    {
+     "symbol": "text_columns_for",
+     "line": 107,
+     "summary": "Set of source columns whose unwrapped final type is outside NATIVELY_PARSED_TYPES and therefore must arrive as raw text."
+    },
+    {
+     "symbol": "iter_pandas_chunks",
+     "line": 146,
+     "summary": "Chunked pd.read_csv iterator shared by preview/inference/load: per-column dtype/na_values, compression inference, byte-read progress callback."
+    },
+    {
+     "symbol": "preview_csv_rows",
+     "line": 259,
+     "summary": "First nrows of the CSV as all-text DataFrame (dtype=str, keep_default_na=False), header stripped."
+    },
+    {
+     "symbol": "choose_read_options_for_preview",
+     "line": 287,
+     "summary": "Tries ENCODING_SUGGESTIONS, scores mojibake, auto-selects the best encoding or raises."
+    },
+    {
+     "symbol": "detect_mojibake",
+     "line": 343,
+     "summary": "Returns MojibakeWarning when preview scores mojibake markers."
+    },
+    {
+     "symbol": "analyze_csv_with_pandas_sample",
+     "line": 366,
+     "summary": "Schema inference from the first DEFAULT_SCHEMA_SAMPLE_ROWS=100_000 rows (fast sample mode)."
+    },
+    {
+     "symbol": "analyze_csv_with_pandas_chunks",
+     "line": 388,
+     "summary": "Schema inference over the whole file in chunks, cancellable via cancel_callback raising CsvReadCancelled."
+    },
+    {
+     "symbol": "schema_to_mappings",
+     "line": 451,
+     "summary": "CsvSchema to list[SchemaMapping] for the type editor."
+    },
+    {
+     "symbol": "mappings_to_schema",
+     "line": 467,
+     "summary": "Editor mappings back to CsvSchema; normalizes Nullable placement and validates each type expression."
+    },
+    {
+     "symbol": "mappings_to_editor_rows",
+     "line": 498,
+     "summary": "Mappings to plain dict rows for the Streamlit data editor."
+    },
+    {
+     "symbol": "mappings_from_editor_rows",
+     "line": 515,
+     "summary": "Editor rows back to mappings; custom_type overrides final_type, nullable flag reconciled via _normalize_nullable_type."
+    },
+    {
+     "symbol": "convert_chunk_to_schema",
+     "line": 537,
+     "summary": "Converts one chunk column-by-column via _convert_series; on failure bisects for the first bad value (_first_bad_value) and raises CsvSchemaError with chunk/column/value."
+    },
+    {
+     "symbol": "validate_csv_with_pandas_chunks",
+     "line": 562,
+     "summary": "Dry run: full read + convert + serialize with no inserts; returns row count."
+    },
+    {
+     "symbol": "validate_csv_sample_with_pandas_chunks",
+     "line": 585,
+     "summary": "Same dry run capped at sample_rows (default 200_000)."
+    },
+    {
+     "symbol": "wire_codec",
+     "line": 627,
+     "summary": "Normalizes compression setting: '' or 'off' becomes None so it never reaches Content-Encoding."
+    },
+    {
+     "symbol": "compress_payload",
+     "line": 641,
+     "summary": "Compresses a block body with a fresh clickhouse_connect compressor per call (compressors are not thread-safe)."
+    },
+    {
+     "symbol": "chunk_to_json_lines",
+     "line": 695,
+     "summary": "Whole chunk to JSONEachRow bytes: Arrow fast path (_arrow_json_lines, ~3.5x faster) else byte-exact to_json reference (_pandas_json_lines)."
+    },
+    {
+     "symbol": "iter_json_each_row_payloads",
+     "line": 880,
+     "summary": "Slices a converted chunk into (payload_bytes, rows) blocks not exceeding max_payload_bytes, using a 1024-row size estimate and a pending-lines buffer so each row serializes exactly once."
+    },
+    {
+     "symbol": "load_csv_via_raw_insert",
+     "line": 972,
+     "summary": "Main load entrypoint: read -> convert -> serialize -> compress -> raw_insert_batch per block; worker_count>1 dispatches to _load_csv_via_raw_insert_parallel (line 1089); returns/updates LoadStats."
+    }
+   ],
+   "tests": [
+    {
+     "path": "tests/test_json_serialization.py",
+     "verifies": "JSONEachRow serialization contract: byte-exact output per ClickHouse type, block packing under a byte limit, Arrow fast path byte-parity with to_json (incl. fuzz), compression round-trip, loud failure on inf/tz-aware datetimes",
+     "node": "tests"
+    },
+    {
+     "path": "tests/test_read_consistency.py",
+     "verifies": "Load-path reading equals preview/inference reading: leading zeros and NA-like literals survive in String columns, empty cell = NULL only in Nullable, padded headers give the same names everywhere, NA_MARKERS matches pandas STR_NA_VALUES",
+     "node": "tests"
+    },
+    {
+     "path": "tests/test_app_load_ui.py",
+     "verifies": "Job-state-to-screen contract (jobs built by state, no threads): running panel shows phase/bytes progress/cancel/log tail, results survive reruns and name tables fate, second start warns instead of replacing, vanished CSV gives an error not a traceback, log tail is bounded (O(n2) fix)",
+     "node": "tests"
+    },
+    {
+     "path": "tests/test_load_job.py",
+     "verifies": "LoadJob behavior: outcome matrix (ok/cancelled/failed/interrupted), tables fate at every cancellation/failure boundary, run record always persisted, one-job-per-process registry incl. failed thread.start, streamlit-free module, codec reaches the wire, per-phase clocks, retry counter armed around the load",
+     "node": "tests"
+    },
+    {
+     "path": "tests/test_schema.py",
+     "verifies": "Full-file type inference: leading zeros/plus force String, Decimal/integer/date widening at exact boundaries, NaN/inf literal handling matches load-path NA markers, inferred type always in the editor list and passes strict validation, cyrillic identifiers normalize",
+     "node": "tests"
+    },
+    {
+     "path": "tests/test_pandas_loader.py",
+     "verifies": "Loader core: encoding/separator handling incl. mojibake auto-select, chunk conversion (narrow ints as numbers, LowCardinality/Nullable normalization, culprit-naming errors), load_csv_via_raw_insert sequential and parallel paths — payload splitting, compression on/off semantics, stage clocks, cancellation at every boundary, partial stats on failure",
+     "node": "tests"
+    }
+   ],
+   "constraints": [
+    {
+     "text": "Default insert block cap is 16 MiB; iter_json_each_row_payloads never yields a payload above max_payload_bytes.",
+     "evidence": {
+      "path": "src/csv_click/pandas_loader.py",
+      "symbol": "DEFAULT_MAX_INSERT_PAYLOAD_BYTES",
+      "line": 47
+     }
+    },
+    {
+     "text": "Default pandas chunk is 100_000 rows; batch_size must be positive (checked in iter_pandas_chunks line 164).",
+     "evidence": {
+      "path": "src/csv_click/pandas_loader.py",
+      "symbol": "batch_size: int = 100_000",
+      "line": 44
+     }
+    },
+    {
+     "text": "Row-size estimate is taken from at most the first 1024 rows of the chunk; rows-per-block estimate may grow at most 16x per block (_BLOCK_ESTIMATE_GROWTH_LIMIT, line 53).",
+     "evidence": {
+      "path": "src/csv_click/pandas_loader.py",
+      "symbol": "_BLOCK_ESTIMATE_SAMPLE_ROWS",
+      "line": 49
+     }
+    },
+    {
+     "text": "Only Int8..Int64, UInt8..UInt64, Float64 are parsed natively by pandas; all other columns are read as text to preserve leading zeros, trailing zeros for Decimal, and NA literals; Int128/256 deliberately stay text (JSONEachRow accepts quoted integers).",
+     "evidence": {
+      "path": "src/csv_click/pandas_loader.py",
+      "symbol": "NATIVELY_PARSED_TYPES",
+      "line": 83
+     }
+    },
+    {
+     "text": "A single JSONEachRow row larger than max_payload_bytes aborts the load with CsvLoadError (no silent split).",
+     "evidence": {
+      "path": "src/csv_click/pandas_loader.py",
+      "symbol": "A single JSONEachRow row is",
+      "line": 962
+     }
+    },
+    {
+     "text": "Payload block boundaries are found by splitting serialized bytes on newline, which is safe because JSON escapes newlines inside values.",
+     "evidence": {
+      "path": "src/csv_click/pandas_loader.py",
+      "symbol": "b\"\\n\".join(pending[:taken])",
+      "line": 967
+     }
+    },
+    {
+     "text": "Arrow fast path is used only when it guarantees byte-for-byte identity with to_json; any doubt returns None and the chunk goes through the reference serializer.",
+     "evidence": {
+      "path": "src/csv_click/pandas_loader.py",
+      "symbol": "_arrow_json_lines",
+      "line": 729
+     }
+    },
+    {
+     "text": "Reference serialization is DataFrame.to_json(orient='records', lines=True, force_ascii=False, double_precision=15) encoded UTF-8; float dtype columns always refuse the fast path because to_json float formatting is unproven (line 830).",
+     "evidence": {
+      "path": "src/csv_click/pandas_loader.py",
+      "symbol": "double_precision=15",
+      "line": 724
+     }
+    },
+    {
+     "text": "to_json escapes backslash, double quote AND forward slash (ujson legacy: a/b -> a\\/b); control chars \\x00-\\x1f (_JSON_UNSUPPORTED_RE line 98) force fallback to the reference path.",
+     "evidence": {
+      "path": "src/csv_click/pandas_loader.py",
+      "symbol": "_JSON_ESCAPES",
+      "line": 95
+     }
+    },
+    {
+     "text": "Compression 'off' must be converted to None before the driver: the driver sets Content-Encoding from ANY non-empty string, and 'off' in the header failed the load on the first block.",
+     "evidence": {
+      "path": "src/csv_click/pandas_loader.py",
+      "symbol": "wire_codec",
+      "line": 627
+     }
+    },
+    {
+     "text": "A fresh compressor is created per compress_payload call because the driver's Lz4Compressor/GzipCompressor are marked thread_safe=False and five workers compress concurrently.",
+     "evidence": {
+      "path": "src/csv_click/pandas_loader.py",
+      "symbol": "get_compressor(codec)",
+      "line": 658
+     }
+    },
+    {
+     "text": "On the parallel path compression runs inside the worker (zlib releases the GIL, measured 4.5x on five threads); sequential path compresses in the producer via _compress_block (line 664).",
+     "evidence": {
+      "path": "src/csv_click/pandas_loader.py",
+      "symbol": "compress_payload(payload, compression)",
+      "line": 1128
+     }
+    },
+    {
+     "text": "worker_count must be positive (line 1000); client_factory is mandatory when worker_count > 1; backpressure caps in-flight blocks at worker_count * 2 (max_pending, line 1105).",
+     "evidence": {
+      "path": "src/csv_click/pandas_loader.py",
+      "symbol": "client_factory is required when worker_count is greater than 1",
+      "line": 1012
+     }
+    },
+    {
+     "text": "Missing semantics: empty cell is always missing; NA_MARKERS count as missing in every type EXCEPT String, where they stay literal text (na_markers=inner_type != \"String\", line 1463).",
+     "evidence": {
+      "path": "src/csv_click/pandas_loader.py",
+      "symbol": "_missing_mask",
+      "line": 1430
+     }
+    },
+    {
+     "text": "Narrow integers matching U?Int(8|16|32|64) are converted via pd.to_numeric + safe astype into same-named pandas nullable dtypes, so they travel as JSON numbers with wholeness and range checks (300 in Int8 raises, 1.7 in Int64 raises) instead of strings.",
+     "evidence": {
+      "path": "src/csv_click/pandas_loader.py",
+      "symbol": "_PANDAS_INTEGER_TYPE_RE",
+      "line": 90
+     }
+    },
+    {
+     "text": "For String columns a missing value becomes None (JSON null) when Nullable, else empty string; non-nullable non-String columns with missing values raise.",
+     "evidence": {
+      "path": "src/csv_click/pandas_loader.py",
+      "symbol": "filler = None if nullable else \"\"",
+      "line": 1468
+     }
+    },
+    {
+     "text": "Float64 values that overflowed to infinity raise CsvSchemaError instead of letting to_json silently write null.",
+     "evidence": {
+      "path": "src/csv_click/pandas_loader.py",
+      "symbol": "became infinity",
+      "line": 1506
+     }
+    },
+    {
+     "text": "Decimal columns stay Decimal objects; to_json encodes them as quoted strings exactly like the old str() row path (convert_value at line 1515).",
+     "evidence": {
+      "path": "src/csv_click/pandas_loader.py",
+      "symbol": "inner_type.startswith(\"Decimal(\")",
+      "line": 1512
+     }
+    },
+    {
+     "text": "Date/Date32 serialize as 'YYYY-MM-DD' (unit 'D'), DateTime as 'YYYY-MM-DD HH:MM:SS' (unit 's', space separator, no fractional seconds) via np.datetime_as_string (line 1562); tz-aware datetimes raise (line 1555).",
+     "evidence": {
+      "path": "src/csv_click/pandas_loader.py",
+      "symbol": "_format_temporal",
+      "line": 1535
+     }
+    },
+    {
+     "text": "LowCardinality is storage-only: _convert_series strips the wrapper and picks the converter branch by the base type, so 'NA' in LowCardinality(Nullable(String)) stays text and LowCardinality(Int32) travels as numbers.",
+     "evidence": {
+      "path": "src/csv_click/pandas_loader.py",
+      "symbol": "inner_type.removeprefix(\"LowCardinality(\")",
+      "line": 1460
+     }
+    },
+    {
+     "text": "Nullable normalization: Nullable is pushed INSIDE LowCardinality (Nullable(LowCardinality(X)) -> LowCardinality(Nullable(X))); Nullable(Array|Map|Tuple|Nested) is rejected with CsvSchemaError before any DDL.",
+     "evidence": {
+      "path": "src/csv_click/pandas_loader.py",
+      "symbol": "_UNNULLABLE_WRAPPER_RE",
+      "line": 1605
+     }
+    },
+    {
+     "text": "Encoding auto-selection candidates are utf_8, utf-8-sig, cp1251, windows-1251; unresolvable mojibake raises CsvSchemaError.",
+     "evidence": {
+      "path": "src/csv_click/pandas_loader.py",
+      "symbol": "ENCODING_SUGGESTIONS",
+      "line": 55
+     }
+    },
+    {
+     "text": "CSV is read with keep_default_na=False globally; NA markers are re-enabled per column via na_values only for natively parsed (non-text) columns.",
+     "evidence": {
+      "path": "src/csv_click/pandas_loader.py",
+      "symbol": "_read_type_options",
+      "line": 205
+     }
+    },
+    {
+     "text": "Cancellation is polled before each block (and on every drain step of the parallel tail); True raises CsvLoadCancelled; blocks already handed to workers finish and are counted or land in blocks_unconfirmed.",
+     "evidence": {
+      "path": "src/csv_click/pandas_loader.py",
+      "symbol": "_raise_if_load_cancelled",
+      "line": 1339
+     }
+    },
+    {
+     "text": "When reading through the byte-counting file object, compression is inferred from the filename via infer_compression so data.csv.gz still decompresses.",
+     "evidence": {
+      "path": "src/csv_click/pandas_loader.py",
+      "symbol": "infer_compression(str(csv_path), \"infer\")",
+      "line": 182
+     }
+    }
+   ],
+   "evidence": {
+    "path": "src/csv_click/pandas_loader.py",
+    "symbol": "load_csv_via_raw_insert",
+    "line": 972
+   }
+  },
+  {
+   "id": "load_job",
+   "path": "src/csv_click/load_job.py",
+   "role": "core",
+   "label": "load_job.py",
+   "summary": "Runs one CSV-to-ClickHouse load in a daemon background thread with cooperative cancellation, phase/log/stats state readable by the UI, table-fate handling after stops, and a process-wide single-active-job registry.",
+   "entrypoints": [
+    {
+     "symbol": "LoadJob",
+     "line": 171,
+     "summary": "One load: owns the worker thread, cancel/finished Events, log with lock, LoadStats, outcome, tables_fate and run-record path; Thread/Event by composition, not inheritance."
+    },
+    {
+     "symbol": "LoadJob.__init__",
+     "line": 184,
+     "summary": "Built on the Streamlit script thread; constructs the frozen RunConfig immediately so the run record survives any early crash inside run()."
+    },
+    {
+     "symbol": "LoadJob.start",
+     "line": 282,
+     "summary": "Sets _started=True then launches threading.Thread(target=self.run, name=\"csv-click-load\", daemon=True); daemon so process exit kills the load."
+    },
+    {
+     "symbol": "LoadJob.run",
+     "line": 318,
+     "summary": "Load body on the job thread (tests call it synchronously): preflight -> connect -> DDL -> insert -> table fate -> run record; phases separated by _raise_if_cancelled()."
+    },
+    {
+     "symbol": "LoadJob.request_cancel",
+     "line": 272,
+     "summary": "Sets the _cancel threading.Event; non-instant — in-flight blocks finish and are counted, connect/DDL cancel lands at phase boundaries."
+    },
+    {
+     "symbol": "LoadJob.wait",
+     "line": 296,
+     "summary": "Blocks on the _finished Event; for tests and the shell, explicitly not for the UI."
+    },
+    {
+     "symbol": "LoadJob.log_lines",
+     "line": 266,
+     "summary": "Returns a copy of the log under _log_lock; the UI's read side of the log."
+    },
+    {
+     "symbol": "LoadJob.is_running",
+     "line": 254,
+     "summary": "Property: _started and not _finished.is_set(); what the registry checks before admitting a new job."
+    },
+    {
+     "symbol": "LoadJob.is_finished",
+     "line": 258,
+     "summary": "Property over the _finished Event; outcome/error_message/tables_fate are guaranteed populated before it turns true."
+    },
+    {
+     "symbol": "LoadJob.cancel_requested",
+     "line": 262,
+     "summary": "Property over the _cancel Event for the UI."
+    },
+    {
+     "symbol": "start_load_job",
+     "line": 550,
+     "summary": "Registers the job in the module-global registry under _registry_lock and starts its thread; returns False if a live job exists; rolls back registration if thread.start() raises."
+    },
+    {
+     "symbol": "current_load_job",
+     "line": 579,
+     "summary": "Returns the process's job — live or last finished — under _registry_lock."
+    },
+    {
+     "symbol": "reset_load_job_registry",
+     "line": 585,
+     "summary": "Forgets the registered job (tests only); a live daemon thread is left running."
+    },
+    {
+     "symbol": "INSERT_PAYLOAD_SAFETY_RATIO",
+     "line": 60,
+     "summary": "0.9 — effective insert payload is 90% of the configured MB to stay under ClickHouse HTTP/proxy read limits."
+    },
+    {
+     "symbol": "TABLES_KEPT_WITH_DATA",
+     "line": 67,
+     "summary": "One of five table-fate strings (not_created/created/kept_with_data/dropped_as_empty/cleanup_failed) written into the run record."
+    },
+    {
+     "symbol": "_handle_tables_after_stopped_load",
+     "line": 88,
+     "summary": "Post-stop policy: keep tables if any CONFIRMED block landed, drop the pair only when stats.blocks == 0; returns the fate string."
+    }
+   ],
+   "tests": [
+    {
+     "path": "tests/test_app_load_ui.py",
+     "verifies": "Job-state-to-screen contract (jobs built by state, no threads): running panel shows phase/bytes progress/cancel/log tail, results survive reruns and name tables fate, second start warns instead of replacing, vanished CSV gives an error not a traceback, log tail is bounded (O(n2) fix)",
+     "node": "tests"
+    },
+    {
+     "path": "tests/test_app_state.py",
+     "verifies": "Source-structure pins (no execution): widget keys disjoint from session_state keys, _render_load_flow step order, _start_load uses type_rows and re-checks encoding, LoadJob.run passes payload limit/cancel/progress kwargs to the loader and writes the run record from finally",
+     "node": "tests"
+    },
+    {
+     "path": "tests/test_load_job.py",
+     "verifies": "LoadJob behavior: outcome matrix (ok/cancelled/failed/interrupted), tables fate at every cancellation/failure boundary, run record always persisted, one-job-per-process registry incl. failed thread.start, streamlit-free module, codec reaches the wire, per-phase clocks, retry counter armed around the load",
+     "node": "tests"
+    }
+   ],
+   "constraints": [
+    {
+     "text": "No Streamlit calls anywhere in this module: st.* from a non-script thread silently no-ops (missing ScriptRunContext) and Streamlit's RerunException must never reach the load; a test enforces this.",
+     "evidence": {
+      "path": "src/csv_click/load_job.py",
+      "symbol": "missing ScriptRunContext",
+      "line": 10
+     }
+    },
+    {
+     "text": "Thread and Event are held by composition, not inheritance: a subclass field named _stop would shadow Thread._stop and break join()/is_alive().",
+     "evidence": {
+      "path": "src/csv_click/load_job.py",
+      "symbol": "Thread._stop",
+      "line": 175
+     }
+    },
+    {
+     "text": "Single-writer rule for stats: only the job thread writes LoadStats; the UI only reads. Ints are atomic under the GIL, so the worst case is a slightly stale progress figure.",
+     "evidence": {
+      "path": "src/csv_click/load_job.py",
+      "symbol": "GIL",
+      "line": 181
+     }
+    },
+    {
+     "text": "Cancellation is cooperative and not instantaneous: blocks in flight finish and are counted; during connect/DDL it takes effect only at the next phase boundary via _raise_if_cancelled().",
+     "evidence": {
+      "path": "src/csv_click/load_job.py",
+      "symbol": "request_cancel",
+      "line": 272
+     }
+    },
+    {
+     "text": "Worker thread is daemon=True on purpose: closing the Streamlit process kills the load instead of Ctrl+C waiting for an hour-long insert.",
+     "evidence": {
+      "path": "src/csv_click/load_job.py",
+      "symbol": "daemon=True",
+      "line": 292
+     }
+    },
+    {
+     "text": "run_config is built in __init__ on the script thread, before the worker exists, so the run record survives any early failure inside run().",
+     "evidence": {
+      "path": "src/csv_click/load_job.py",
+      "symbol": "run_config",
+      "line": 221
+     }
+    },
+    {
+     "text": "Table-drop decision uses CONFIRMED blocks only (stats.blocks); blocks_unconfirmed is unusable because it mixes cancel_pending blocks that were never sent with blocks whose server reply was lost, and the driver raises the same OperationalError for both.",
+     "evidence": {
+      "path": "src/csv_click/load_job.py",
+      "symbol": "blocks_unconfirmed",
+      "line": 106
+     }
+    },
+    {
+     "text": "load_completed flag is a one-way gate: once the loader returns, no later exception may declare the load failed or drop the tables — report failures become 'The load finished, but reporting it failed'.",
+     "evidence": {
+      "path": "src/csv_click/load_job.py",
+      "symbol": "load_completed",
+      "line": 450
+     }
+    },
+    {
+     "text": "Terminal outcomes are exactly \"ok\", \"cancelled\", \"failed\", and the safety-net \"interrupted\" (unexpected BaseException with no error message).",
+     "evidence": {
+      "path": "src/csv_click/load_job.py",
+      "symbol": "\"interrupted\"",
+      "line": 510
+     }
+    },
+    {
+     "text": "Publication order in the finally block is mandatory: outcome/error_message/tables_fate are set BEFORE _finished.set(), so anyone who observes is_finished must also see the populated result; _finished.set() runs no matter what, or the registry would refuse all loads until process restart.",
+     "evidence": {
+      "path": "src/csv_click/load_job.py",
+      "symbol": "self._finished.set()",
+      "line": 541
+     }
+    },
+    {
+     "text": "One active job per process; the registry lives in this imported module (not app.py) because Streamlit re-executes the script and its globals do not survive a rerun, while an imported module does — after F5 a new session sees the same job.",
+     "evidence": {
+      "path": "src/csv_click/load_job.py",
+      "symbol": "_current_job",
+      "line": 547
+     }
+    },
+    {
+     "text": "job.start() happens under _registry_lock, and _started is set before thread.start(): between registration and thread start the job must never look not-alive, or a second session could replace it; if thread.start() raises, registration is rolled back.",
+     "evidence": {
+      "path": "src/csv_click/load_job.py",
+      "symbol": "_registry_lock",
+      "line": 563
+     }
+    },
+    {
+     "text": "Strict preflight switches to sample validation (first max(SAMPLE_PRECHECK_ROWS, batch_size) rows) for files over 50 MB instead of a full pass.",
+     "evidence": {
+      "path": "src/csv_click/load_job.py",
+      "symbol": "LARGE_CSV_PRECHECK_THRESHOLD_BYTES",
+      "line": 360
+     }
+    },
+    {
+     "text": "insert_wall_s is measured strictly around the loader call (excluding preflight/connect/DDL), and driver_retries is copied out of the counter in the same finally, even if the loader raised.",
+     "evidence": {
+      "path": "src/csv_click/load_job.py",
+      "symbol": "stats.insert_wall_s",
+      "line": 445
+     }
+    },
+    {
+     "text": "wait() exists for tests and the wrapper shell, not for the UI; the UI must poll is_running/is_finished instead of blocking the script thread.",
+     "evidence": {
+      "path": "src/csv_click/load_job.py",
+      "symbol": "wait",
+      "line": 296
+     }
+    }
+   ],
+   "evidence": {
+    "path": "src/csv_click/load_job.py",
+    "symbol": "start_load_job",
+    "line": null
+   }
+  },
+  {
+   "id": "load_stats",
+   "path": "src/csv_click/load_stats.py",
+   "role": "core",
+   "label": "load_stats.py",
+   "summary": "Streamlit-free counters and instruments for one load: per-block progress records, aggregated LoadStats with derived shares, a logging-based driver-retry counter, network-path/source-file/environment probes, human-readable stat lines, and the JSON run record writer.",
+   "entrypoints": [
+    {
+     "symbol": "BlockProgress",
+     "line": 71,
+     "summary": "Frozen dataclass for one sent JSONEachRow block: chunk/block numbers, rows, raw vs wire bytes, server_ns and the explicit server_time_reported flag."
+    },
+    {
+     "symbol": "LoadStats",
+     "line": 95,
+     "summary": "Mutable counters for one load (rows, blocks, blocks_unconfirmed, stage seconds, busy/queue/stall times); passed in from outside so the caller keeps partial numbers when the load dies mid-way."
+    },
+    {
+     "symbol": "LoadStats.add_block",
+     "line": 154,
+     "summary": "Folds a BlockProgress into the totals; the consume side of the per-block progress stream."
+    },
+    {
+     "symbol": "LoadStats.server_share",
+     "line": 164,
+     "summary": "Server share of insert wall time; None (never 0) when uncomputable: no blocks, missing elapsed_ns, worker_count != 1, or unmeasured wall."
+    },
+    {
+     "symbol": "LoadStats.server_share_of_insert",
+     "line": 193,
+     "summary": "Server share with insert_busy_s as denominator so concurrency cancels out; works at any worker count."
+    },
+    {
+     "symbol": "LoadStats.worker_occupancy",
+     "line": 212,
+     "summary": "insert_busy_s / (worker_count * insert_wall_s): who waited for whom."
+    },
+    {
+     "symbol": "LoadStats.producer_unattributed_s",
+     "line": 224,
+     "summary": "Producer time not covered by any measured stage, so the stage breakdown is provably complete."
+    },
+    {
+     "symbol": "RunConfig",
+     "line": 239,
+     "summary": "Frozen dataclass of the knob positions the run actually used; without it before/after comparisons are meaningless."
+    },
+    {
+     "symbol": "DriverRetryCounter",
+     "line": 265,
+     "summary": "logging.Handler + context manager that attaches to the clickhouse_connect.driver.httpclient logger to count silent full-body POST retries; filters by arming thread and csv-click-load-worker prefix."
+    },
+    {
+     "symbol": "library_versions",
+     "line": 359,
+     "summary": "Versions of Python and TRACKED_PACKAGES for the run record."
+    },
+    {
+     "symbol": "arrow_pool_high_water_bytes",
+     "line": 369,
+     "summary": "PyArrow default memory pool high-water mark; None when pyarrow is absent."
+    },
+    {
+     "symbol": "first_pooled_socket",
+     "line": 383,
+     "summary": "First live socket from the client's urllib3 pool, walking keys() (never values()) and the LifoQueue from the end."
+    },
+    {
+     "symbol": "describe_connection_path",
+     "line": 406,
+     "summary": "Records /16 networks and privacy flags of both socket ends — never host addresses; any exception becomes an 'unavailable' field instead of propagating."
+    },
+    {
+     "symbol": "describe_source_file",
+     "line": 446,
+     "summary": "Source-file facts for the record: size, Windows drive type, OneDrive-style cloud-placeholder attributes; stat errors are recorded, not swallowed."
+    },
+    {
+     "symbol": "format_load_stats_lines",
+     "line": 481,
+     "summary": "Renders LoadStats into the human-readable log lines (timing, bytes, server-time line, occupancy, retry warning)."
+    },
+    {
+     "symbol": "write_run_record",
+     "line": 575,
+     "summary": "Writes config+stats+tables+source+libraries JSON to ~/.csv_click/runs with collision-proof naming; returns the path."
+    },
+    {
+     "symbol": "LOAD_WORKER_THREAD_PREFIX",
+     "line": 34,
+     "summary": "\"csv-click-load-worker\" — thread-name prefix by which the retry counter attributes driver retries to THIS load rather than concurrent UI traffic."
+    },
+    {
+     "symbol": "DEFAULT_RUN_LOG_DIR",
+     "line": 26,
+     "summary": "Path.home()/.csv_click/runs — default run-record directory."
+    }
+   ],
+   "tests": [
+    {
+     "path": "tests/test_app_load_ui.py",
+     "verifies": "Job-state-to-screen contract (jobs built by state, no threads): running panel shows phase/bytes progress/cancel/log tail, results survive reruns and name tables fate, second start warns instead of replacing, vanished CSV gives an error not a traceback, log tail is bounded (O(n2) fix)",
+     "node": "tests"
+    },
+    {
+     "path": "tests/test_load_job.py",
+     "verifies": "LoadJob behavior: outcome matrix (ok/cancelled/failed/interrupted), tables fate at every cancellation/failure boundary, run record always persisted, one-job-per-process registry incl. failed thread.start, streamlit-free module, codec reaches the wire, per-phase clocks, retry counter armed around the load",
+     "node": "tests"
+    },
+    {
+     "path": "tests/test_load_stats.py",
+     "verifies": "Stats accounting and reporting: server_share None-semantics (parallel/unreported/empty), bottleneck attribution fields, report line formatting, DriverRetryCounter logger hygiene under nesting/overlap and thread filtering, write_run_record contents, unique naming, and address anonymization",
+     "node": "tests"
+    },
+    {
+     "path": "tests/test_pandas_loader.py",
+     "verifies": "Loader core: encoding/separator handling incl. mojibake auto-select, chunk conversion (narrow ints as numbers, LowCardinality/Nullable normalization, culprit-naming errors), load_csv_via_raw_insert sequential and parallel paths — payload splitting, compression on/off semantics, stage clocks, cancellation at every boundary, partial stats on failure",
+     "node": "tests"
+    }
+   ],
+   "constraints": [
+    {
+     "text": "LoadStats is deliberately mutable and injected from outside: if the load dies mid-way the caller still holds the partial counters needed to diagnose the crash.",
+     "evidence": {
+      "path": "src/csv_click/load_stats.py",
+      "symbol": "LoadStats",
+      "line": 95
+     }
+    },
+    {
+     "text": "server_share is None, not zero, whenever it cannot be computed — including worker_count > 1, where summed server_ns divided by one wall clock inflates up to worker_count times (six workers can print '514%').",
+     "evidence": {
+      "path": "src/csv_click/load_stats.py",
+      "symbol": "server_share",
+      "line": 164
+     }
+    },
+    {
+     "text": "Even a computed server share covers only the initiator half: raw_insert_batch passes no settings, distributed_foreground_insert stays at server default 0, HTTP 200 arrives once the spool file is written — shard forwarding, replication and merges are excluded, so a small share never proves 'the rest was the wire'.",
+     "evidence": {
+      "path": "src/csv_click/load_stats.py",
+      "symbol": "distributed_foreground_insert",
+      "line": 182
+     }
+    },
+    {
+     "text": "source_fully_read promises exactly 'the producer saw the end of the CSV' and nothing more; 'table is complete' requires source_fully_read and blocks_unconfirmed == 0 and outcome == \"ok\", otherwise verify with count().",
+     "evidence": {
+      "path": "src/csv_click/load_stats.py",
+      "symbol": "source_fully_read",
+      "line": 144
+     }
+    },
+    {
+     "text": "blocks_unconfirmed counts blocks handed to insert but never server-confirmed (cancelled during shutdown or failed); their rows may be missing and are not in rows — without it a lost tail would look like success.",
+     "evidence": {
+      "path": "src/csv_click/load_stats.py",
+      "symbol": "blocks_unconfirmed",
+      "line": 148
+     }
+    },
+    {
+     "text": "server_time_reported must be an explicit flag: the summary dict is never empty because the driver always injects query_id (httpclient.py:444), so emptiness cannot detect a proxy stripping X-ClickHouse-Summary.",
+     "evidence": {
+      "path": "src/csv_click/load_stats.py",
+      "symbol": "server_time_reported",
+      "line": 91
+     }
+    },
+    {
+     "text": "The driver logger is process-global and loads may overlap: only the FIRST attaching DriverRetryCounter saves logger state, and the LAST detaching one restores it — restore-on-own-exit would reset the logger mid-flight of a second load.",
+     "evidence": {
+      "path": "src/csv_click/load_stats.py",
+      "symbol": "_saved_state",
+      "line": 290
+     }
+    },
+    {
+     "text": "The retry counter counts only records from the arming thread or threads prefixed csv-click-load-worker; a 'Test connection' click during a background load would otherwise write a phantom retry into the run record.",
+     "evidence": {
+      "path": "src/csv_click/load_stats.py",
+      "symbol": "_counts_thread",
+      "line": 300
+     }
+    },
+    {
+     "text": "The count increment in emit() is thread-safe because Handler.handle() holds the handler lock around emit(); WARNING+ records are forwarded manually, and only by the first attached counter, to avoid duplicates.",
+     "evidence": {
+      "path": "src/csv_click/load_stats.py",
+      "symbol": "Handler.handle()",
+      "line": 316
+     }
+    },
+    {
+     "text": "Each silent driver retry re-uploads the full POST body and is invisible in wire_bytes: N x payload_bytes must be subtracted before any MB/s claim, or the link reads as narrower than it is.",
+     "evidence": {
+      "path": "src/csv_click/load_stats.py",
+      "symbol": "DRIVER_RETRY_MESSAGE",
+      "line": 29
+     }
+    },
+    {
+     "text": "arrow_pool_high_water_bytes is monotonic and process-wide, not per-load: only the growth between the before/after snapshots is attributable to one run, and two runs in the same Streamlit session cannot be compared.",
+     "evidence": {
+      "path": "src/csv_click/load_stats.py",
+      "symbol": "arrow_pool_high_water_bytes",
+      "line": 369
+     }
+    },
+    {
+     "text": "first_pooled_socket must never iterate RecentlyUsedContainer.values() (raises NotImplementedError on the installed urllib3) and must walk the LifoQueue pool from the END, since the next request takes the last element.",
+     "evidence": {
+      "path": "src/csv_click/load_stats.py",
+      "symbol": "NotImplementedError",
+      "line": 389
+     }
+    },
+    {
+     "text": "describe_connection_path records only /16 networks and privacy flags — host addresses of the operator machine and the cluster node must not enter the run record; it catches every exception because a diagnostic must not kill a 45-minute load.",
+     "evidence": {
+      "path": "src/csv_click/load_stats.py",
+      "symbol": "describe_connection_path",
+      "line": 406
+     }
+    },
+    {
+     "text": "write_run_record's tables argument has no default on purpose: a record without table fate is exactly the blindness this file exists to close.",
+     "evidence": {
+      "path": "src/csv_click/load_stats.py",
+      "symbol": "tables",
+      "line": 582
+     }
+    },
+    {
+     "text": "Run-record file names collide within one second; _unused_path appends -2..-999 rather than overwrite, because losing a crash record costs more than an ugly suffix.",
+     "evidence": {
+      "path": "src/csv_click/load_stats.py",
+      "symbol": "_unused_path",
+      "line": 624
+     }
+    },
+    {
+     "text": "producer_stall_s wraps only the wait for a ready block, not the loop body, or the progress callback's time would be misattributed to queue stall.",
+     "evidence": {
+      "path": "src/csv_click/load_stats.py",
+      "symbol": "producer_stall_s",
+      "line": 127
+     }
+    }
+   ],
+   "evidence": {
+    "path": "src/csv_click/load_stats.py",
+    "symbol": "class LoadStats",
+    "line": null
+   }
+  },
+  {
+   "id": "clickhouse",
+   "path": "src/csv_click/clickhouse.py",
+   "role": "io",
+   "label": "clickhouse.py",
+   "summary": "Sole ClickHouse access layer: builds the clickhouse-connect HTTPS client (mTLS client cert), validates identifiers, generates and executes ON CLUSTER DDL (ReplicatedMergeTree local + Distributed pair with rollback), inserts batches via insert() and raw_insert(JSONEachRow), and parses the X-ClickHouse-Summary header.",
+   "entrypoints": [
+    {
+     "symbol": "DEFAULT_HOST",
+     "line": 21,
+     "summary": "Default server host \"tp17.wb-bank.ru\""
+    },
+    {
+     "symbol": "DEFAULT_PORT",
+     "line": 22,
+     "summary": "Default port 443 (HTTPS interface)"
+    },
+    {
+     "symbol": "default_client_paths",
+     "line": 27,
+     "summary": "Platform-dependent default cert/key paths: /home/jovyan/tsh on POSIX (JupyterHub), ~/tsh on Windows"
+    },
+    {
+     "symbol": "DEFAULT_CLIENT_CERT",
+     "line": 48,
+     "summary": "Module-level default cert path (paired with DEFAULT_CLIENT_KEY on same line)"
+    },
+    {
+     "symbol": "ClickHouseClient",
+     "line": 51,
+     "summary": "Protocol with query(sql), insert(table, data, column_names, database), raw_insert(**kwargs) — the only client surface this module uses"
+    },
+    {
+     "symbol": "ClickHouseConfig",
+     "line": 63,
+     "summary": "Dataclass: database=sandbox, cluster=clickhouse, host/port defaults, username/password empty, secure=True, verify=False, client_cert/client_key defaults"
+    },
+    {
+     "symbol": "TableNames",
+     "line": 77,
+     "summary": "Pair of distributed and local table names"
+    },
+    {
+     "symbol": "build_table_names",
+     "line": 82,
+     "summary": "Validates distributed name and derives local name as <distributed>_local"
+    },
+    {
+     "symbol": "quote_identifier",
+     "line": 87,
+     "summary": "Allows only [A-Za-z_][A-Za-z0-9_]* for db/table/cluster names; ValueError otherwise"
+    },
+    {
+     "symbol": "quote_column_identifier",
+     "line": 93,
+     "summary": "Backtick-quotes free-text column names; rejects empty, backtick, and NUL"
+    },
+    {
+     "symbol": "get_client",
+     "line": 100,
+     "summary": "Validates cert files then clickhouse_connect.get_client(...) with connect_timeout=60, send_receive_timeout=1800; wraps failures in ClickHouseConnectionError"
+    },
+    {
+     "symbol": "test_connection",
+     "line": 128,
+     "summary": "SELECT 1 probe; failure -> ClickHouseConnectionError"
+    },
+    {
+     "symbol": "ensure_tables_do_not_exist",
+     "line": 135,
+     "summary": "Raises ExistingTableError if either target table exists anywhere on the cluster (clusterAllReplicas over system.tables)"
+    },
+    {
+     "symbol": "drop_target_tables",
+     "line": 172,
+     "summary": "DROP TABLE IF EXISTS ... ON CLUSTER for distributed then local"
+    },
+    {
+     "symbol": "build_create_local_table_sql",
+     "line": 235,
+     "summary": "CREATE TABLE ... ON CLUSTER, ReplicatedMergeTree, optional PARTITION BY, ORDER BY single column, index_granularity=8192"
+    },
+    {
+     "symbol": "build_create_distributed_table_sql",
+     "line": 269,
+     "summary": "CREATE TABLE ... ENGINE = Distributed with sipHash64(sharding_key)"
+    },
+    {
+     "symbol": "create_tables",
+     "line": 295,
+     "summary": "Orchestrates: pre-check existing pair / drop partial state, create local, poll cluster visibility, create distributed, poll again; rollback on failure"
+    },
+    {
+     "symbol": "insert_batch",
+     "line": 378,
+     "summary": "Row-based path: client.insert(table, rows, column_names, database)"
+    },
+    {
+     "symbol": "raw_insert_batch",
+     "line": 393,
+     "summary": "Byte-based path: client.raw_insert with fmt=JSONEachRow and pre-compressed payload; returns parsed X-ClickHouse-Summary dict"
+    },
+    {
+     "symbol": "summary_elapsed_ns",
+     "line": 427,
+     "summary": "Extracts elapsed_ns from summary as int; None means server did not report (proxy stripped header), which is distinct from 0"
+    }
+   ],
+   "tests": [
+    {
+     "path": "tests/test_settings.py",
+     "verifies": "AppSettings persistence: platform-aware cert path defaults (Windows vs jovyan), configured paths win, save/load round-trip, old default batch_size migrated to 100_000, table-specific fields never saved",
+     "node": "tests"
+    },
+    {
+     "path": "tests/test_app_load_ui.py",
+     "verifies": "Job-state-to-screen contract (jobs built by state, no threads): running panel shows phase/bytes progress/cancel/log tail, results survive reruns and name tables fate, second start warns instead of replacing, vanished CSV gives an error not a traceback, log tail is bounded (O(n2) fix)",
+     "node": "tests"
+    },
+    {
+     "path": "tests/test_clickhouse.py",
+     "verifies": "ClickHouse layer with fake clients: DDL builders (backtick quoting incl. cyrillic, injection refusal, sharding key required), create_tables drop/verify/rollback ordering incl. TableCleanupError, certificate validation, raw_insert_batch JSONEachRow + compression kwarg, summary_elapsed_ns None-vs-zero",
+     "node": "tests"
+    },
+    {
+     "path": "tests/test_load_job.py",
+     "verifies": "LoadJob behavior: outcome matrix (ok/cancelled/failed/interrupted), tables fate at every cancellation/failure boundary, run record always persisted, one-job-per-process registry incl. failed thread.start, streamlit-free module, codec reaches the wire, per-phase clocks, retry counter armed around the load",
+     "node": "tests"
+    }
+   ],
+   "constraints": [
+    {
+     "text": "Client timeouts are hardcoded: connect_timeout=60 s, send_receive_timeout=1800 s",
+     "evidence": {
+      "path": "src/csv_click/clickhouse.py",
+      "symbol": "send_receive_timeout",
+      "line": 113
+     }
+    },
+    {
+     "text": "TLS defaults: secure=True but verify=False (server certificate not verified)",
+     "evidence": {
+      "path": "src/csv_click/clickhouse.py",
+      "symbol": "verify",
+      "line": 71
+     }
+    },
+    {
+     "text": "client_cert/client_cert_key are passed to the driver only when config.secure is true",
+     "evidence": {
+      "path": "src/csv_click/clickhouse.py",
+      "symbol": "config.secure",
+      "line": 115
+     }
+    },
+    {
+     "text": "Empty password is sent as None, not empty string",
+     "evidence": {
+      "path": "src/csv_click/clickhouse.py",
+      "symbol": "config.password or None",
+      "line": 109
+     }
+    },
+    {
+     "text": "Database/table/cluster identifiers must match [A-Za-z_][A-Za-z0-9_]* or ValueError is raised",
+     "evidence": {
+      "path": "src/csv_click/clickhouse.py",
+      "symbol": "re.fullmatch",
+      "line": 88
+     }
+    },
+    {
+     "text": "Column identifiers are free text but must be non-empty and contain no backtick or NUL (backtick would escape the DDL quoting)",
+     "evidence": {
+      "path": "src/csv_click/clickhouse.py",
+      "symbol": "quote_column_identifier",
+      "line": 93
+     }
+    },
+    {
+     "text": "PARTITION BY expression must not contain a semicolon (single-statement injection guard)",
+     "evidence": {
+      "path": "src/csv_click/clickhouse.py",
+      "symbol": "cannot contain semicolon",
+      "line": 232
+     }
+    },
+    {
+     "text": "ORDER BY is mandatory and is treated as one backtick-quoted column, not a free expression",
+     "evidence": {
+      "path": "src/csv_click/clickhouse.py",
+      "symbol": "ORDER BY is required",
+      "line": 244
+     }
+    },
+    {
+     "text": "Distributed sharding key is required and always wrapped as sipHash64(`column`)",
+     "evidence": {
+      "path": "src/csv_click/clickhouse.py",
+      "symbol": "sipHash64",
+      "line": 283
+     }
+    },
+    {
+     "text": "Local table engine is fixed: ReplicatedMergeTree('/clickhouse/tables/{shard}-{uuid}/<table>', '{replica}')",
+     "evidence": {
+      "path": "src/csv_click/clickhouse.py",
+      "symbol": "ReplicatedMergeTree",
+      "line": 263
+     }
+    },
+    {
+     "text": "index_granularity is fixed at 8192 in local table DDL",
+     "evidence": {
+      "path": "src/csv_click/clickhouse.py",
+      "symbol": "index_granularity",
+      "line": 266
+     }
+    },
+    {
+     "text": "After each CREATE, cluster-wide visibility is polled: default 30 attempts at 1.0 s interval, then ClickHouseConnectionError",
+     "evidence": {
+      "path": "src/csv_click/clickhouse.py",
+      "symbol": "attempts",
+      "line": 216
+     }
+    },
+    {
+     "text": "create_tables: if BOTH target tables already exist -> ExistingTableError; partial state is dropped before retry; if rollback drop itself fails -> TableCleanupError naming the likely-surviving local table",
+     "evidence": {
+      "path": "src/csv_click/clickhouse.py",
+      "symbol": "TableCleanupError",
+      "line": 368
+     }
+    },
+    {
+     "text": "raw_insert always uses fmt=JSONEachRow; the payload bytes must already be serialized (and compressed, if compression is set) by the caller",
+     "evidence": {
+      "path": "src/csv_click/clickhouse.py",
+      "symbol": "JSONEachRow",
+      "line": 419
+     }
+    },
+    {
+     "text": "With compression set, the driver adds Content-Encoding and moves the INSERT statement into URL params (comment cites clickhouse-connect httpclient.py:417-427)",
+     "evidence": {
+      "path": "src/csv_click/clickhouse.py",
+      "symbol": "compression",
+      "line": 422
+     }
+    },
+    {
+     "text": "raw_insert summary dict is never empty — the driver unconditionally adds query_id (httpclient.py:437-445); a proxy-stripped X-ClickHouse-Summary is detected by absent elapsed_ns, not by an empty dict",
+     "evidence": {
+      "path": "src/csv_click/clickhouse.py",
+      "symbol": "query_id",
+      "line": 405
+     }
+    },
+    {
+     "text": "elapsed_ns in the summary covers only the initiator's work: no settings are sent, distributed_foreground_insert stays server default 0, so the response arrives once the spool file is written (shard forwarding/replication/merges excluded)",
+     "evidence": {
+      "path": "src/csv_click/clickhouse.py",
+      "symbol": "distributed_foreground_insert",
+      "line": 410
+     }
+    },
+    {
+     "text": "summary_elapsed_ns returns None (never 0) when elapsed_ns is missing or unparsable — None means 'server did not report', a distinction the wire-vs-server analysis depends on",
+     "evidence": {
+      "path": "src/csv_click/clickhouse.py",
+      "symbol": "elapsed_ns",
+      "line": 435
+     }
+    },
+    {
+     "text": "When secure, cert and key files must exist on disk before client creation, else CertificateError",
+     "evidence": {
+      "path": "src/csv_click/clickhouse.py",
+      "symbol": "_validate_certificate_files",
+      "line": 444
+     }
+    },
+    {
+     "text": "Client certificate expiry is checked eagerly against UTC now; expired cert -> CertificateError before any network call",
+     "evidence": {
+      "path": "src/csv_click/clickhouse.py",
+      "symbol": "expires_at <= datetime.now(timezone.utc)",
+      "line": 456
+     }
+    },
+    {
+     "text": "Certificate expiry is decoded via private CPython API ssl._ssl._test_decode_cert",
+     "evidence": {
+      "path": "src/csv_click/clickhouse.py",
+      "symbol": "_test_decode_cert",
+      "line": 467
+     }
+    },
+    {
+     "text": "Default cert dir on non-Windows is the JupyterHub tsh path /home/jovyan/tsh, returned as a plain string so Windows Path backslashes never corrupt it",
+     "evidence": {
+      "path": "src/csv_click/clickhouse.py",
+      "symbol": "NOTEBOOK_CERT_DIR",
+      "line": 24
+     }
+    },
+    {
+     "text": "Connection errors mentioning certificate_expired get an enriched message with current cert/key paths",
+     "evidence": {
+      "path": "src/csv_click/clickhouse.py",
+      "symbol": "_format_connection_error",
+      "line": 477
+     }
+    }
+   ],
+   "evidence": {
+    "path": "src/csv_click/clickhouse.py",
+    "symbol": "raw_insert_batch",
+    "line": 393
+   }
+  },
+  {
+   "id": "errors",
+   "path": "src/csv_click/errors.py",
+   "role": "core",
+   "label": "errors.py",
+   "summary": "Flat exception hierarchy: single base CsvClickError with eight leaf errors covering certificates, connection, existing tables, schema, load failures, two cancellation kinds, and failed table cleanup.",
+   "entrypoints": [
+    {
+     "symbol": "CsvClickError",
+     "line": 1,
+     "summary": "Base application error; all others derive from it"
+    },
+    {
+     "symbol": "CertificateError",
+     "line": 5,
+     "summary": "Client certificate files missing or unusable"
+    },
+    {
+     "symbol": "ClickHouseConnectionError",
+     "line": 9,
+     "summary": "Connection check (client init, SELECT 1, cluster visibility) failed"
+    },
+    {
+     "symbol": "ExistingTableError",
+     "line": 13,
+     "summary": "Target local or distributed table already exists"
+    },
+    {
+     "symbol": "CsvSchemaError",
+     "line": 17,
+     "summary": "CSV schema inference or type conversion failed"
+    },
+    {
+     "symbol": "CsvLoadError",
+     "line": 21,
+     "summary": "Converted CSV rows could not be loaded into ClickHouse"
+    },
+    {
+     "symbol": "CsvReadCancelled",
+     "line": 25,
+     "summary": "User stopped CSV schema reading"
+    },
+    {
+     "symbol": "CsvLoadCancelled",
+     "line": 29,
+     "summary": "Operator cancelled a running load"
+    },
+    {
+     "symbol": "TableCleanupError",
+     "line": 33,
+     "summary": "Dropping partially created tables failed; tables likely still on cluster"
+    }
+   ],
+   "tests": [
+    {
+     "path": "tests/test_json_serialization.py",
+     "verifies": "JSONEachRow serialization contract: byte-exact output per ClickHouse type, block packing under a byte limit, Arrow fast path byte-parity with to_json (incl. fuzz), compression round-trip, loud failure on inf/tz-aware datetimes",
+     "node": "tests"
+    },
+    {
+     "path": "tests/test_clickhouse.py",
+     "verifies": "ClickHouse layer with fake clients: DDL builders (backtick quoting incl. cyrillic, injection refusal, sharding key required), create_tables drop/verify/rollback ordering incl. TableCleanupError, certificate validation, raw_insert_batch JSONEachRow + compression kwarg, summary_elapsed_ns None-vs-zero",
+     "node": "tests"
+    },
+    {
+     "path": "tests/test_load_job.py",
+     "verifies": "LoadJob behavior: outcome matrix (ok/cancelled/failed/interrupted), tables fate at every cancellation/failure boundary, run record always persisted, one-job-per-process registry incl. failed thread.start, streamlit-free module, codec reaches the wire, per-phase clocks, retry counter armed around the load",
+     "node": "tests"
+    },
+    {
+     "path": "tests/test_pandas_loader.py",
+     "verifies": "Loader core: encoding/separator handling incl. mojibake auto-select, chunk conversion (narrow ints as numbers, LowCardinality/Nullable normalization, culprit-naming errors), load_csv_via_raw_insert sequential and parallel paths — payload splitting, compression on/off semantics, stage clocks, cancellation at every boundary, partial stats on failure",
+     "node": "tests"
+    }
+   ],
+   "constraints": [
+    {
+     "text": "Every application exception derives from the single base CsvClickError, so callers can catch one type",
+     "evidence": {
+      "path": "src/csv_click/errors.py",
+      "symbol": "CsvClickError",
+      "line": 1
+     }
+    },
+    {
+     "text": "TableCleanupError exists so the run record cannot claim not_created for a table that is likely still on the cluster",
+     "evidence": {
+      "path": "src/csv_click/errors.py",
+      "symbol": "TableCleanupError",
+      "line": 33
+     }
+    }
+   ],
+   "evidence": {
+    "path": "src/csv_click/errors.py",
+    "symbol": "CsvClickError",
+    "line": 1
+   }
+  },
+  {
+   "id": "readme",
+   "path": "README.md",
+   "role": "docs",
+   "label": "README.md",
+   "summary": "User-facing docs (install via loader.bat/uv, UI walkthrough by actual buttons, connection defaults, table DDL, CSV rules, type list); pinned by tests/test_readme_matches_the_app.py which checks button names, mandatory steps and type list against app.py.",
+   "entrypoints": [],
+   "tests": [
+    {
+     "path": "tests/test_loader_bat.py",
+     "verifies": "Text pins on loader.bat: uv sync --locked, :find_uv off-PATH search, self-install of uv via pip --user, correct error branches (pip errorlevel 1, no false 'Python failed'), no dead vars, launch delegated to csv_click.launcher; plus README makes loader.bat the primary Windows path",
+     "node": "tests"
+    },
+    {
+     "path": "tests/test_readme_matches_the_app.py",
+     "verifies": "README-vs-app consistency: every button name in README exists in app.py (AST-extracted), mandatory steps present and in enforced order, README type list matches CLICKHOUSE_TYPE_OPTIONS both ways, no rand() sharding promise",
+     "node": "tests"
+    }
+   ],
+   "constraints": [
+    {
+     "text": "Documents the load path: pandas chunks + raw_insert in JSONEachRow, chosen because client.insert()/insert_df() can fail in HTTP/proxy environments",
+     "evidence": {
+      "path": "README.md",
+      "symbol": "clickhouse-connect.raw_insert()",
+      "line": 22
+     }
+    },
+    {
+     "text": "Documents chunk serialization as one DataFrame.to_json call; floats capped at 15 fractional digits (double_precision ceiling), minus zero written as 0.0",
+     "evidence": {
+      "path": "README.md",
+      "symbol": "double_precision",
+      "line": 35
+     }
+    },
+    {
+     "text": "Documents DateTime serialized with space, not T (ClickHouse basic format, no fractional seconds)",
+     "evidence": {
+      "path": "README.md",
+      "symbol": "2024-01-02 03:04:05",
+      "line": 40
+     }
+    },
+    {
+     "text": "Points to benchmarks/serialize_bench.py as the before/after measurement for dropping the row-wise loop (90% of insert time on the measured profile)",
+     "evidence": {
+      "path": "README.md",
+      "symbol": "benchmarks/serialize_bench.py",
+      "line": 31
+     }
+    },
+    {
+     "text": "Only supported install path is uv sync --locked --extra dev; versions pinned deliberately for run comparability, --locked (not --frozen) so a drifted lockfile refuses to run",
+     "evidence": {
+      "path": "README.md",
+      "symbol": "uv sync --locked --extra dev",
+      "line": 51
+     }
+    },
+    {
+     "text": "Effective insert payload limit is cut 10% below the entered value (default 16 MB -> 14.4 MB) to stay under the HTTP proxy limit",
+     "evidence": {
+      "path": "README.md",
+      "symbol": "INSERT_PAYLOAD_SAFETY_RATIO",
+      "line": 241
+     }
+    },
+    {
+     "text": "Each run writes a JSON record to ~/.csv_click/runs/ with settings, per-stage counters, derived instruments and a tables-fate block",
+     "evidence": {
+      "path": "README.md",
+      "symbol": "~/.csv_click/runs/",
+      "line": 273
+     }
+    },
+    {
+     "text": "Creation and load are blocked if either target table already exists, checked via clusterAllReplicas(system.tables)",
+     "evidence": {
+      "path": "README.md",
+      "symbol": "clusterAllReplicas(system.tables)",
+      "line": 301
+     }
+    },
+    {
+     "text": "Documented UI defaults: host tp17.wb-bank.ru, port 443, database sandbox, cluster clickhouse; credentials via CLICKHOUSE_USER/CLICKHOUSE_PASSWORD",
+     "evidence": {
+      "path": "README.md",
+      "symbol": "tp17.wb-bank.ru",
+      "line": 195
+     }
+    },
+    {
+     "text": "Tests must run from repo root only (some tests read files by relative paths), via uv run --locked --extra dev pytest",
+     "evidence": {
+      "path": "README.md",
+      "symbol": "uv run --locked --extra dev pytest",
+      "line": 348
+     }
+    }
+   ],
+   "evidence": {
+    "path": "tests/test_readme_matches_the_app.py",
+    "symbol": "README",
+    "line": null
+   }
+  },
+  {
+   "id": "tests",
+   "path": "tests",
+   "role": "tests",
+   "label": "tests/",
+   "summary": "16 pytest-файлов (AppTest-сценарии UI, сериализация JSONEachRow, схема, жизненный цикл job-а, статистика, launcher, текст loader.bat, соответствие README приложению); test2.csv — фикстура-сирота.",
+   "entrypoints": [
+    {
+     "symbol": "test_json_serialization.py",
+     "line": 1,
+     "summary": "JSONEachRow serialization contract: byte-exact output per ClickHouse type, block packing under a byte limit, Arrow fast path byte-parity with to_json (incl. fuzz), compression round-trip, loud failure on inf/tz-aware datetimes"
+    },
+    {
+     "symbol": "test_read_consistency.py",
+     "line": 1,
+     "summary": "Load-path reading equals preview/inference reading: leading zeros and NA-like literals survive in String columns, empty cell = NULL only in Nullable, padded headers give the same names everywhere, NA_MARKERS matches pandas STR_NA_VALUES"
+    },
+    {
+     "symbol": "test_tcp_info_probe.py",
+     "line": 1,
+     "summary": "Diagnostic probe smoke: TCP_INFO_v0 struct offsets, Poller is composition not Thread subclass, print_report verdict logic (SO_SNDBUF pin vs peer window vs application-limited, refusal cases), main() end-to-end over a real loopback socket. NOTE: targets benchmarks/tcp_info_probe.py, NOT src/csv_click"
+    },
+    {
+     "symbol": "test_app_steps.py",
+     "line": 1,
+     "summary": "Step navigation UI: every step knows its number/total, the single path-line caption tracks the actually-open step through AppTest runs (incl. failed mapping not claiming a later step), exactly one expander open at a time"
+    },
+    {
+     "symbol": "test_launcher.py",
+     "line": 1,
+     "summary": "Launcher module: free-port probing (busy port moves within +10, loud failure when none), git-based version string with date (None outside a repo or on git failure), streamlit command uses sys.executable and 127.0.0.1"
+    },
+    {
+     "symbol": "test_loader_bat.py",
+     "line": 1,
+     "summary": "Text pins on loader.bat: uv sync --locked, :find_uv off-PATH search, self-install of uv via pip --user, correct error branches (pip errorlevel 1, no false 'Python failed'), no dead vars, launch delegated to csv_click.launcher; plus README makes loader.bat the primary Windows path"
+    },
+    {
+     "symbol": "test_readme_matches_the_app.py",
+     "line": 1,
+     "summary": "README-vs-app consistency: every button name in README exists in app.py (AST-extracted), mandatory steps present and in enforced order, README type list matches CLICKHOUSE_TYPE_OPTIONS both ways, no rand() sharding promise"
+    },
+    {
+     "symbol": "test_settings.py",
+     "line": 1,
+     "summary": "AppSettings persistence: platform-aware cert path defaults (Windows vs jovyan), configured paths win, save/load round-trip, old default batch_size migrated to 100_000, table-specific fields never saved"
+    },
+    {
+     "symbol": "test_app_form_state.py",
+     "line": 1,
+     "summary": "Connection/load form widget state via AppTest: ORDER BY / sharding key / table name / PARTITION BY survive a hidden rerun, dropped column warns once and falls back, second consecutive edit applies, reading another CSV clears table-scoped choices"
+    },
+    {
+     "symbol": "test_app_load_ui.py",
+     "line": 1,
+     "summary": "Job-state-to-screen contract (jobs built by state, no threads): running panel shows phase/bytes progress/cancel/log tail, results survive reruns and name tables fate, second start warns instead of replacing, vanished CSV gives an error not a traceback, log tail is bounded (O(n2) fix)"
+    },
+    {
+     "symbol": "test_app_state.py",
+     "line": 1,
+     "summary": "Source-structure pins (no execution): widget keys disjoint from session_state keys, _render_load_flow step order, _start_load uses type_rows and re-checks encoding, LoadJob.run passes payload limit/cancel/progress kwargs to the loader and writes the run record from finally"
+    },
+    {
+     "symbol": "test_clickhouse.py",
+     "line": 1,
+     "summary": "ClickHouse layer with fake clients: DDL builders (backtick quoting incl. cyrillic, injection refusal, sharding key required), create_tables drop/verify/rollback ordering incl. TableCleanupError, certificate validation, raw_insert_batch JSONEachRow + compression kwarg, summary_elapsed_ns None-vs-zero"
+    },
+    {
+     "symbol": "test_load_job.py",
+     "line": 1,
+     "summary": "LoadJob behavior: outcome matrix (ok/cancelled/failed/interrupted), tables fate at every cancellation/failure boundary, run record always persisted, one-job-per-process registry incl. failed thread.start, streamlit-free module, codec reaches the wire, per-phase clocks, retry counter armed around the load"
+    },
+    {
+     "symbol": "test_load_stats.py",
+     "line": 1,
+     "summary": "Stats accounting and reporting: server_share None-semantics (parallel/unreported/empty), bottleneck attribution fields, report line formatting, DriverRetryCounter logger hygiene under nesting/overlap and thread filtering, write_run_record contents, unique naming, and address anonymization"
+    },
+    {
+     "symbol": "test_schema.py",
+     "line": 1,
+     "summary": "Full-file type inference: leading zeros/plus force String, Decimal/integer/date widening at exact boundaries, NaN/inf literal handling matches load-path NA markers, inferred type always in the editor list and passes strict validation, cyrillic identifiers normalize"
+    },
+    {
+     "symbol": "test_pandas_loader.py",
+     "line": 1,
+     "summary": "Loader core: encoding/separator handling incl. mojibake auto-select, chunk conversion (narrow ints as numbers, LowCardinality/Nullable normalization, culprit-naming errors), load_csv_via_raw_insert sequential and parallel paths — payload splitting, compression on/off semantics, stage clocks, cancellation at every boundary, partial stats on failure"
+    }
+   ],
+   "tests": [],
+   "constraints": [],
+   "evidence": {
+    "path": "pyproject.toml",
+    "symbol": "testpaths",
+    "line": 22
+   }
+  },
+  {
+   "id": "benchmarks",
+   "path": "benchmarks",
+   "role": "benchmark",
+   "label": "benchmarks/",
+   "summary": "Manual Windows-only diagnostic: polls SIO_TCP_INFO counters on the pooled urllib3 socket during a raw_insert to decide which of four mechanisms (SO_SNDBUF pin, packet loss, application-limited producer, peer/gateway receive window) caps insert throughput; explicitly not embedded in or imported by the app.",
+   "entrypoints": [
+    {
+     "symbol": "main",
+     "line": 228,
+     "summary": "Runs all profiles, prints table, returns exit code 0 only if acceptance criterion holds"
+    },
+    {
+     "symbol": "build_profiles",
+     "line": 123,
+     "summary": "Builds six data profiles (operator profile, UInt64, 20xString, mixed types, 2000-char blobs, heterogeneous 12B/100KB)"
+    },
+    {
+     "symbol": "legacy_pack",
+     "line": 94,
+     "summary": "Copy of the pre-phase-3 greedy row-wise packer removed from pandas_loader"
+    },
+    {
+     "symbol": "legacy_convert",
+     "line": 85,
+     "summary": "Copy of the pre-phase-3 conversion incl. temporal columns, so migrated work stays inside the measurement"
+    },
+    {
+     "symbol": "measure",
+     "line": 177,
+     "summary": "Best-of-N wall-clock timing"
+    },
+    {
+     "symbol": "parsed_objects",
+     "line": 187,
+     "summary": "Parses payload blocks back to JSON objects splitting only on b'\\n'"
+    },
+    {
+     "symbol": "main",
+     "line": 357,
+     "summary": "Parses args, connects, captures pooled socket, runs poller around raw_insert, prints report even on insert failure"
+    },
+    {
+     "symbol": "Poller",
+     "line": 152,
+     "summary": "Background SIO_TCP_INFO poller; composes threading.Thread instead of subclassing"
+    },
+    {
+     "symbol": "read_tcp_info",
+     "line": 99,
+     "summary": "WSAIoctl(SIO_TCP_INFO) via ctypes on ws2_32"
+    },
+    {
+     "symbol": "find_pooled_socket",
+     "line": 135,
+     "summary": "Grabs the idle socket from the urllib3 LIFO pool before the insert"
+    },
+    {
+     "symbol": "print_report",
+     "line": 215,
+     "summary": "Relational verdict over active-transfer samples; refuses conclusions when the socket did not carry the payload"
+    },
+    {
+     "symbol": "TCP_INFO_v0",
+     "line": 59,
+     "summary": "ctypes mirror of mstcpip.h TCP_INFO_v0 (88 bytes)"
+    }
+   ],
+   "tests": [
+    {
+     "path": "tests/test_tcp_info_probe.py",
+     "verifies": "Diagnostic probe smoke: TCP_INFO_v0 struct offsets, Poller is composition not Thread subclass, print_report verdict logic (SO_SNDBUF pin vs peer window vs application-limited, refusal cases), main() end-to-end over a real loopback socket. NOTE: targets benchmarks/tcp_info_probe.py, NOT src/csv_click",
+     "node": "tests"
+    }
+   ],
+   "constraints": [
+    {
+     "text": "Measures iter_json_each_row_payloads at app defaults: block limit int(16MB*0.9)=14.4MB, batch 100_000 rows",
+     "evidence": {
+      "path": "benchmarks/serialize_bench.py",
+      "symbol": "APP_DEFAULT_LIMIT_BYTES",
+      "line": 46
+     }
+    },
+    {
+     "text": "Acceptance gate: vector path >= 3x faster on operator profile AND parsed objects identical on all profiles; otherwise exit code 1",
+     "evidence": {
+      "path": "benchmarks/serialize_bench.py",
+      "symbol": "operator_speedup >= 3.0",
+      "line": 287
+     }
+    },
+    {
+     "text": "Row-wise implementations are copies of code deleted from pandas_loader, including temporal conversion rewritten in phase 3",
+     "evidence": {
+      "path": "benchmarks/serialize_bench.py",
+      "symbol": "legacy_clean_json_value",
+      "line": 54
+     }
+    },
+    {
+     "text": "Comparison is on parsed objects, not bytes, split only on b'\\n' (splitlines would also split U+2028/U+2029/\\x0b/\\x0c/\\x85)",
+     "evidence": {
+      "path": "benchmarks/serialize_bench.py",
+      "symbol": "parsed_objects",
+      "line": 187
+     }
+    },
+    {
+     "text": "Only documented divergence normalised: 'T' vs space at position 10, and only in columns declared Date/DateTime",
+     "evidence": {
+      "path": "benchmarks/serialize_bench.py",
+      "symbol": "normalise_legacy",
+      "line": 203
+     }
+    },
+    {
+     "text": "Strict canonicalisation via json.dumps because == cannot distinguish -0.0 from 0.0",
+     "evidence": {
+      "path": "benchmarks/serialize_bench.py",
+      "symbol": "canonical",
+      "line": 223
+     }
+    },
+    {
+     "text": "Imports csv_click by prepending ../src to sys.path; run from repo root without installation",
+     "evidence": {
+      "path": "benchmarks/serialize_bench.py",
+      "symbol": "sys.path.insert",
+      "line": 33
+     }
+    },
+    {
+     "text": "Windows-only: exits 2 unless sys.platform is win32",
+     "evidence": {
+      "path": "benchmarks/tcp_info_probe.py",
+      "symbol": "\"win32\"",
+      "line": 374
+     }
+    },
+    {
+     "text": "Assumes driver pins SO_SNDBUF at 256 KiB (cites clickhouse-connect httputil.py:40-41)",
+     "evidence": {
+      "path": "benchmarks/tcp_info_probe.py",
+      "symbol": "SO_SNDBUF_PIN_BYTES",
+      "line": 56
+     }
+    },
+    {
+     "text": "Default insert target is table function null('c String'): needs no DDL rights, data is discarded; real path needs --table",
+     "evidence": {
+      "path": "benchmarks/tcp_info_probe.py",
+      "symbol": "FUNCTION null('c String')",
+      "line": 361
+     }
+    },
+    {
+     "text": "Poller composes threading.Thread: a _stop field in a Thread subclass breaks join()/is_alive()",
+     "evidence": {
+      "path": "benchmarks/tcp_info_probe.py",
+      "symbol": "Poller",
+      "line": 152
+     }
+    },
+    {
+     "text": "Socket must be captured before the insert: urllib3 LIFO pool removes the connection from the queue during a request",
+     "evidence": {
+      "path": "benchmarks/tcp_info_probe.py",
+      "symbol": "find_pooled_socket",
+      "line": 135
+     }
+    },
+    {
+     "text": "Refuses verdict if socket carried <50% of payload (wrong pooled connection) or >120% (silent full-body retransmit, cites httpclient.py:602-617)",
+     "evidence": {
+      "path": "benchmarks/tcp_info_probe.py",
+      "symbol": "carried < payload_bytes * 0.5",
+      "line": 247
+     }
+    },
+    {
+     "text": "Windows reuses fd numbers: polling stops if sock.fileno() == -1 to avoid reading a stranger socket's counters",
+     "evidence": {
+      "path": "benchmarks/tcp_info_probe.py",
+      "symbol": "self._sock.fileno() == -1",
+      "line": 175
+     }
+    },
+    {
+     "text": "Reads CLICKHOUSE_USER/CLICKHOUSE_PASSWORD env vars, the same ones README documents for loader.bat",
+     "evidence": {
+      "path": "benchmarks/tcp_info_probe.py",
+      "symbol": "CLICKHOUSE_USER",
+      "line": 383
+     }
+    },
+    {
+     "text": "Window/cwnd stats computed only over samples where bytes_out grew, else min(SndWnd) would falsely blame the gateway",
+     "evidence": {
+      "path": "benchmarks/tcp_info_probe.py",
+      "symbol": "current.bytes_out > previous.bytes_out",
+      "line": 267
+     }
+    }
+   ],
+   "evidence": {
+    "path": "benchmarks/serialize_bench.py",
+    "symbol": "legacy_pack",
+    "line": null
+   }
+  },
+  {
+   "id": "streamlit",
+   "path": null,
+   "role": "external-lib",
+   "label": "Streamlit",
+   "summary": "Веб-фреймворк UI: исполняет app.py, даёт session_state, фрагменты с run_every и rerun-модель, вокруг которых построен интерфейс.",
+   "entrypoints": [],
+   "tests": [],
+   "constraints": [],
+   "evidence": {
+    "path": "pyproject.toml",
+    "symbol": "streamlit>=1.37.0",
+    "line": 9
+   }
+  },
+  {
+   "id": "pandas",
+   "path": null,
+   "role": "external-lib",
+   "label": "pandas",
+   "summary": "Чтение CSV чанками (всё, кроме нативно парсимых типов, — dtype=str) и датафреймы редакторов маппинга/типов.",
+   "entrypoints": [],
+   "tests": [],
+   "constraints": [],
+   "evidence": {
+    "path": "pyproject.toml",
+    "symbol": "pandas>=2.2.0",
+    "line": 8
+   }
+  },
+  {
+   "id": "clickhouse_connect",
+   "path": null,
+   "role": "external-lib",
+   "label": "clickhouse-connect",
+   "summary": "HTTP(S)-драйвер ClickHouse: get_client с mTLS, raw_insert(fmt=JSONEachRow), компрессоры zstd/lz4/gzip, пул urllib3.",
+   "entrypoints": [],
+   "tests": [],
+   "constraints": [],
+   "evidence": {
+    "path": "pyproject.toml",
+    "symbol": "clickhouse-connect>=0.8.0",
+    "line": 7
+   }
+  },
+  {
+   "id": "clickhouse_server",
+   "path": null,
+   "role": "database",
+   "label": "ClickHouse (кластер)",
+   "summary": "Кластер ClickHouse за HTTPS-контуром: проверки через clusterAllReplicas, ON CLUSTER DDL (ReplicatedMergeTree + Distributed), приём JSONEachRow INSERT, заголовок X-ClickHouse-Summary.",
+   "entrypoints": [],
+   "tests": [],
+   "constraints": [],
+   "evidence": {
+    "path": "src/csv_click/clickhouse.py",
+    "symbol": "clickhouse_connect.get_client",
+    "line": 119
+   }
+  },
+  {
+   "id": "csv_file",
+   "path": null,
+   "role": "datasource",
+   "label": "CSV-файл",
+   "summary": "Исходный CSV на диске машины, где работает Streamlit: путь задаёт оператор; читается чанками в all-text режиме; размер файла — базис индикатора прогресса.",
+   "entrypoints": [],
+   "tests": [],
+   "constraints": [],
+   "evidence": {
+    "path": "src/csv_click/pandas_loader.py",
+    "symbol": "pd.read_csv",
+    "line": 171
+   }
+  }
+ ],
+ "edges": [
+  {
+   "from": "app",
+   "to": "clickhouse",
+   "type": "calls",
+   "evidence": {
+    "path": "src/csv_click/app.py",
+    "symbol": "build_table_names",
+    "line": 218
+   },
+   "note": "ValueError from DDL builders is caught and shown as 'DDL parameter error'; _test_connection; CertificateError / ClickHouseConnectionError mapped to st.error; derives <name>_local from the distributed table name; indirect",
+   "bend": -13
+  },
+  {
+   "from": "app",
+   "to": "clickhouse",
+   "type": "imports",
+   "evidence": {
+    "path": "src/csv_click/app.py",
+    "symbol": "csv_click.clickhouse",
+    "line": 14
+   },
+   "bend": 13
+  },
+  {
+   "from": "app",
+   "to": "csv_file",
+   "type": "reads",
+   "evidence": {
+    "path": "src/csv_click/app.py",
+    "symbol": "Path(csv_path).exists()",
+    "line": 836
+   },
+   "note": "only direct filesystem touch in this file; actual CSV reading is delegated to pandas_loader"
+  },
+  {
+   "from": "app",
+   "to": "errors",
+   "type": "calls",
+   "evidence": {
+    "path": "src/csv_click/app.py",
+    "symbol": "CsvReadCancelled",
+    "line": 900
+   },
+   "note": "raised inside _analyze_csv to unify the stop-CSV-read path; also caught at line 922",
+   "bend": -13
+  },
+  {
+   "from": "app",
+   "to": "errors",
+   "type": "imports",
+   "evidence": {
+    "path": "src/csv_click/app.py",
+    "symbol": "csv_click.errors",
+    "line": 22
+   },
+   "bend": 13
+  },
+  {
+   "from": "app",
+   "to": "load_job",
+   "type": "calls",
+   "evidence": {
+    "path": "src/csv_click/app.py",
+    "symbol": "current_load_job",
+    "line": 1206
+   },
+   "note": "also lines 1153 (pre-start guard) and 1226 (inside polling fragment); job constructed with config, schema, mappings, table/order/partition/sharding, payload/workers/compression/preflight, schema_inference_mode, encoding_",
+   "bend": -13
+  },
+  {
+   "from": "app",
+   "to": "load_job",
+   "type": "imports",
+   "evidence": {
+    "path": "src/csv_click/app.py",
+    "symbol": "csv_click.load_job",
+    "line": 28
+   },
+   "bend": 13
+  },
+  {
+   "from": "app",
+   "to": "load_stats",
+   "type": "imports",
+   "evidence": {
+    "path": "src/csv_click/app.py",
+    "symbol": "csv_click.load_stats",
+    "line": 38
+   },
+   "note": "LoadStats used only as the type of stats in load_progress_line"
+  },
+  {
+   "from": "app",
+   "to": "pandas",
+   "type": "calls",
+   "evidence": {
+    "path": "src/csv_click/app.py",
+    "symbol": "pd.DataFrame",
+    "line": 952
+   },
+   "note": "also line 991; editor rows round-trip via .to_dict(orient='records')",
+   "bend": -13
+  },
+  {
+   "from": "app",
+   "to": "pandas",
+   "type": "imports",
+   "evidence": {
+    "path": "src/csv_click/app.py",
+    "symbol": "import pandas as pd",
+    "line": 11
+   },
+   "bend": 13
+  },
+  {
+   "from": "app",
+   "to": "pandas_loader",
+   "type": "calls",
+   "evidence": {
+    "path": "src/csv_click/app.py",
+    "symbol": "choose_read_options_for_preview",
+    "line": 901
+   },
+   "note": "CsvSchemaError shown as 'Type editor error'; Fast sample mode; nrows=DEFAULT_SCHEMA_SAMPLE_ROWS (line 918); Full scan mode; receives cancel_callback=_csv_read_cancel_requested; also line 1158 in _start_load from session_",
+   "bend": -13
+  },
+  {
+   "from": "app",
+   "to": "pandas_loader",
+   "type": "imports",
+   "evidence": {
+    "path": "src/csv_click/app.py",
+    "symbol": "csv_click.pandas_loader",
+    "line": 39
+   },
+   "bend": 13
+  },
+  {
+   "from": "app",
+   "to": "schema",
+   "type": "calls",
+   "evidence": {
+    "path": "src/csv_click/app.py",
+    "symbol": "CLICKHOUSE_TYPE_OPTIONS",
+    "line": 998
+   },
+   "note": "constant read: options list of the final_type SelectboxColumn in the type editor",
+   "bend": -13
+  },
+  {
+   "from": "app",
+   "to": "schema",
+   "type": "imports",
+   "evidence": {
+    "path": "src/csv_click/app.py",
+    "symbol": "csv_click.schema",
+    "line": 51
+   },
+   "bend": 13
+  },
+  {
+   "from": "app",
+   "to": "settings",
+   "type": "calls",
+   "evidence": {
+    "path": "src/csv_click/app.py",
+    "symbol": "load_app_settings",
+    "line": 680
+   },
+   "note": "constructed from the full params form for persistence; lazy, cached in session_state['app_settings']; on Apply parameters; OSError becomes st.warning, cache updated only on success",
+   "bend": -13
+  },
+  {
+   "from": "app",
+   "to": "settings",
+   "type": "imports",
+   "evidence": {
+    "path": "src/csv_click/app.py",
+    "symbol": "csv_click.settings",
+    "line": 55
+   },
+   "bend": 13
+  },
+  {
+   "from": "app",
+   "to": "streamlit",
+   "type": "calls",
+   "evidence": {
+    "path": "src/csv_click/app.py",
+    "symbol": "st.set_page_config",
+    "line": 144
+   },
+   "note": "@st.fragment(run_every=LOAD_PROGRESS_POLL_S) — polling fragment; button clicks inside redraw only the fragment; mapping editor key='mapping_editor'; second editor key='type_editor' at line 990; plus st.* throughout: form",
+   "bend": -13
+  },
+  {
+   "from": "app",
+   "to": "streamlit",
+   "type": "imports",
+   "evidence": {
+    "path": "src/csv_click/app.py",
+    "symbol": "import streamlit as st",
+    "line": 12
+   },
+   "bend": 13
+  },
+  {
+   "from": "benchmarks",
+   "to": "clickhouse",
+   "type": "calls",
+   "evidence": {
+    "path": "benchmarks/tcp_info_probe.py",
+    "symbol": "get_client",
+    "line": 394
+   },
+   "note": "ClickHouseConfig constructed at line 380 from settings plus CLICKHOUSE_USER/CLICKHOUSE_PASSWORD env vars (383-384)",
+   "bend": -13
+  },
+  {
+   "from": "benchmarks",
+   "to": "clickhouse",
+   "type": "imports",
+   "evidence": {
+    "path": "benchmarks/tcp_info_probe.py",
+    "symbol": "get_client",
+    "line": 49
+   },
+   "note": "also imports ClickHouseConfig on the same line",
+   "bend": 13
+  },
+  {
+   "from": "benchmarks",
+   "to": "clickhouse_connect",
+   "type": "calls",
+   "evidence": {
+    "path": "benchmarks/tcp_info_probe.py",
+    "symbol": "client.query",
+    "line": 396
+   },
+   "note": "warm-up SELECT 1 so a socket returns to the pool; client object comes from get_client"
+  },
+  {
+   "from": "benchmarks",
+   "to": "clickhouse_server",
+   "type": "writes",
+   "evidence": {
+    "path": "benchmarks/tcp_info_probe.py",
+    "symbol": "client.raw_insert",
+    "line": 407
+   },
+   "note": "JSONEachRow insert of synthetic payload; default target FUNCTION null('c String') (line 361) discards data, --table redirects to a real table"
+  },
+  {
+   "from": "benchmarks",
+   "to": "load_stats",
+   "type": "calls",
+   "evidence": {
+    "path": "benchmarks/tcp_info_probe.py",
+    "symbol": "first_pooled_socket",
+    "line": 143
+   },
+   "note": "inside find_pooled_socket; grabs the idle urllib3 pooled socket before the insert",
+   "bend": -13
+  },
+  {
+   "from": "benchmarks",
+   "to": "load_stats",
+   "type": "imports",
+   "evidence": {
+    "path": "benchmarks/tcp_info_probe.py",
+    "symbol": "first_pooled_socket",
+    "line": 50
+   },
+   "bend": 13
+  },
+  {
+   "from": "benchmarks",
+   "to": "pandas",
+   "type": "calls",
+   "evidence": {
+    "path": "benchmarks/serialize_bench.py",
+    "symbol": "pd.DataFrame",
+    "line": 248
+   },
+   "note": "profile frames built as object dtype; pd.to_datetime used in legacy path at lines 75, 78",
+   "bend": -13
+  },
+  {
+   "from": "benchmarks",
+   "to": "pandas",
+   "type": "imports",
+   "evidence": {
+    "path": "benchmarks/serialize_bench.py",
+    "symbol": "import pandas as pd",
+    "line": 36
+   },
+   "bend": 13
+  },
+  {
+   "from": "benchmarks",
+   "to": "pandas_loader",
+   "type": "calls",
+   "evidence": {
+    "path": "benchmarks/serialize_bench.py",
+    "symbol": "convert_chunk_to_schema",
+    "line": 254
+   },
+   "note": "also called inside legacy_convert at line 86 so both paths share the same conversion; the measured production path, timed via measure()",
+   "bend": -13
+  },
+  {
+   "from": "benchmarks",
+   "to": "pandas_loader",
+   "type": "imports",
+   "evidence": {
+    "path": "benchmarks/serialize_bench.py",
+    "symbol": "iter_json_each_row_payloads",
+    "line": 41
+   },
+   "note": "import block lines 38-42 also brings SchemaMapping (39) and convert_chunk_to_schema (40)",
+   "bend": 13
+  },
+  {
+   "from": "benchmarks",
+   "to": "schema",
+   "type": "calls",
+   "evidence": {
+    "path": "benchmarks/serialize_bench.py",
+    "symbol": "unwrap_nullable",
+    "line": 252
+   },
+   "note": "also at line 73 inside legacy_convert_temporal",
+   "bend": -13
+  },
+  {
+   "from": "benchmarks",
+   "to": "schema",
+   "type": "imports",
+   "evidence": {
+    "path": "benchmarks/serialize_bench.py",
+    "symbol": "unwrap_nullable",
+    "line": 43
+   },
+   "bend": 13
+  },
+  {
+   "from": "benchmarks",
+   "to": "settings",
+   "type": "calls",
+   "evidence": {
+    "path": "benchmarks/tcp_info_probe.py",
+    "symbol": "load_app_settings",
+    "line": 378
+   },
+   "bend": -13
+  },
+  {
+   "from": "benchmarks",
+   "to": "settings",
+   "type": "imports",
+   "evidence": {
+    "path": "benchmarks/tcp_info_probe.py",
+    "symbol": "load_app_settings",
+    "line": 51
+   },
+   "bend": 13
+  },
+  {
+   "from": "clickhouse",
+   "to": "clickhouse_connect",
+   "type": "calls",
+   "evidence": {
+    "path": "src/csv_click/clickhouse.py",
+    "symbol": "clickhouse_connect.get_client",
+    "line": 119
+   },
+   "note": "HTTP(S) interface client: host/port 443, secure, verify, client_cert, client_cert_key, connect_timeout=60, send_receive_timeout=1800",
+   "bend": -13
+  },
+  {
+   "from": "clickhouse",
+   "to": "clickhouse_connect",
+   "type": "imports",
+   "evidence": {
+    "path": "src/csv_click/clickhouse.py",
+    "symbol": "clickhouse_connect",
+    "line": 103
+   },
+   "note": "lazy import inside get_client(), not module-level, so import errors surface as ClickHouseConnectionError",
+   "bend": 13
+  },
+  {
+   "from": "clickhouse",
+   "to": "clickhouse_server",
+   "type": "calls",
+   "evidence": {
+    "path": "src/csv_click/clickhouse.py",
+    "symbol": "client.query",
+    "line": 130
+   },
+   "note": "_existing_target_tables: clusterAllReplicas('<cluster>', system.tables) lookup of distributed+local names; _table_exists_on_cluster: single-table visibility poll after CREATE; test_connection: SELECT 1 probe",
+   "bend": -13
+  },
+  {
+   "from": "clickhouse",
+   "to": "clickhouse_server",
+   "type": "writes",
+   "evidence": {
+    "path": "src/csv_click/clickhouse.py",
+    "symbol": "client.query",
+    "line": 187
+   },
+   "note": "create_tables: CREATE Distributed table ON CLUSTER; create_tables: CREATE local ReplicatedMergeTree table ON CLUSTER; drop_target_tables: DROP TABLE IF EXISTS <db>.<table> ON CLUSTER, distributed then local; insert_batch",
+   "bend": 13
+  },
+  {
+   "from": "clickhouse",
+   "to": "errors",
+   "type": "imports",
+   "evidence": {
+    "path": "src/csv_click/clickhouse.py",
+    "symbol": "csv_click.errors",
+    "line": 12
+   },
+   "note": "imports CertificateError, ClickHouseConnectionError, ExistingTableError, TableCleanupError"
+  },
+  {
+   "from": "clickhouse",
+   "to": "schema",
+   "type": "imports",
+   "evidence": {
+    "path": "src/csv_click/clickhouse.py",
+    "symbol": "CsvSchema",
+    "line": 18
+   },
+   "note": "uses schema.columns[].column_name/final_type and schema.column_names"
+  },
+  {
+   "from": "launcher",
+   "to": "app",
+   "type": "calls",
+   "evidence": {
+    "path": "src/csv_click/launcher.py",
+    "symbol": "with_name(\"app.py\")",
+    "line": 107
+   },
+   "note": "never imported — the file path is handed to `streamlit run` as the script argument; streamlit executes it"
+  },
+  {
+   "from": "launcher",
+   "to": "streamlit",
+   "type": "calls",
+   "evidence": {
+    "path": "src/csv_click/launcher.py",
+    "symbol": "streamlit",
+    "line": 95
+   },
+   "note": "sys.executable -m streamlit run <app.py> --server.address 127.0.0.1 --server.port N; actually executed by subprocess.call at line 122"
+  },
+  {
+   "from": "load_job",
+   "to": "clickhouse",
+   "type": "calls",
+   "evidence": {
+    "path": "src/csv_click/load_job.py",
+    "symbol": "get_client(self.config)",
+    "line": 391
+   },
+   "note": "DDL phase; the HTTP write to clickhouse-server lives inside clickhouse.py; also at lines 121 and 160; rollback of empty tables after a stopped load, via _cleanup_after_stopped_load; worker thread creates the primary clie",
+   "bend": -13
+  },
+  {
+   "from": "load_job",
+   "to": "clickhouse",
+   "type": "imports",
+   "evidence": {
+    "path": "src/csv_click/load_job.py",
+    "symbol": "get_client",
+    "line": 26
+   },
+   "note": "also ClickHouseConfig, build_table_names, create_tables, drop_target_tables, test_connection (lines 21-28)",
+   "bend": 13
+  },
+  {
+   "from": "load_job",
+   "to": "csv_file",
+   "type": "reads",
+   "evidence": {
+    "path": "src/csv_click/load_job.py",
+    "symbol": "Path(self.csv_path).stat().st_size",
+    "line": 342
+   },
+   "note": "source size only; the CSV body is read inside pandas_loader"
+  },
+  {
+   "from": "load_job",
+   "to": "errors",
+   "type": "calls",
+   "evidence": {
+    "path": "src/csv_click/load_job.py",
+    "symbol": "CsvLoadCancelled(\"The load was cancelled by the operator\")",
+    "line": 309
+   },
+   "note": "raised at phase boundaries by _raise_if_cancelled",
+   "bend": -13
+  },
+  {
+   "from": "load_job",
+   "to": "errors",
+   "type": "imports",
+   "evidence": {
+    "path": "src/csv_click/load_job.py",
+    "symbol": "CsvLoadCancelled",
+    "line": 33
+   },
+   "note": "also CertificateError, ClickHouseConnectionError, CsvClickError, CsvSchemaError, ExistingTableError, TableCleanupError (lines 29-37)",
+   "bend": 13
+  },
+  {
+   "from": "load_job",
+   "to": "load_stats",
+   "type": "calls",
+   "evidence": {
+    "path": "src/csv_click/load_job.py",
+    "symbol": "RunConfig(",
+    "line": 221
+   },
+   "note": "before-snapshot; after-snapshot at line 506; in finally; OSError logged and swallowed, other exceptions propagate after _finished.set(); taken right after connect, the only moment the pooled socket is idle; used as conte",
+   "bend": -26
+  },
+  {
+   "from": "load_job",
+   "to": "load_stats",
+   "type": "imports",
+   "evidence": {
+    "path": "src/csv_click/load_job.py",
+    "symbol": "write_run_record",
+    "line": 46
+   },
+   "note": "also BlockProgress, DriverRetryCounter, LoadStats, RunConfig, arrow_pool_high_water_bytes, describe_connection_path, format_load_stats_lines (lines 38-47)"
+  },
+  {
+   "from": "load_job",
+   "to": "load_stats",
+   "type": "publishes",
+   "evidence": {
+    "path": "src/csv_click/load_job.py",
+    "symbol": "stats.insert_wall_s",
+    "line": 445
+   },
+   "note": "job thread is the single writer of the shared LoadStats instance: src_bytes (342), preflight_s (385), connect_s (393), connection_path (396), ddl_s (413), driver_retries (446), total_s (505), arrow_bytes (506); UI reads ",
+   "bend": 26
+  },
+  {
+   "from": "load_job",
+   "to": "pandas_loader",
+   "type": "calls",
+   "evidence": {
+    "path": "src/csv_click/load_job.py",
+    "symbol": "validate_csv_sample_with_pandas_chunks",
+    "line": 367
+   },
+   "note": "full strict preflight for files up to 50 MB; strict preflight for files over 50 MB; the insert itself; receives shared stats, progress_callback and cancel_callback",
+   "bend": -39
+  },
+  {
+   "from": "load_job",
+   "to": "pandas_loader",
+   "type": "imports",
+   "evidence": {
+    "path": "src/csv_click/load_job.py",
+    "symbol": "load_csv_via_raw_insert",
+    "line": 51
+   },
+   "note": "also ReadOptions, SchemaMapping, validate_csv_sample_with_pandas_chunks, validate_csv_with_pandas_chunks (lines 48-54)",
+   "bend": -13
+  },
+  {
+   "from": "load_job",
+   "to": "pandas_loader",
+   "type": "publishes",
+   "evidence": {
+    "path": "src/csv_click/load_job.py",
+    "symbol": "cancel_callback=self._cancel.is_set",
+    "line": 439
+   },
+   "note": "threading.Event set by request_cancel on the UI thread, polled by the loader between blocks — the cancellation propagation channel",
+   "bend": 13
+  },
+  {
+   "from": "load_job",
+   "to": "pandas_loader",
+   "type": "subscribes",
+   "evidence": {
+    "path": "src/csv_click/load_job.py",
+    "symbol": "progress_callback=self._on_block",
+    "line": 436
+   },
+   "note": "loader pushes BlockProgress records into _on_block (line 311), which appends per-block lines to the job log under _log_lock",
+   "bend": 39
+  },
+  {
+   "from": "load_job",
+   "to": "schema",
+   "type": "imports",
+   "evidence": {
+    "path": "src/csv_click/load_job.py",
+    "symbol": "CsvSchema",
+    "line": 55
+   }
+  },
+  {
+   "from": "load_stats",
+   "to": "clickhouse_connect",
+   "type": "calls",
+   "evidence": {
+    "path": "src/csv_click/load_stats.py",
+    "symbol": "getattr(getattr(client, \"http\", None), \"pools\", None)",
+    "line": 393
+   },
+   "note": "first_pooled_socket/describe_connection_path introspect the client's urllib3 PoolManager to find the live socket",
+   "bend": -13
+  },
+  {
+   "from": "load_stats",
+   "to": "clickhouse_connect",
+   "type": "subscribes",
+   "evidence": {
+    "path": "src/csv_click/load_stats.py",
+    "symbol": "logger.addHandler(self)",
+    "line": 338
+   },
+   "note": "DriverRetryCounter attaches as logging.Handler to logging.getLogger(\"clickhouse_connect.driver.httpclient\") (DRIVER_LOGGER_NAME, line 28) to count 'Retrying remotely closed connection' DEBUG records",
+   "bend": 13
+  },
+  {
+   "from": "load_stats",
+   "to": "csv_file",
+   "type": "reads",
+   "evidence": {
+    "path": "src/csv_click/load_stats.py",
+    "symbol": "csv_path.stat()",
+    "line": 462
+   },
+   "note": "describe_source_file: size and Windows st_file_attributes for cloud-placeholder detection"
+  },
+  {
+   "from": "loader_bat",
+   "to": "clickhouse_connect",
+   "type": "imports",
+   "evidence": {
+    "path": "loader.bat",
+    "symbol": "clickhouse_connect",
+    "line": 24
+   },
+   "note": "смоук-проверка импортов venv-питоном перед запуском"
+  },
+  {
+   "from": "loader_bat",
+   "to": "launcher",
+   "type": "calls",
+   "evidence": {
+    "path": "loader.bat",
+    "symbol": "csv_click.launcher",
+    "line": 33
+   },
+   "note": "\"%VENV_PYTHON%\" -m csv_click.launcher with PYTHONPATH=%PROJECT_DIR%src; nonzero exit -> :launch_failed"
+  },
+  {
+   "from": "loader_bat",
+   "to": "pandas",
+   "type": "imports",
+   "evidence": {
+    "path": "loader.bat",
+    "symbol": "pandas",
+    "line": 24
+   },
+   "note": "смоук-проверка импортов venv-питоном перед запуском"
+  },
+  {
+   "from": "loader_bat",
+   "to": "streamlit",
+   "type": "imports",
+   "evidence": {
+    "path": "loader.bat",
+    "symbol": "import streamlit",
+    "line": 24
+   },
+   "note": "смоук-проверка импортов venv-питоном перед запуском"
+  },
+  {
+   "from": "main",
+   "to": "app",
+   "type": "calls",
+   "evidence": {
+    "path": "src/csv_click/main.py",
+    "symbol": "main()",
+    "line": 5
+   },
+   "note": "under __main__ guard",
+   "bend": -13
+  },
+  {
+   "from": "main",
+   "to": "app",
+   "type": "imports",
+   "evidence": {
+    "path": "src/csv_click/main.py",
+    "symbol": "csv_click.app",
+    "line": 1
+   },
+   "note": "from csv_click.app import main",
+   "bend": 13
+  },
+  {
+   "from": "pandas_loader",
+   "to": "clickhouse",
+   "type": "calls",
+   "evidence": {
+    "path": "src/csv_click/pandas_loader.py",
+    "symbol": "raw_insert_batch",
+    "line": 1057
+   },
+   "note": "extracts server-reported elapsed_ns from the insert summary for BlockProgress; sequential path; parallel worker calls the same function at line 1135",
+   "bend": -13
+  },
+  {
+   "from": "pandas_loader",
+   "to": "clickhouse",
+   "type": "imports",
+   "evidence": {
+    "path": "src/csv_click/pandas_loader.py",
+    "symbol": "raw_insert_batch",
+    "line": 23
+   },
+   "note": "also imports summary_elapsed_ns on the same line",
+   "bend": 13
+  },
+  {
+   "from": "pandas_loader",
+   "to": "clickhouse_connect",
+   "type": "calls",
+   "evidence": {
+    "path": "src/csv_click/pandas_loader.py",
+    "symbol": "get_compressor(codec)",
+    "line": 658
+   },
+   "note": "fresh compressor per call: driver compressors are thread_safe=False",
+   "bend": -13
+  },
+  {
+   "from": "pandas_loader",
+   "to": "clickhouse_connect",
+   "type": "imports",
+   "evidence": {
+    "path": "src/csv_click/pandas_loader.py",
+    "symbol": "from clickhouse_connect.driver.compression import get_compressor",
+    "line": 21
+   },
+   "bend": 13
+  },
+  {
+   "from": "pandas_loader",
+   "to": "clickhouse_server",
+   "type": "writes",
+   "evidence": {
+    "path": "src/csv_click/pandas_loader.py",
+    "symbol": "raw_insert_batch",
+    "line": 1057
+   },
+   "note": "JSONEachRow INSERT block (optionally zstd/lz4/gzip-compressed) handed to csv_click.clickhouse.raw_insert_batch which performs the HTTP insert; parallel workers write via the same call at line 1135"
+  },
+  {
+   "from": "pandas_loader",
+   "to": "csv_file",
+   "type": "reads",
+   "evidence": {
+    "path": "src/csv_click/pandas_loader.py",
+    "symbol": "open(path, \"rb\")",
+    "line": 125
+   },
+   "note": "_CountingBinaryFile: binary CSV read with byte counter for progress; preview/inference paths read csv_path directly from disk (also 171, 231)"
+  },
+  {
+   "from": "pandas_loader",
+   "to": "errors",
+   "type": "imports",
+   "evidence": {
+    "path": "src/csv_click/pandas_loader.py",
+    "symbol": "CsvLoadCancelled",
+    "line": 24
+   },
+   "note": "also CsvLoadError, CsvReadCancelled, CsvSchemaError"
+  },
+  {
+   "from": "pandas_loader",
+   "to": "load_stats",
+   "type": "imports",
+   "evidence": {
+    "path": "src/csv_click/pandas_loader.py",
+    "symbol": "LoadStats",
+    "line": 25
+   },
+   "note": "also LOAD_WORKER_THREAD_PREFIX, BlockProgress"
+  },
+  {
+   "from": "pandas_loader",
+   "to": "pandas",
+   "type": "calls",
+   "evidence": {
+    "path": "src/csv_click/pandas_loader.py",
+    "symbol": "pd.read_csv",
+    "line": 171
+   },
+   "note": "chunked reader with chunksize=batch_size; also header read (231) and preview (265); narrow-int conversion before safe astype to nullable pandas dtype; also Float64 path at 1498; reference JSONEachRow serializer: orient='",
+   "bend": -13
+  },
+  {
+   "from": "pandas_loader",
+   "to": "pandas",
+   "type": "imports",
+   "evidence": {
+    "path": "src/csv_click/pandas_loader.py",
+    "symbol": "import pandas as pd",
+    "line": 16
+   },
+   "bend": 13
+  },
+  {
+   "from": "pandas_loader",
+   "to": "schema",
+   "type": "calls",
+   "evidence": {
+    "path": "src/csv_click/pandas_loader.py",
+    "symbol": "normalize_identifier",
+    "line": 421
+   },
+   "note": "also 521, 1529; entry of _convert_series; also text_columns_for (112), _schema_from_stats (443), mapping helpers (458, 488, 507, 528); header -> column name during stats init; also in _schema_from_stats at 439; instantia",
+   "bend": -13
+  },
+  {
+   "from": "pandas_loader",
+   "to": "schema",
+   "type": "imports",
+   "evidence": {
+    "path": "src/csv_click/pandas_loader.py",
+    "symbol": "_infer_type",
+    "line": 31
+   },
+   "note": "import block lines 26-37: NA_MARKERS, CsvColumn, CsvSchema, _ColumnStats, _infer_type, _needs_nullable, convert_value, normalize_identifier, unwrap_nullable, validate_clickhouse_type_expression",
+   "bend": 13
+  },
+  {
+   "from": "schema",
+   "to": "csv_file",
+   "type": "reads",
+   "evidence": {
+    "path": "src/csv_click/schema.py",
+    "symbol": "path.open(\"r\", encoding=\"utf-8-sig\", newline=\"\")",
+    "line": 270
+   },
+   "note": "_detect_dialect samples the first 8192 characters for csv.Sniffer; analyze_csv_schema reads the CSV with csv.DictReader"
+  },
+  {
+   "from": "schema",
+   "to": "errors",
+   "type": "imports",
+   "evidence": {
+    "path": "src/csv_click/schema.py",
+    "symbol": "CsvSchemaError",
+    "line": 10
+   }
+  },
+  {
+   "from": "settings",
+   "to": "clickhouse",
+   "type": "imports",
+   "evidence": {
+    "path": "src/csv_click/settings.py",
+    "symbol": "csv_click.clickhouse",
+    "line": 8
+   },
+   "note": "imports DEFAULT_CLIENT_CERT, DEFAULT_CLIENT_KEY, DEFAULT_HOST, DEFAULT_PORT as AppSettings defaults"
+  },
+  {
+   "from": "tests",
+   "to": "app",
+   "type": "calls",
+   "evidence": {
+    "path": "tests/test_app_steps.py",
+    "symbol": "from csv_click.app import LOAD_STEPS, step_heading, step_path_line",
+    "line": 17
+   }
+  },
+  {
+   "from": "tests",
+   "to": "benchmarks",
+   "type": "calls",
+   "evidence": {
+    "path": "tests/test_tcp_info_probe.py",
+    "symbol": "import tcp_info_probe",
+    "line": 28
+   }
+  },
+  {
+   "from": "tests",
+   "to": "clickhouse",
+   "type": "calls",
+   "evidence": {
+    "path": "tests/test_settings.py",
+    "symbol": "from csv_click.clickhouse import DEFAULT_CLIENT_CERT, DEFAULT_CLIENT_KEY, default_client_paths",
+    "line": 4
+   }
+  },
+  {
+   "from": "tests",
+   "to": "errors",
+   "type": "calls",
+   "evidence": {
+    "path": "tests/test_json_serialization.py",
+    "symbol": "from csv_click.errors import CsvLoadError, CsvSchemaError",
+    "line": 28
+   }
+  },
+  {
+   "from": "tests",
+   "to": "launcher",
+   "type": "calls",
+   "evidence": {
+    "path": "tests/test_launcher.py",
+    "symbol": "from csv_click.launcher import (",
+    "line": 11
+   }
+  },
+  {
+   "from": "tests",
+   "to": "load_job",
+   "type": "calls",
+   "evidence": {
+    "path": "tests/test_app_load_ui.py",
+    "symbol": "import csv_click.load_job as load_job",
+    "line": 19
+   }
+  },
+  {
+   "from": "tests",
+   "to": "load_stats",
+   "type": "calls",
+   "evidence": {
+    "path": "tests/test_app_load_ui.py",
+    "symbol": "from csv_click.load_stats import LoadStats",
+    "line": 22
+   }
+  },
+  {
+   "from": "tests",
+   "to": "loader_bat",
+   "type": "reads",
+   "evidence": {
+    "path": "tests/test_loader_bat.py",
+    "symbol": "Path(\"loader.bat\").read_text(encoding=\"utf-8\")",
+    "line": 13
+   }
+  },
+  {
+   "from": "tests",
+   "to": "pandas_loader",
+   "type": "calls",
+   "evidence": {
+    "path": "tests/test_json_serialization.py",
+    "symbol": "import csv_click.pandas_loader as pandas_loader",
+    "line": 27
+   }
+  },
+  {
+   "from": "tests",
+   "to": "readme",
+   "type": "reads",
+   "evidence": {
+    "path": "tests/test_loader_bat.py",
+    "symbol": "Path(\"README.md\").read_text(encoding=\"utf-8\")",
+    "line": 184
+   }
+  },
+  {
+   "from": "tests",
+   "to": "schema",
+   "type": "calls",
+   "evidence": {
+    "path": "tests/test_readme_matches_the_app.py",
+    "symbol": "from csv_click.schema import CLICKHOUSE_TYPE_OPTIONS",
+    "line": 14
+   }
+  },
+  {
+   "from": "tests",
+   "to": "settings",
+   "type": "calls",
+   "evidence": {
+    "path": "tests/test_settings.py",
+    "symbol": "from csv_click.settings import AppSettings, load_app_settings, save_app_settings",
+    "line": 5
+   }
+  }
+ ],
+ "flows": [
+  {
+   "id": "f1-launch",
+   "title": "Запуск с ярлыка",
+   "trigger": "Двойной клик по loader.bat (Windows, без прав администратора)",
+   "steps": [
+    {
+     "node": "loader_bat",
+     "action": "находит или ставит uv, разворачивает .venv строго по uv.lock (uv sync --locked), смоук-проверяет импорты streamlit/pandas/clickhouse_connect"
+    },
+    {
+     "node": "launcher",
+     "action": "печатает версию копии (git log -1, офлайн), bind-пробой берёт свободный порт 8501–8510 без SO_REUSEADDR"
+    },
+    {
+     "node": "streamlit",
+     "action": "поднимается тем же интерпретатором .venv: python -m streamlit run src/csv_click/app.py на 127.0.0.1:<порт>"
+    },
+    {
+     "node": "app",
+     "action": "main() рисует мастер из 5 шагов и панель загрузки вне шагов"
+    }
+   ],
+   "outcome": "Работающий UI на http://127.0.0.1:<порт>; любая ошибка запуска печатается одной понятной строкой"
+  },
+  {
+   "id": "f2-read-infer",
+   "title": "Чтение CSV и вывод схемы",
+   "trigger": "Шаг 1: оператор указывает серверный путь к CSV, разделитель и кодировку, жмёт Read CSV",
+   "steps": [
+    {
+     "node": "app",
+     "action": "_apply_csv_path проверяет существование файла и сбрасывает всё пофайловое состояние (CSV_READ_STATE_KEYS)"
+    },
+    {
+     "node": "csv_file",
+     "action": "источник: превью 20 строк, затем быстрая выборка 100 000 строк или полный скан с кнопкой остановки"
+    },
+    {
+     "node": "pandas_loader",
+     "action": "iter_pandas_chunks читает чанками в all-text; analyze_csv_with_pandas_sample/chunks копит постолбцовую статистику"
+    },
+    {
+     "node": "schema",
+     "action": "_ColumnStats.add_value → _infer_type (точное расширение диапазонов, String-фолбэки) → _needs_nullable → обёртка Nullable(…)"
+    },
+    {
+     "node": "app",
+     "action": "редакторы маппинга (шаг 2) и типов (шаг 3): подтверждения гейтят следующие шаги, повторное применение маппинга инвалидирует типы"
+    }
+   ],
+   "outcome": "Подтверждённые schema_rows/type_rows в session_state — вход для шага параметров и загрузки"
+  },
+  {
+   "id": "f3-load",
+   "title": "Создание таблиц и загрузка",
+   "trigger": "Шаг 5: кнопка «Create tables and load»",
+   "steps": [
+    {
+     "node": "app",
+     "action": "_start_load на script-треде: guard «один job на процесс», пересборка маппингов из type_rows, повторная проверка превью"
+    },
+    {
+     "node": "load_job",
+     "action": "daemon-поток: preflight → connect → DDL → insert; RunConfig заморожен; UI только читает состояние job-а"
+    },
+    {
+     "node": "clickhouse",
+     "action": "get_client (HTTPS + mTLS) → test_connection → create_tables: ReplicatedMergeTree + Distributed ON CLUSTER с поллингом видимости и откатом при сбое"
+    },
+    {
+     "node": "pandas_loader",
+     "action": "чанки → convert_chunk_to_schema (узкие int числами, Nullable-семантика) → JSONEachRow-блоки ≤ лимита payload (Arrow fast path, опц. zstd/lz4/gzip)"
+    },
+    {
+     "node": "clickhouse_server",
+     "action": "каждый блок уходит HTTP INSERT-ом через raw_insert (fmt=JSONEachRow); X-ClickHouse-Summary отдаёт elapsed_ns"
+    },
+    {
+     "node": "load_stats",
+     "action": "add_block копит строки/байты/серверное время; в finally пишется JSON run record в ~/.csv_click/runs"
+    },
+    {
+     "node": "app",
+     "action": "фрагмент раз в секунду: фаза, байтовый прогресс, хвост лога (400 строк); по завершении — одна полная перерисовка и сводка"
+    }
+   ],
+   "outcome": "Данные в кластерной паре таблиц, подробная сводка и run record; ошибка любой фазы не роняет UI"
+  },
+  {
+   "id": "f4-cancel",
+   "title": "Отмена загрузки",
+   "trigger": "Кнопка «Cancel load» в панели прогресса во время загрузки",
+   "steps": [
+    {
+     "node": "app",
+     "action": "request_cancel() на script-треде; кнопка гаснет, оператору показан контракт отмены"
+    },
+    {
+     "node": "load_job",
+     "action": "threading.Event: _raise_if_cancelled на границах фаз; во время insert событие передано в cancel_callback"
+    },
+    {
+     "node": "pandas_loader",
+     "action": "поллит колбэк между блоками: блоки в полёте доезжают и подтверждаются, новые не отправляются"
+    },
+    {
+     "node": "load_job",
+     "action": "outcome=cancelled; судьба таблиц по подтверждённым блокам: с данными — оставить, пустые — снести; run record пишется всегда"
+    },
+    {
+     "node": "app",
+     "action": "после остановки — st.rerun(scope='app') и сводка: сколько строк в скольких блоках доехало до отмены"
+    }
+   ],
+   "outcome": "Управляемая остановка без потери подтверждённых блоков и без осиротевших пустых таблиц"
+  },
+  {
+   "id": "f5-probe",
+   "title": "Диагностика скорости вставки",
+   "trigger": "Ручной запуск benchmarks/tcp_info_probe.py на Windows при подозрении, что вставку ограничивает сеть",
+   "steps": [
+    {
+     "node": "benchmarks",
+     "action": "собирает ClickHouseConfig из настроек и CLICKHOUSE_USER/CLICKHOUSE_PASSWORD; вне Windows выходит с кодом 2"
+    },
+    {
+     "node": "settings",
+     "action": "load_app_settings: хост, порт, сертификаты, кластер из ~/.csv_click/settings.json"
+    },
+    {
+     "node": "clickhouse",
+     "action": "get_client + прогрев SELECT 1, чтобы сокет вернулся в LIFO-пул"
+    },
+    {
+     "node": "load_stats",
+     "action": "first_pooled_socket достаёт живой пул-сокет для опроса SIO_TCP_INFO"
+    },
+    {
+     "node": "clickhouse_server",
+     "action": "raw_insert синтетического JSONEachRow-пейлоада, по умолчанию в FUNCTION null('c String')"
+    },
+    {
+     "node": "benchmarks",
+     "action": "Poller снимает RTT/BytesInFlight/Cwnd/SndWnd/ретрансмиссии; print_report выносит вердикт о лимитирующем механизме"
+    }
+   ],
+   "outcome": "Обоснованный вердикт: SO_SNDBUF-пин, потери, application-limited или окно получателя"
+  }
+ ],
+ "unknowns": [
+  "schema.analyze_csv_schema (путь через csv.DictReader) вызывается только из tests/test_schema.py; продакшен-инференс идёт через pandas_loader.analyze_csv_with_pandas_* — ребро schema→csv_file существует в коде, но в рабочих потоках приложения не участвует.",
+  "src/csv_click/main.py не упоминается ни в loader.bat, ни в pyproject.toml (секции [project.scripts] нет): только ручной запуск python -m csv_click.main.",
+  "tests/test2.csv — фикстура-сирота: по репозиторию нет ни одной ссылки на неё.",
+  "Зависимости вне словаря целей карты (numpy, pyarrow, lz4, zstandard, zlib, urllib3, ctypes/WinAPI, git, uv/pip) в рёбра не включены; главные: Arrow fast path сериализации в pandas_loader, интроспекция пула urllib3 в load_stats, git-версия при старте в launcher, WSAIoctl в tcp_info_probe.",
+  "Утверждения о внутренностях clickhouse-connect (тихий повтор тела на ConnectionResetError, query_id всегда в summary, перенос INSERT в URL при компрессии) и urllib3 (LIFO-пул) взяты из комментариев в коде и не проверяемы по исходникам этого репозитория.",
+  "Ограничение контура «через прокси живёт только raw_insert + JSONEachRow» задокументировано комментарием у settings.insert_compression и памятью проекта; из самих исходников оно не выводится."
+ ]
+}
+</script>
+<script id="codemap-layout" type="application/json">
+{"positions": {"streamlit": {"x": 320, "y": 40}, "pandas": {"x": 600, "y": 40}, "loader_bat": {"x": 50, "y": 200}, "launcher": {"x": 50, "y": 340}, "main": {"x": 50, "y": 480}, "app": {"x": 320, "y": 300}, "settings": {"x": 320, "y": 500}, "schema": {"x": 600, "y": 170}, "load_job": {"x": 600, "y": 310}, "pandas_loader": {"x": 600, "y": 450}, "load_stats": {"x": 600, "y": 590}, "clickhouse": {"x": 880, "y": 340}, "errors": {"x": 880, "y": 530}, "clickhouse_connect": {"x": 1170, "y": 340}, "clickhouse_server": {"x": 1420, "y": 340}, "csv_file": {"x": 860, "y": 40}, "readme": {"x": 350, "y": 780}, "tests": {"x": 640, "y": 780}, "benchmarks": {"x": 930, "y": 780}}, "boundaries": [{"label": "Запуск (Windows)", "x": 24, "y": 150, "w": 224, "h": 430}, {"label": "Приложение csv_click (src/)", "x": 292, "y": 120, "w": 512, "h": 570}, {"label": "Обёртка ClickHouse", "x": 856, "y": 290, "w": 216, "h": 340}, {"label": "Внешний контур", "x": 1146, "y": 290, "w": 470, "h": 150}, {"label": "Проверка и документация", "x": 320, "y": 740, "w": 810, "h": 140}], "view": {"x": 8, "y": 6, "k": 0.8}}
+</script>
+<script>
+"use strict";
+const DATA = JSON.parse(document.getElementById("codemap-data").textContent);
+const LAYOUT = JSON.parse(document.getElementById("codemap-layout").textContent);
+
+const ROLE_STYLE = {
+  "entrypoint": {color:"var(--entry)", label:"точка запуска"},
+  "ui":         {color:"var(--ui)",    label:"интерфейс (Streamlit)"},
+  "core":       {color:"var(--core)", label:"движок загрузки"},
+  "io":         {color:"var(--io)",   label:"обёртка ClickHouse"},
+  "config":     {color:"var(--config)",label:"конфигурация"},
+  "tests":      {color:"var(--test)", label:"тесты"},
+  "docs":       {color:"var(--doc)",  label:"документация"},
+  "benchmark":  {color:"var(--test)", label:"бенчмарки"},
+  "external-lib":{color:"var(--ext)", label:"внешняя библиотека"},
+  "database":   {color:"var(--db)",   label:"ClickHouse-сервер"},
+  "datasource": {color:"var(--data)", label:"исходные данные (CSV)"},
+};
+const EDGE_LABEL = {imports:"импорт", calls:"вызовы", reads:"чтение данных", writes:"запись в ClickHouse", publishes:"публикация состояния", subscribes:"подписка"};
+
+const nodesById = {};
+DATA.nodes.forEach(n => nodesById[n.id] = n);
+
+/* ---------- build SVG ---------- */
+const svg = document.getElementById("svg");
+const vp = document.getElementById("viewport");
+const NW = 168, NH = 52;
+
+function nodeCenter(id){
+  const p = LAYOUT.positions[id];
+  return {x:p.x + NW/2, y:p.y + NH/2};
+}
+function edgePath(e){
+  const a = nodeCenter(e.from), b = nodeCenter(e.to);
+  const dx = b.x - a.x, dy = b.y - a.y;
+  let sx, sy, tx, ty;
+  if (Math.abs(dx) > Math.abs(dy)) {
+    sx = a.x + Math.sign(dx)*NW/2; sy = a.y;
+    tx = b.x - Math.sign(dx)*NW/2; ty = b.y;
+  } else {
+    sx = a.x; sy = a.y + Math.sign(dy)*NH/2;
+    tx = b.x; ty = b.y - Math.sign(dy)*NH/2;
+  }
+  const mx = (sx+tx)/2, my = (sy+ty)/2;
+  const bend = (e.bend || 0);
+  const nxv = -(ty-sy), nyv = (tx-sx);
+  const nl = Math.hypot(nxv, nyv) || 1;
+  const cx = mx + nxv/nl*bend, cy = my + nyv/nl*bend;
+  return `M${sx},${sy} Q${cx},${cy} ${tx},${ty}`;
+}
+
+const edgeEls = [];
+function drawBoundaries(){
+  (LAYOUT.boundaries||[]).forEach(b=>{
+    const r = document.createElementNS(svg.namespaceURI,"rect");
+    r.setAttribute("class","boundary");
+    r.setAttribute("x",b.x); r.setAttribute("y",b.y);
+    r.setAttribute("width",b.w); r.setAttribute("height",b.h);
+    r.setAttribute("rx",14);
+    vp.appendChild(r);
+    const t = document.createElementNS(svg.namespaceURI,"text");
+    t.setAttribute("class","boundary-label");
+    t.setAttribute("x",b.x+12); t.setAttribute("y",b.y+18);
+    t.textContent = b.label;
+    vp.appendChild(t);
+  });
+}
+function drawEdges(){
+  DATA.edges.forEach((e,i)=>{
+    if(!(e.from in LAYOUT.positions) || !(e.to in LAYOUT.positions)) return;
+    const p = document.createElementNS(svg.namespaceURI,"path");
+    p.setAttribute("class","edge "+e.type);
+    p.setAttribute("d", edgePath(e));
+    p.setAttribute("marker-end","url(#arr)");
+    p.dataset.idx = i;
+    const ttl = document.createElementNS(svg.namespaceURI,"title");
+    const ev = (e.evidence && e.evidence !== "unknown") ? ` — ${e.evidence.symbol} (${e.evidence.path}:${e.evidence.line||"?"})` : "";
+    ttl.textContent = `${e.from} → ${e.to} · ${EDGE_LABEL[e.type]||e.type}${ev}`;
+    p.appendChild(ttl);
+    vp.appendChild(p);
+    edgeEls.push(p);
+  });
+}
+const nodeEls = {};
+function drawNodes(){
+  DATA.nodes.forEach(n=>{
+    const pos = LAYOUT.positions[n.id];
+    if(!pos) return;
+    const g = document.createElementNS(svg.namespaceURI,"g");
+    g.setAttribute("class","node");
+    g.setAttribute("transform",`translate(${pos.x},${pos.y})`);
+    g.dataset.id = n.id;
+    const st = ROLE_STYLE[n.role] || {color:"var(--ext)"};
+    const r = document.createElementNS(svg.namespaceURI,"rect");
+    r.setAttribute("width",NW); r.setAttribute("height",NH); r.setAttribute("rx",8);
+    r.setAttribute("stroke", st.color);
+    g.appendChild(r);
+    const t1 = document.createElementNS(svg.namespaceURI,"text");
+    t1.setAttribute("x",12); t1.setAttribute("y",22);
+    t1.textContent = n.label || n.id;
+    g.appendChild(t1);
+    const t2 = document.createElementNS(svg.namespaceURI,"text");
+    t2.setAttribute("x",12); t2.setAttribute("y",39);
+    t2.setAttribute("class","sub");
+    t2.textContent = n.path ? n.path : (ROLE_STYLE[n.role]||{}).label || "";
+    g.appendChild(t2);
+    const badge = document.createElementNS(svg.namespaceURI,"circle");
+    badge.setAttribute("cx",NW-1); badge.setAttribute("cy",1); badge.setAttribute("r",11);
+    badge.setAttribute("fill","var(--hl-flow)");
+    badge.style.display="none";
+    badge.classList.add("stepbadge");
+    g.appendChild(badge);
+    const bt = document.createElementNS(svg.namespaceURI,"text");
+    bt.setAttribute("x",NW-1); bt.setAttribute("y",5);
+    bt.setAttribute("text-anchor","middle");
+    bt.setAttribute("class","stepnum");
+    bt.style.display="none";
+    g.appendChild(bt);
+    vp.appendChild(g);
+    nodeEls[n.id] = g;
+    g.addEventListener("click", ev=>{ev.stopPropagation(); selectNode(n.id);});
+  });
+}
+drawBoundaries(); drawEdges(); drawNodes();
+
+/* ---------- legend ---------- */
+(function(){
+  const lg = document.getElementById("legend");
+  const seen = new Set(DATA.nodes.map(n=>n.role));
+  let html = "";
+  Object.entries(ROLE_STYLE).forEach(([k,v])=>{
+    if(!seen.has(k)) return;
+    html += `<div class="row"><span class="sw" style="background:${v.color}"></span>${v.label}</div>`;
+  });
+  html += `<div style="height:6px"></div>`;
+  html += `<div class="lrow"><span class="lsw" style="border-color:#7d8794"></span>вызов</div>`;
+  html += `<div class="lrow"><span class="lsw" style="border-color:#4a5568; border-top-style:dashed"></span>импорт</div>`;
+  html += `<div class="lrow"><span class="lsw" style="border-color:var(--db)"></span>запись в ClickHouse</div>`;
+  html += `<div class="lrow"><span class="lsw" style="border-color:var(--io)"></span>чтение данных</div>`;
+  lg.innerHTML = html;
+})();
+
+/* ---------- pan & zoom ---------- */
+let view = {x:LAYOUT.view.x, y:LAYOUT.view.y, k:LAYOUT.view.k};
+function applyView(){ vp.setAttribute("transform",`translate(${view.x},${view.y}) scale(${view.k})`); }
+applyView();
+svg.addEventListener("wheel", e=>{
+  e.preventDefault();
+  const f = e.deltaY < 0 ? 1.12 : 1/1.12;
+  const pt = svgPoint(e);
+  view.x = pt.x - (pt.x - view.x)*f;
+  view.y = pt.y - (pt.y - view.y)*f;
+  view.k *= f;
+  applyView();
+},{passive:false});
+function svgPoint(e){
+  const r = svg.getBoundingClientRect();
+  return {x:e.clientX - r.left, y:e.clientY - r.top};
+}
+let drag = null;
+svg.addEventListener("mousedown", e=>{
+  const g = e.target.closest(".node");
+  if(g){
+    drag = {type:"node", id:g.dataset.id, start:svgPoint(e), orig:{...LAYOUT.positions[g.dataset.id]}};
+  } else {
+    drag = {type:"pan", start:svgPoint(e), orig:{x:view.x, y:view.y}};
+    svg.classList.add("panning");
+  }
+});
+window.addEventListener("mousemove", e=>{
+  if(!drag) return;
+  const p = svgPoint(e);
+  const dx = p.x - drag.start.x, dy = p.y - drag.start.y;
+  if(drag.type==="pan"){
+    view.x = drag.orig.x + dx; view.y = drag.orig.y + dy; applyView();
+  } else {
+    const pos = LAYOUT.positions[drag.id];
+    pos.x = drag.orig.x + dx/view.k; pos.y = drag.orig.y + dy/view.k;
+    nodeEls[drag.id].setAttribute("transform",`translate(${pos.x},${pos.y})`);
+    edgeEls.forEach(el=>{
+      const e2 = DATA.edges[el.dataset.idx];
+      if(e2.from===drag.id || e2.to===drag.id) el.setAttribute("d", edgePath(e2));
+    });
+  }
+});
+window.addEventListener("mouseup", ()=>{ if(drag && drag.type==="pan") svg.classList.remove("panning"); drag=null; });
+svg.addEventListener("click", e=>{ if(!e.target.closest(".node")) clearAll(); });
+window.addEventListener("keydown", e=>{ if(e.key==="Escape") clearAll(); });
+
+/* ---------- selection / highlighting ---------- */
+let activeFlow = null, activeNode = null;
+function resetClasses(){
+  Object.values(nodeEls).forEach(g=>{ g.classList.remove("dim","semi","hl-up","hl-down","hl-sel","hl-test","hl-flow");
+    g.querySelector(".stepbadge").style.display="none";
+    g.querySelectorAll("text")[2] && (g.querySelectorAll("text")[2].style.display="none");
+  });
+  edgeEls.forEach(p=>{ p.classList.remove("dim","hl","hl-flowedge"); p.setAttribute("marker-end","url(#arr)"); });
+}
+function clearAll(){
+  activeFlow = null; activeNode = null;
+  resetClasses();
+  document.querySelectorAll(".flowchip").forEach(c=>c.classList.remove("active"));
+  document.getElementById("flowbar").classList.remove("open");
+  document.getElementById("panel").classList.remove("open");
+  applyFilters();
+}
+function selectNode(id){
+  activeFlow = null;
+  document.querySelectorAll(".flowchip").forEach(c=>c.classList.remove("active"));
+  document.getElementById("flowbar").classList.remove("open");
+  activeNode = id;
+  resetClasses();
+  const up = new Set(), down = new Set();
+  edgeEls.forEach(p=>{
+    const e = DATA.edges[p.dataset.idx];
+    if(e.to===id && e.from!==id){ up.add(e.from); p.classList.add("hl"); }
+    else if(e.from===id && e.to!==id){ down.add(e.to); p.classList.add("hl"); }
+    else p.classList.add("dim");
+  });
+  const n = nodesById[id];
+  const testIds = new Set((n.tests||[]).map(t=>t.node).filter(Boolean));
+  Object.entries(nodeEls).forEach(([nid,g])=>{
+    if(nid===id) g.classList.add("hl-sel");
+    else if(up.has(nid)) g.classList.add("hl-up");
+    else if(down.has(nid)) g.classList.add("hl-down");
+    else if(testIds.has(nid)) g.classList.add("hl-test");
+    else g.classList.add("dim");
+  });
+  showPanel(id, up, down);
+}
+function showPanel(id, up, down){
+  const n = nodesById[id];
+  const st = ROLE_STYLE[n.role]||{color:"var(--ext)",label:n.role};
+  const panel = document.getElementById("panel");
+  let h = `<button class="closebtn" onclick="clearAll()">×</button>`;
+  h += `<h2><span class="dot" style="background:${st.color}"></span>${esc(n.label||n.id)}</h2>`;
+  h += `<div class="path">${esc(n.path||st.label)}</div>`;
+  h += `<div class="sub">${esc(n.summary||"")}</div>`;
+  if(up.size){
+    h += `<h3>Кто вызывает (${up.size})</h3><ul>`;
+    [...up].forEach(u=>{
+      const evs = DATA.edges.filter(e=>e.from===u&&e.to===id).map(fmtEdgeEv).join("; ");
+      h += `<li class="rel" onclick="selectNode('${u}')"><code>${esc(u)}</code> <span class="ev">${evs}</span></li>`;
+    });
+    h += `</ul>`;
+  }
+  if(down.size){
+    h += `<h3>От чего зависит (${down.size})</h3><ul>`;
+    [...down].forEach(d=>{
+      const evs = DATA.edges.filter(e=>e.from===id&&e.to===d).map(fmtEdgeEv).join("; ");
+      h += `<li class="rel" onclick="selectNode('${d}')"><code>${esc(d)}</code> <span class="ev">${evs}</span></li>`;
+    });
+    h += `</ul>`;
+  }
+  if((n.entrypoints||[]).length){
+    h += `<h3>Точки входа</h3><ul>`;
+    n.entrypoints.forEach(ep=>{
+      h += `<li><code>${esc(ep.symbol)}</code>${ep.line?` <span class="ev">:${ep.line}</span>`:""}${ep.summary?`<div class="sub">${esc(ep.summary)}</div>`:""}</li>`;
+    });
+    h += `</ul>`;
+  }
+  if((n.constraints||[]).length){
+    h += `<h3>Ограничения и инварианты</h3><ul>`;
+    n.constraints.forEach(c=>{
+      h += `<li>${esc(c.text)}<div class="ev">${esc(c.evidence&&c.evidence.symbol||"")} ${c.evidence&&c.evidence.path?esc(c.evidence.path)+":"+(c.evidence.line||"?"):""}</div></li>`;
+    });
+    h += `</ul>`;
+  }
+  if((n.tests||[]).length){
+    h += `<h3>Тесты (${n.tests.length})</h3><ul>`;
+    n.tests.forEach(t=>{
+      h += `<li><code>${esc(t.path)}</code>${t.verifies?`<div class="sub">${esc(t.verifies)}</div>`:""}</li>`;
+    });
+    h += `</ul>`;
+  }
+  const flows = DATA.flows.filter(f=>f.steps.some(s=>s.node===id));
+  if(flows.length){
+    h += `<h3>Участвует в потоках</h3><ul>`;
+    flows.forEach(f=>{
+      h += `<li class="flowref" onclick="selectFlow('${f.id}')">▶ ${esc(f.title||f.id)}</li>`;
+    });
+    h += `</ul>`;
+  }
+  panel.innerHTML = h;
+  panel.classList.add("open");
+}
+function fmtEdgeEv(e){
+  const lbl = EDGE_LABEL[e.type]||e.type;
+  if(e.evidence && e.evidence!=="unknown") return `${lbl}: ${e.evidence.symbol}`;
+  return lbl+" (unknown)";
+}
+
+/* ---------- flows ---------- */
+function selectFlow(fid){
+  const f = DATA.flows.find(x=>x.id===fid);
+  if(!f) return;
+  activeNode = null; activeFlow = fid;
+  document.getElementById("panel").classList.remove("open");
+  resetClasses();
+  document.querySelectorAll(".flowchip").forEach(c=>c.classList.toggle("active", c.dataset.id===fid));
+  const stepNodes = f.steps.map(s=>s.node);
+  const inFlow = new Set(stepNodes);
+  Object.entries(nodeEls).forEach(([nid,g])=>{
+    if(inFlow.has(nid)){
+      g.classList.add("hl-flow");
+      const idx = stepNodes.indexOf(nid);
+      const badge = g.querySelector(".stepbadge");
+      const texts = g.querySelectorAll("text");
+      const bt = texts[texts.length-1];
+      badge.style.display=""; bt.style.display="";
+      bt.textContent = String(idx+1);
+    } else g.classList.add("dim");
+  });
+  const consec = new Set();
+  for(let i=0;i<stepNodes.length-1;i++) consec.add(stepNodes[i]+"→"+stepNodes[i+1]);
+  edgeEls.forEach(p=>{
+    const e = DATA.edges[p.dataset.idx];
+    if(consec.has(e.from+"→"+e.to)){ p.classList.add("hl-flowedge"); p.setAttribute("marker-end","url(#arr-hl)"); }
+    else if(inFlow.has(e.from)&&inFlow.has(e.to)) p.classList.add("semi");
+    else p.classList.add("dim");
+  });
+  const fb = document.getElementById("flowbar");
+  fb.innerHTML = `<b>${esc(f.title||f.id)}</b> · триггер: ${esc(f.trigger)} · итог: ${esc(f.outcome)}
+    <div class="steps">${f.steps.map((s,i)=>`<b>${i+1}.</b> ${esc(s.node)} — ${esc(s.action)}`).join(" &nbsp;·&nbsp; ")}</div>`;
+  fb.classList.add("open");
+}
+(function(){
+  const wrap = document.getElementById("flowchips");
+  DATA.flows.forEach(f=>{
+    const b = document.createElement("button");
+    b.className = "flowchip"; b.dataset.id = f.id;
+    b.textContent = f.title||f.id;
+    b.addEventListener("click", ()=>{ activeFlow===f.id ? clearAll() : selectFlow(f.id); });
+    wrap.appendChild(b);
+  });
+})();
+
+/* ---------- search & filters ---------- */
+const roleFilterState = {};
+(function(){
+  const groups = [["entrypoint","запуск"],["ui","UI"],["core","движок"],["io","IO"],["config","конфиг"],["tests","тесты"],["benchmark","бенч"],["docs","доки"],["external-lib","внешние"],["database","БД"],["datasource","CSV"]];
+  const present = new Set(DATA.nodes.map(n=>n.role));
+  const wrap = document.getElementById("filters");
+  wrap.insertAdjacentHTML("beforeend", `<span style="color:var(--faint); margin-left:6px">Фильтр:</span>`);
+  groups.forEach(([k,label])=>{
+    if(!present.has(k)) return;
+    roleFilterState[k]=true;
+    const l = document.createElement("label");
+    l.innerHTML = `<input type="checkbox" checked data-role="${k}"> ${label}`;
+    l.querySelector("input").addEventListener("change", e=>{
+      roleFilterState[k]=e.target.checked; applyFilters();
+    });
+    wrap.appendChild(l);
+  });
+})();
+function applyFilters(){
+  if(activeNode||activeFlow) return;
+  const q = document.getElementById("search").value.trim().toLowerCase();
+  DATA.nodes.forEach(n=>{
+    const g = nodeEls[n.id]; if(!g) return;
+    const roleOK = roleFilterState[n.role]!==false;
+    let searchOK = true;
+    if(q){
+      const hay = [n.id, n.label, n.path, n.summary, ...(n.entrypoints||[]).map(e=>e.symbol)].join(" ").toLowerCase();
+      searchOK = hay.includes(q);
+    }
+    g.classList.toggle("dim", !(roleOK&&searchOK));
+    g.classList.toggle("hl-sel", !!q && roleOK && searchOK);
+  });
+  edgeEls.forEach(p=>{
+    const e = DATA.edges[p.dataset.idx];
+    const okF = !nodeEls[e.from].classList.contains("dim");
+    const okT = !nodeEls[e.to].classList.contains("dim");
+    p.classList.toggle("dim", !(okF&&okT));
+  });
+}
+document.getElementById("search").addEventListener("input", ()=>{ if(activeNode||activeFlow){activeNode=null;activeFlow=null;resetClasses();document.getElementById("panel").classList.remove("open");document.getElementById("flowbar").classList.remove("open");document.querySelectorAll(".flowchip").forEach(c=>c.classList.remove("active"));} applyFilters(); });
+
+function esc(s){ return String(s==null?"":s).replace(/[&<>"']/g, c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c])); }
+window.selectNode = selectNode; window.selectFlow = selectFlow; window.clearAll = clearAll;
+</script>
+</body>
+</html>

@@ -1,0 +1,141 @@
+{
+  "commit": "70eda36da4e5c6406d5593da175dda9a0ed4616b",
+  "branch": "docs/codemap",
+  "working_tree_dirty": false,
+  "uncommitted_changes_in_scope": [],
+  "generated_at": "2026-08-05T18:22:48+03:00",
+  "scope": [
+    "src/csv_click",
+    "tests",
+    "benchmarks",
+    "loader.bat",
+    "README.md",
+    "pyproject.toml"
+  ],
+  "excluded": [
+    ".venv",
+    ".codex",
+    ".git",
+    "docs/superpowers",
+    "docs/codemap",
+    "*.ipynb",
+    "uv.lock",
+    "example_pandas_to_click.md",
+    ".gitignore",
+    ".python-version",
+    "AGENTS.codex.md",
+    "AGENTS.md"
+  ],
+  "fingerprint_algorithm": "sha256-v1: per module, sha256 over newline-joined entries '<repo-relative path>:<sha256 hex of file bytes>' for its tracked files sorted by path",
+  "modules": {
+    "app": {
+      "files": [
+        "src/csv_click/app.py"
+      ],
+      "fingerprint": "031590c7660955582135b412a898ef215bed8e91568f0cd53a3b77716d2b5447"
+    },
+    "benchmarks": {
+      "files": [
+        "benchmarks/serialize_bench.py",
+        "benchmarks/tcp_info_probe.py"
+      ],
+      "fingerprint": "9e24261edbdde1d7ab2780276b0c84a21573ff06a8dd9d3342ffcbb06103233e"
+    },
+    "clickhouse": {
+      "files": [
+        "src/csv_click/clickhouse.py"
+      ],
+      "fingerprint": "c9fdd99e01795305ab852ee333d1b3c2196ca6a72c05d4c5a37cc762ef6d337d"
+    },
+    "errors": {
+      "files": [
+        "src/csv_click/errors.py"
+      ],
+      "fingerprint": "4a984a430f354bd5587915844fddbda361458200715136aa1671d12aa46824f7"
+    },
+    "launcher": {
+      "files": [
+        "src/csv_click/launcher.py"
+      ],
+      "fingerprint": "acfe3ee6d2642c064205ef4734831be77c15d25af7d26173a4c51fd4afc477cf"
+    },
+    "load_job": {
+      "files": [
+        "src/csv_click/load_job.py"
+      ],
+      "fingerprint": "190052fa64aa23c1775033a726dceaf9fbdd41ae4c60ebb872b894fdd49df0d0"
+    },
+    "load_stats": {
+      "files": [
+        "src/csv_click/load_stats.py"
+      ],
+      "fingerprint": "2cf615d5dd0bc33ad321739f45a8e8c27b43f311d18f413eed85e4d52dd1b021"
+    },
+    "loader_bat": {
+      "files": [
+        "loader.bat"
+      ],
+      "fingerprint": "36a092007cb0c933b992960398fba25650dbfa5d682173a928148cf6b44b498f"
+    },
+    "main": {
+      "files": [
+        "src/csv_click/main.py"
+      ],
+      "fingerprint": "2a948c2a84acf384f80ce28d946fd79c9b7ba512a93568150bcb86dd81018400"
+    },
+    "package": {
+      "files": [
+        "src/csv_click/__init__.py",
+        "pyproject.toml"
+      ],
+      "fingerprint": "344eb324dbd927ce205b1f47968abbd8f77487a6441f33a55dd3b81ea12b00f3"
+    },
+    "pandas_loader": {
+      "files": [
+        "src/csv_click/pandas_loader.py"
+      ],
+      "fingerprint": "3c0613a73844ca5fc8487a575c19bcc73b0e0218acef2a16595a9fce914a6ec7"
+    },
+    "readme": {
+      "files": [
+        "README.md"
+      ],
+      "fingerprint": "74bd18de560df5f96c1e488d639909e55aa58fce2cb29f37bf84f2b782b8667e"
+    },
+    "schema": {
+      "files": [
+        "src/csv_click/schema.py"
+      ],
+      "fingerprint": "97703d6c315c688d3079f168de16a03e6e72cf138c50b0556024dc80d3233a1a"
+    },
+    "settings": {
+      "files": [
+        "src/csv_click/settings.py"
+      ],
+      "fingerprint": "2e49e877fc734885f85939e11e6785adf0dece4ab6e922630ce9cdf4ac783dda"
+    },
+    "tests": {
+      "files": [
+        "tests/test2.csv",
+        "tests/test_app_form_state.py",
+        "tests/test_app_load_ui.py",
+        "tests/test_app_state.py",
+        "tests/test_app_steps.py",
+        "tests/test_clickhouse.py",
+        "tests/test_csv.csv",
+        "tests/test_json_serialization.py",
+        "tests/test_launcher.py",
+        "tests/test_load_job.py",
+        "tests/test_load_stats.py",
+        "tests/test_loader_bat.py",
+        "tests/test_pandas_loader.py",
+        "tests/test_read_consistency.py",
+        "tests/test_readme_matches_the_app.py",
+        "tests/test_schema.py",
+        "tests/test_settings.py",
+        "tests/test_tcp_info_probe.py"
+      ],
+      "fingerprint": "6cd1bd688af4e34da3bbaba42336d2a0c8c3cf0a8937b0e138cd78a442958ff8"
+    }
+  }
+}
