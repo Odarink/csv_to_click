@@ -179,6 +179,69 @@ def test_untouched_defaults_are_not_reported_as_operator_choices() -> None:
     assert not [str(w.value) for w in at.warning]
 
 
+def test_table_name_and_partition_by_survive_form_hidden_rerun() -> None:
+    """Пропущенная перерисовка молча съедала имя таблицы и PARTITION BY:
+    st.text_input без key= — тот же способ, каким терялся ORDER BY (п.1
+    фазы 7). Таблица создавалась без партиционирования, и никто не замечал."""
+    at = _start()
+    _text_input(at, "Distributed table name").set_value("probe_table")
+    _text_input(at, "PARTITION BY (optional)").set_value("toYYYYMM(dt)")
+    at.run()
+
+    _hide_form_for_one_run(at)
+
+    assert _text_input(at, "Distributed table name").value == "probe_table"
+    assert _text_input(at, "PARTITION BY (optional)").value == "toYYYYMM(dt)"
+    params = at.session_state["load_params"]
+    assert params["distributed_table"] == "probe_table"
+    assert params["partition_by"] == "toYYYYMM(dt)"
+
+
+def test_second_consecutive_table_name_edit_is_applied() -> None:
+    """Урок index= из фазы 7: восстановление не имеет права менять тождество
+    виджета, иначе второй подряд ввод молча пропадает."""
+    at = _start()
+    _text_input(at, "Distributed table name").set_value("first")
+    at.run()
+    _text_input(at, "Distributed table name").set_value("second")
+    at.run()
+
+    assert _text_input(at, "Distributed table name").value == "second"
+    assert at.session_state["load_params"]["distributed_table"] == "second"
+
+
+def test_a_deliberately_cleared_partition_by_stays_cleared() -> None:
+    """Очистка поля — тоже действие оператора: вернуть стёртое выражение после
+    пропуска отрисовки значит партиционировать таблицу против его решения."""
+    at = _start()
+    _text_input(at, "Distributed table name").set_value("probe_table")
+    _text_input(at, "PARTITION BY (optional)").set_value("toYYYYMM(dt)")
+    at.run()
+    _text_input(at, "PARTITION BY (optional)").set_value("")
+    at.run()
+
+    _hide_form_for_one_run(at)
+
+    assert _text_input(at, "PARTITION BY (optional)").value == ""
+    assert at.session_state["load_params"]["partition_by"] is None
+
+
+def test_reading_another_csv_clears_table_name_and_partition_by() -> None:
+    """Имя таблицы и выражение партиционирования живут в пределах одного
+    файла: у другого CSV другие колонки, и toYYYYMM(dt) выглядел бы выбранным
+    для файла, где колонки dt нет."""
+    at = _start()
+    _text_input(at, "Distributed table name").set_value("probe_table")
+    _text_input(at, "PARTITION BY (optional)").set_value("toYYYYMM(dt)")
+    at.run()
+
+    at.session_state["form_probe_new_file"] = True
+    at.run()
+
+    assert _text_input(at, "Distributed table name").value == ""
+    assert _text_input(at, "PARTITION BY (optional)").value == ""
+
+
 def test_reading_another_csv_does_not_carry_the_previous_keys_over() -> None:
     at = _start()
     _selectbox(at, "ORDER BY").select("gamma")

@@ -178,12 +178,16 @@ CSV_READ_STATE_KEYS = [
     "csv_preview_rows",
     "csv_preview_warning",
 ]
-#: Слоты выбора ключей: живут в пределах одного прочитанного CSV. Выбор оператора
-#: обязан переживать перерисовки, но НЕ переезжать на другой файл: у чужого файла
-#: колонка с тем же именем - другие данные, а ключ выглядел бы выбранным.
+#: Слоты выбора оператора в форме параметров: живут в пределах одного
+#: прочитанного CSV. Выбор обязан переживать перерисовки, но НЕ переезжать на
+#: другой файл: у чужого файла колонка с тем же именем - другие данные, имя
+#: таблицы - про другую загрузку, а PARTITION BY ссылается на колонки, которых
+#: там может не быть.
 CHOICE_STATE_KEYS = [
     "order_by_choice",
     "sharding_column_choice",
+    "distributed_table_choice",
+    "partition_by_choice",
 ]
 LARGE_CSV_PRECHECK_THRESHOLD_BYTES = 50 * 1024 * 1024
 SAMPLE_PRECHECK_ROWS = 200_000
@@ -490,6 +494,29 @@ def _remembered_selectbox(label: str, options: list[str], state_key: str) -> str
     )
 
 
+def _remembered_text_input(label: str, state_key: str) -> str:
+    """Текстовое поле, переживающее пропуск отрисовки.
+
+    Тот же приём и та же причина, что у :func:`_remembered_selectbox`:
+    состояние виджета живёт, только пока он рисуется, и один пропущенный
+    rerun молча возвращал пустое значение — таблица создавалась без
+    `PARTITION BY`, а имя терялось. Слот пишется только из `on_change`, то
+    есть по действию оператора; намеренная очистка поля — тоже действие, и
+    пустая строка запоминается, а не подменяется прежним значением.
+    Тождество виджета держит `key=` — второй подряд ввод не пропадает.
+    """
+    widget_key = _choice_widget_key(state_key)
+    stored = st.session_state.get(state_key)
+    if stored is not None:
+        st.session_state[widget_key] = stored
+    return st.text_input(
+        label,
+        key=widget_key,
+        on_change=_remember_choice,
+        args=(state_key,),
+    )
+
+
 def _render_connection_and_load_form(schema: CsvSchema) -> dict[str, object] | None:
     settings = _get_app_settings()
     target_names = _schema_target_names(schema)
@@ -498,10 +525,14 @@ def _render_connection_and_load_form(schema: CsvSchema) -> dict[str, object] | N
     left, right = st.columns(2)
     with left:
         database = st.text_input("Database", value=settings.database)
-        distributed_table = st.text_input("Distributed table name")
+        distributed_table = _remembered_text_input(
+            "Distributed table name", "distributed_table_choice"
+        )
         cluster = st.text_input("Cluster", value=settings.cluster)
         order_by = _remembered_selectbox("ORDER BY", target_names, "order_by_choice")
-        partition_by = st.text_input("PARTITION BY (optional)")
+        partition_by = _remembered_text_input(
+            "PARTITION BY (optional)", "partition_by_choice"
+        )
         sharding_column = _remembered_selectbox(
             "Distributed sharding key", target_names, "sharding_column_choice"
         )
