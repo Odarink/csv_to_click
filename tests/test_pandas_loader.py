@@ -421,6 +421,77 @@ def test_nullable_on_array_and_map_is_refused_loudly(wrapper_type: str) -> None:
         mappings_from_editor_rows(rows)
 
 
+@pytest.mark.parametrize(
+    "typed_form", ["Nullable(Array(String))", "Nullable(Map(String, UInt64))"]
+)
+def test_explicitly_typed_nullable_wrapper_is_refused_too(typed_form: str) -> None:
+    """Отказ нельзя обойти, набрав невалидную форму руками: проверка только
+    «Nullable ещё нет» пропускала готовый Nullable(Array(...)) в DDL."""
+    rows = [
+        {
+            "source_name": "s",
+            "target_name": "s",
+            "include": True,
+            "inferred_type": "String",
+            "final_type": "String",
+            "custom_type": typed_form,
+            "nullable": True,
+        }
+    ]
+
+    with pytest.raises(CsvSchemaError, match="Nullable"):
+        mappings_from_editor_rows(rows)
+
+
+def test_explicitly_typed_nullable_lowcardinality_is_normalized_inside() -> None:
+    """У Nullable(LowCardinality(X)) смысл однозначен — валидная форма
+    LowCardinality(Nullable(X)): нормализуем, а не отказываем."""
+    rows = [
+        {
+            "source_name": "s",
+            "target_name": "s",
+            "include": True,
+            "inferred_type": "String",
+            "final_type": "String",
+            "custom_type": "Nullable(LowCardinality(String))",
+            "nullable": True,
+        }
+    ]
+
+    mappings = mappings_from_editor_rows(rows)
+
+    assert mappings[0].final_type == "LowCardinality(Nullable(String))"
+    assert mappings[0].nullable is True
+
+
+def test_na_markers_stay_text_in_lowcardinality_string() -> None:
+    """Контракт фазы 3b: в String-семантике 'NA' и 'null' — обычный текст.
+    LowCardinality не меняет семантику значений — только хранение: unwrap до
+    базового типа обязан вести и решение о маркерах, иначе текст 'NA' молча
+    превращался в null."""
+    chunk = pd.DataFrame({"s": ["a", "NA", ""]})
+    mappings = [
+        SchemaMapping("s", "s", True, "LowCardinality(Nullable(String))", True)
+    ]
+
+    converted = convert_chunk_to_schema(chunk, mappings, chunk_number=1)
+    payload = chunk_to_json_lines(converted, ["s"])
+
+    assert payload == b'{"s":"a"}\n{"s":"NA"}\n{"s":null}', payload
+
+
+def test_lowcardinality_integer_travels_as_numbers() -> None:
+    """LowCardinality(Int32) — это Int32 по семантике значений: числа, не
+    строки в кавычках."""
+    chunk = pd.DataFrame({"n": ["1", "2", "3"]})
+    mappings = [SchemaMapping("n", "n", True, "LowCardinality(Int32)", False)]
+
+    converted = convert_chunk_to_schema(chunk, mappings, chunk_number=1)
+    payload = chunk_to_json_lines(converted, ["n"])
+
+    assert payload == b'{"n":1}\n{"n":2}\n{"n":3}', payload
+
+
 def test_lowcardinality_nullable_string_sends_null_for_missing() -> None:
     """Пропуск в LowCardinality(Nullable(String)) — это null, а не пустая
     строка: nullable-ность видна и сквозь обёртку."""

@@ -1452,6 +1452,12 @@ def _missing_mask(series: pd.Series, na_markers: bool) -> pd.Series:
 
 def _convert_series(series: pd.Series, clickhouse_type: str) -> pd.Series:
     nullable, inner_type = unwrap_nullable(clickhouse_type)
+    if inner_type.startswith("LowCardinality(") and inner_type.endswith(")"):
+        # LowCardinality — свойство ХРАНЕНИЯ, а не значений: ветку конвертера
+        # (маркеры пропусков, числа, даты) выбирает базовый тип. Без этого
+        # 'NA' в LowCardinality(Nullable(String)) молча превращался в null, а
+        # LowCardinality(Int32) уезжал строками.
+        inner_type = inner_type.removeprefix("LowCardinality(").removesuffix(")")
     # В String-колонке `NA` и `null` - обычный текст, ради чего фаза 3b и
     # делалась; во всех остальных типах это по-прежнему пропуск.
     missing = _missing_mask(series, na_markers=inner_type != "String")
@@ -1610,16 +1616,21 @@ def _normalize_nullable_type(clickhouse_type: str, nullable: bool) -> str:
     if clickhouse_type.startswith("LowCardinality(") and clickhouse_type.endswith(")"):
         inner = clickhouse_type.removeprefix("LowCardinality(").removesuffix(")")
         return f"LowCardinality({_normalize_nullable_type(inner, nullable)})"
+    if clickhouse_type.startswith("Nullable(") and clickhouse_type.endswith(")"):
+        # Явно набранная форма разбирается, а не пропускается как есть: отказ
+        # нельзя обходить, напечатав Nullable(Array(...)) руками, а
+        # Nullable(LowCardinality(X)) имеет однозначный валидный смысл —
+        # LowCardinality(Nullable(X)) — и нормализуется в него.
+        inner = clickhouse_type.removeprefix("Nullable(").removesuffix(")")
+        return _normalize_nullable_type(inner, nullable)
     if nullable and _UNNULLABLE_WRAPPER_RE.match(clickhouse_type):
         raise CsvSchemaError(
             f"ClickHouse does not support Nullable({clickhouse_type}); "
             "make the element type Nullable instead, e.g. Array(Nullable(String)), "
             "and uncheck nullable for the column."
         )
-    if nullable and not clickhouse_type.startswith("Nullable("):
+    if nullable:
         return f"Nullable({clickhouse_type})"
-    if not nullable and clickhouse_type.startswith("Nullable("):
-        return clickhouse_type.removeprefix("Nullable(").removesuffix(")")
     return clickhouse_type
 
 
