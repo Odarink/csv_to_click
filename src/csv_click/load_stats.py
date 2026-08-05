@@ -16,6 +16,7 @@ import logging
 import platform
 import re
 import sys
+import threading
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from importlib import metadata
@@ -26,6 +27,11 @@ DEFAULT_RUN_LOG_DIR = Path.home() / ".csv_click" / "runs"
 
 DRIVER_LOGGER_NAME = "clickhouse_connect.driver.httpclient"
 DRIVER_RETRY_MESSAGE = "Retrying remotely closed connection"
+#: Имя потоков-воркеров загрузки. По нему счётчик ретраев отличает вставки
+#: СВОЕЙ загрузки от прочего драйверного трафика процесса: с уходом загрузки в
+#: фон интерфейс жив, и «Test connection» во время заливки писал бы фантомный
+#: retry в запись прогона.
+LOAD_WORKER_THREAD_PREFIX = "csv-click-load-worker"
 
 TRACKED_PACKAGES: tuple[str, ...] = (
     "pandas",
@@ -98,6 +104,11 @@ class LoadStats:
     blocks: int = 0
     blocks_without_server_time: int = 0
     src_bytes: int = 0
+    #: Сколько байт файла-источника уже прочитано продюсером. Вместе с
+    #: ``src_bytes`` даёт прогресс на файле любого размера: общее число строк
+    #: большого CSV неизвестно, а размер в байтах известен всегда. Чтение
+    #: опережает вставку на блоки в полёте и упреждающий буфер pandas.
+    src_read_bytes: int = 0
     raw_bytes: int = 0
     wire_bytes: int = 0
     read_s: float = 0.0
@@ -284,11 +295,27 @@ class DriverRetryCounter(logging.Handler):
         self._logger: logging.Logger | None = None
         self._parent: logging.Logger | None = None
         self._forwards_warnings = False
+        self._armed_thread_name: str | None = None
+
+    def _counts_thread(self, thread_name: object) -> bool:
+        """Чей ретрай считать: взведшего потока и воркеров загрузки.
+
+        Логгер драйвера один на процесс, а загрузка теперь фоновая: интерфейс
+        жив, и «Test connection» во время заливки рождает retry ЧУЖОГО клиента
+        в том же логгере. Фантомный +1 заставил бы запись прогона врать про
+        повторно залитые байты, которых на проводе загрузки не было.
+        """
+        if thread_name is None:
+            # Кто-то выключил logging.logThreads: атрибуции нет, честнее
+            # посчитать, чем молча занизить.
+            return True
+        name = str(thread_name)
+        return name == self._armed_thread_name or name.startswith(LOAD_WORKER_THREAD_PREFIX)
 
     def emit(self, record: logging.LogRecord) -> None:
         # Handler.handle() держит лок вокруг emit(), поэтому инкремент безопасен
         # при нескольких воркер-потоках драйвера.
-        if DRIVER_RETRY_MESSAGE in record.getMessage():
+        if DRIVER_RETRY_MESSAGE in record.getMessage() and self._counts_thread(record.threadName):
             self.count += 1
         # Пробрасывает только первый прицепившийся — иначе пересекающиеся
         # счётчики продублировали бы одно предупреждение в логе.
@@ -296,6 +323,10 @@ class DriverRetryCounter(logging.Handler):
             self._parent.handle(record)
 
     def __enter__(self) -> DriverRetryCounter:
+        # Последовательный путь шлёт вставки с того же потока, что взвёл
+        # счётчик (поток задачи; в тестах — MainThread), параллельный — с
+        # воркеров с известным префиксом.
+        self._armed_thread_name = threading.current_thread().name
         logger = logging.getLogger(DRIVER_LOGGER_NAME)
         self._logger = logger
         self._parent = logger.parent
@@ -548,20 +579,34 @@ def write_run_record(
     csv_path: Path,
     outcome: str,
     timestamp: datetime,
+    tables: dict[str, object],
     error: str | None = None,
     directory: Path = DEFAULT_RUN_LOG_DIR,
 ) -> Path:
-    """Сохраняет конфигурацию и счётчики прогона в файл и возвращает путь."""
+    """Сохраняет конфигурацию и счётчики прогона в файл и возвращает путь.
+
+    ``tables`` — оба имени и судьба таблиц (``fate``): после ``514466c`` сбой
+    оставляет либо удалённые, либо оставленные с данными таблицы, и оператор из
+    присланного файла обязан их различать. Параметр без умолчания намеренно:
+    запись без судьбы таблиц — ровно та немота, которую этот блок закрывает.
+    """
     directory.mkdir(parents=True, exist_ok=True)
 
     stats_record = asdict(stats)
     stats_record["server_share"] = stats.server_share
+    # Производные приборы пишутся готовыми: server_share при нескольких
+    # воркерах всегда null, и эти два приходилось считать вручную. None там,
+    # где считать нельзя, — это НЕ ноль, см. докстринги свойств.
+    stats_record["worker_occupancy"] = stats.worker_occupancy
+    stats_record["server_share_of_insert"] = stats.server_share_of_insert
+    stats_record["producer_unattributed_s"] = stats.producer_unattributed_s
     record = {
         "outcome": outcome,
         "error": error,
         "finished_at": timestamp.isoformat(),
         "platform": platform.platform(),
         "config": asdict(config),
+        "tables": tables,
         "stats": stats_record,
         "source": describe_source_file(csv_path),
         "libraries": library_versions(),

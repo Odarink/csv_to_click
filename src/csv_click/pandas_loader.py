@@ -3,6 +3,7 @@ from __future__ import annotations
 from collections.abc import Callable
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from dataclasses import dataclass
+import io
 from pathlib import Path
 import threading
 import time
@@ -12,14 +13,15 @@ import zlib
 import lz4.frame
 import numpy as np
 import pandas as pd
+from pandas.io.common import infer_compression
 import pyarrow as pa
 import pyarrow.compute as pc
 import zstandard
 from clickhouse_connect.driver.compression import get_compressor
 
 from csv_click.clickhouse import raw_insert_batch, summary_elapsed_ns
-from csv_click.errors import CsvLoadError, CsvReadCancelled, CsvSchemaError
-from csv_click.load_stats import BlockProgress, LoadStats
+from csv_click.errors import CsvLoadCancelled, CsvLoadError, CsvReadCancelled, CsvSchemaError
+from csv_click.load_stats import LOAD_WORKER_THREAD_PREFIX, BlockProgress, LoadStats
 from csv_click.schema import (
     NA_MARKERS,
     CsvColumn,
@@ -100,37 +102,88 @@ def text_columns_for(mappings: list[SchemaMapping]) -> set[str]:
     }
 
 
+class _CountingBinaryFile(io.RawIOBase):
+    """Бинарный файл, считающий отданные pandas байты — прогресс по файлу.
+
+    Снято зондом на pandas 3.0.3: парсер читает из объекта постепенно
+    (упреждающий буфер ~3,4 МБ), счётчик растёт монотонно, а после последнего
+    чанка равен размеру файла байт в байт.
+    """
+
+    def __init__(self, path: str | Path) -> None:
+        self._file = open(path, "rb")
+        self.bytes_read = 0
+
+    def readable(self) -> bool:
+        return True
+
+    def read(self, size: int = -1) -> bytes:
+        data = self._file.read(size)
+        self.bytes_read += len(data)
+        return data
+
+    def readinto(self, buffer) -> int | None:
+        count = self._file.readinto(buffer)
+        self.bytes_read += count or 0
+        return count
+
+    def close(self) -> None:
+        self._file.close()
+        super().close()
+
+
 def iter_pandas_chunks(
     csv_path: str | Path,
     read_options: ReadOptions,
     usecols: list[str] | None = None,
     text_columns: set[str] | None = None,
+    on_bytes_read: Callable[[int], None] | None = None,
 ) -> Iterator[pd.DataFrame]:
     """Читает CSV чанками так же, как его читают превью и инференс.
 
     ``text_columns`` — какие колонки нужны сырым текстом; остальные pandas
     разбирает сам, что и быстрее, и точнее для чисел. ``None`` означает «все
     текстом» и используется путями инференса, которые типов ещё не знают.
+
+    ``on_bytes_read`` получает после каждого чанка накопленное число байт,
+    прочитанных из файла. Общее число строк большого CSV неизвестно, а размер
+    в байтах известен всегда — это единственная честная основа прогресса.
+    Из-за упреждающего буфера счётчик чуть опережает разобранные строки.
     """
     if read_options.batch_size <= 0:
         raise ValueError("batch_size must be positive")
 
     try:
         raw_usecols = _raw_header_names(csv_path, read_options, usecols)
-        reader = pd.read_csv(
-            csv_path,
-            sep=read_options.separator,
-            encoding=read_options.encoding,
-            chunksize=read_options.batch_size,
-            usecols=raw_usecols,
-            # Ровно то же, что читают превью и инференс. Без этого путь загрузки
-            # видит другие данные, чем интерфейс: `007` становится числом 7,
-            # литералы NA/null/N/A - пропусками, а `1.50` в Decimal теряет ноль.
-            **_read_type_options(csv_path, read_options, raw_usecols, text_columns),
-        )
-        for chunk in reader:
-            chunk.columns = chunk.columns.str.strip()
-            yield chunk
+        counter = _CountingBinaryFile(csv_path) if on_bytes_read is not None else None
+        try:
+            reader = pd.read_csv(
+                counter if counter is not None else csv_path,
+                sep=read_options.separator,
+                encoding=read_options.encoding,
+                chunksize=read_options.batch_size,
+                usecols=raw_usecols,
+                # Файловый объект прячет имя файла, и pandas не может вывести
+                # сжатие из суффикса: data.csv.gz уезжал в парсер сырыми
+                # байтами, хотя превью и инференс (путь строкой) видели
+                # распакованные данные. Вывод — тем же кодом pandas, что и для
+                # пути строкой, иначе пути разойдутся на редком суффиксе.
+                compression=infer_compression(str(csv_path), "infer")
+                if counter is not None
+                else "infer",
+                # Ровно то же, что читают превью и инференс. Без этого путь загрузки
+                # видит другие данные, чем интерфейс: `007` становится числом 7,
+                # литералы NA/null/N/A - пропусками, а `1.50` в Decimal теряет ноль.
+                **_read_type_options(csv_path, read_options, raw_usecols, text_columns),
+            )
+            for chunk in reader:
+                chunk.columns = chunk.columns.str.strip()
+                if counter is not None and on_bytes_read is not None:
+                    on_bytes_read(counter.bytes_read)
+                yield chunk
+        finally:
+            if counter is not None:
+                counter.close()
     except pd.errors.ParserError as exc:
         raise CsvSchemaError(
             "Cannot parse CSV with "
@@ -918,12 +971,20 @@ def load_csv_via_raw_insert(
     progress_callback=None,
     compression: str | None = None,
     stats: LoadStats | None = None,
+    cancel_callback: Callable[[], bool] | None = None,
 ) -> LoadStats:
     """Грузит CSV блоками JSONEachRow и возвращает счётчики прогона.
 
     ``stats`` можно передать снаружи, чтобы частичные счётчики уцелели, если
     загрузка упадёт на середине: исключение уносит возвращаемое значение, но не
     переданный объект.
+
+    ``cancel_callback`` опрашивается перед каждым блоком (первый блок нового
+    чанка покрывает и границу чанков) — контракт как у
+    :func:`analyze_csv_with_pandas_chunks`. Ответ ``True`` поднимает
+    :class:`CsvLoadCancelled`; блоки, уже отданные воркерам, дорабатывают и
+    попадают либо в подтверждённые, либо в ``blocks_unconfirmed`` — новые на
+    сервер не уходят.
     """
     if worker_count <= 0:
         raise ValueError("worker_count must be positive")
@@ -950,11 +1011,18 @@ def load_csv_via_raw_insert(
             progress_callback=progress_callback,
             compression=compression,
             stats=stats,
+            cancel_callback=cancel_callback,
         )
 
     usecols = [mapping.source_name for mapping in mappings if mapping.include]
     chunks = _iter_timed(
-        iter_pandas_chunks(csv_path, read_options, usecols, text_columns_for(mappings))
+        iter_pandas_chunks(
+            csv_path,
+            read_options,
+            usecols,
+            text_columns_for(mappings),
+            on_bytes_read=_note_read_bytes(stats),
+        )
     )
     for chunk_number, (chunk, read_s) in enumerate(chunks, start=1):
         stats.read_s += read_s
@@ -970,6 +1038,7 @@ def load_csv_via_raw_insert(
             )
         )
         for block_number, ((payload, block_rows), serialize_s) in enumerate(payloads, start=1):
+            _raise_if_load_cancelled(cancel_callback)
             stats.serialize_s += serialize_s
             body = _compress_block(payload, compression, stats)
             insert_started = time.perf_counter()
@@ -1019,6 +1088,7 @@ def _load_csv_via_raw_insert_parallel(
     progress_callback,
     compression: str | None,
     stats: LoadStats,
+    cancel_callback: Callable[[], bool] | None,
 ) -> LoadStats:
     usecols = [mapping.source_name for mapping in mappings if mapping.include]
     max_pending = worker_count * 2
@@ -1158,11 +1228,21 @@ def _load_csv_via_raw_insert_parallel(
                 progress_callback(progress)
 
     pending: set[Future] = set()
-    with ThreadPoolExecutor(max_workers=worker_count) as executor:
+    # Именованные воркеры: по префиксу счётчик ретраев драйвера отличает
+    # вставки этой загрузки от прочего трафика процесса (Test connection).
+    with ThreadPoolExecutor(
+        max_workers=worker_count, thread_name_prefix=LOAD_WORKER_THREAD_PREFIX
+    ) as executor:
         try:
             chunks = _iter_timed(
-        iter_pandas_chunks(csv_path, read_options, usecols, text_columns_for(mappings))
-    )
+                iter_pandas_chunks(
+                    csv_path,
+                    read_options,
+                    usecols,
+                    text_columns_for(mappings),
+                    on_bytes_read=_note_read_bytes(stats),
+                )
+            )
             for chunk_number, (chunk, read_s) in enumerate(chunks, start=1):
                 stats.read_s += read_s
                 convert_started = time.perf_counter()
@@ -1177,6 +1257,7 @@ def _load_csv_via_raw_insert_parallel(
                     )
                 )
                 for block_number, ((payload, block_rows), serialize_s) in enumerate(payloads, start=1):
+                    _raise_if_load_cancelled(cancel_callback)
                     stats.serialize_s += serialize_s
                     pending.add(
                         executor.submit(
@@ -1196,6 +1277,11 @@ def _load_csv_via_raw_insert_parallel(
             # они — отдельный вопрос, на него отвечает `blocks_unconfirmed`.
             stats.source_fully_read = True
             while pending:
+                # Отмена работает и в хвосте: неначатые блоки из очереди пула
+                # гасятся и на сервер не уходят. Прежнее рассуждение «гашение
+                # только подождало бы те же вставки» было неверным ровно для
+                # них — нашло состязательное ревью.
+                _raise_if_load_cancelled(cancel_callback)
                 collect_completed(pending)
         except BaseException:
             # Именно BaseException: RerunException и StopException в Streamlit
@@ -1225,6 +1311,31 @@ class _InsertedBlock:
     compress_s: float = 0.0
     #: Сколько длилась сама вставка в воркере, стенные часы.
     insert_s: float = 0.0
+
+
+def _note_read_bytes(stats: LoadStats) -> Callable[[int], None]:
+    """Пишет накопленные прочитанные байты в счётчики прогона.
+
+    Писатель один — поток продюсера; интерфейс это поле только читает.
+    """
+
+    def note(count: int) -> None:
+        stats.src_read_bytes = count
+
+    return note
+
+
+def _raise_if_load_cancelled(cancel_callback: Callable[[], bool] | None) -> None:
+    """Проверка отмены перед каждым блоком и на каждом шаге drain-хвоста.
+
+    Отдельной проверки на границе чанков нет намеренно: первый блок нового
+    чанка проходит эту же, а мутация, убиравшая границу чанков, выживала —
+    поведение неотличимо. Хвост проверяется: там в очереди пула могут лежать
+    НЕНАЧАТЫЕ блоки, и их гашение — не «подождать те же вставки», а реально
+    не отправить до worker_count блоков.
+    """
+    if cancel_callback and cancel_callback():
+        raise CsvLoadCancelled("The load was cancelled by the operator")
 
 
 _TimedItem = TypeVar("_TimedItem")

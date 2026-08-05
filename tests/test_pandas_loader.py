@@ -8,7 +8,7 @@ import pandas as pd
 import pytest
 
 import csv_click.pandas_loader as pandas_loader
-from csv_click.errors import CsvLoadError, CsvReadCancelled, CsvSchemaError
+from csv_click.errors import CsvLoadCancelled, CsvLoadError, CsvReadCancelled, CsvSchemaError
 from csv_click.load_stats import LoadStats
 from csv_click.pandas_loader import (
     ENCODING_SUGGESTIONS,
@@ -1332,3 +1332,323 @@ def test_convert_chunk_passes_custom_type_values_as_strings() -> None:
     converted = convert_chunk_to_schema(chunk, mappings, chunk_number=1)
 
     assert converted["name"].tolist() == ["alice", "bob"]
+
+
+def test_iter_pandas_chunks_reports_read_bytes_after_every_chunk(tmp_path: Path) -> None:
+    """Прогресс по байтам: после каждого чанка наружу уходит накопленное число
+    прочитанных из файла байт — монотонно и с финалом, равным размеру файла."""
+    csv_path = tmp_path / "bytes.csv"
+    csv_path.write_text("ID,VALUE\n" + "".join(f"{i},v{i}\n" for i in range(9)), encoding="utf_8")
+    marks: list[int] = []
+
+    chunks = list(
+        iter_pandas_chunks(
+            csv_path,
+            ReadOptions(batch_size=2),
+            on_bytes_read=marks.append,
+        )
+    )
+
+    assert len(marks) == len(chunks), "отметка обязана уходить после каждого чанка"
+    assert all(earlier <= later for earlier, later in zip(marks, marks[1:])), marks
+    assert marks[-1] == csv_path.stat().st_size
+
+
+def test_load_tracks_source_read_bytes_in_stats(tmp_path: Path) -> None:
+    csv_path = tmp_path / "bytes_load.csv"
+    csv_path.write_text("ID\n" + "".join(f"{i}\n" for i in range(8)), encoding="utf_8")
+    mappings = [SchemaMapping("ID", "ID", True, "UInt64", False)]
+    stats = LoadStats()
+
+    load_csv_via_raw_insert(
+        client=FakeRawClient(),
+        csv_path=csv_path,
+        read_options=ReadOptions(batch_size=2),
+        database="sandbox",
+        table="target_table",
+        mappings=mappings,
+        worker_count=1,
+        stats=stats,
+    )
+
+    assert stats.src_read_bytes == csv_path.stat().st_size
+
+
+def test_parallel_load_tracks_source_read_bytes_in_stats(tmp_path: Path) -> None:
+    csv_path = tmp_path / "bytes_load_parallel.csv"
+    csv_path.write_text("ID\n" + "".join(f"{i}\n" for i in range(8)), encoding="utf_8")
+    mappings = [SchemaMapping("ID", "ID", True, "UInt64", False)]
+    stats = LoadStats()
+
+    load_csv_via_raw_insert(
+        client=FakeRawClient(),
+        csv_path=csv_path,
+        read_options=ReadOptions(batch_size=2),
+        database="sandbox",
+        table="target_table",
+        mappings=mappings,
+        worker_count=2,
+        client_factory=FakeRawClient,
+        stats=stats,
+    )
+
+    assert stats.src_read_bytes == csv_path.stat().st_size
+
+
+def test_byte_counter_reads_gzip_exactly_like_the_path_does(tmp_path: Path) -> None:
+    """Счётчик байт не имеет права менять ДАННЫЕ: файловый объект прячет имя
+    файла, pandas не выводит сжатие из суффикса, и data.csv.gz уезжал в парсер
+    сырыми байтами — при том, что превью, инференс и preflight (путь строкой)
+    видели распакованные данные, и оператор доходил до созданных таблиц."""
+    import gzip
+
+    csv_path = tmp_path / "data.csv.gz"
+    with gzip.open(csv_path, "wt", encoding="utf_8", newline="\n") as handle:
+        handle.write("ID,VALUE\n" + "".join(f"{i},v{i}\n" for i in range(9)))
+    marks: list[int] = []
+
+    plain = list(iter_pandas_chunks(csv_path, ReadOptions(batch_size=2)))
+    counted = list(
+        iter_pandas_chunks(csv_path, ReadOptions(batch_size=2), on_bytes_read=marks.append)
+    )
+
+    assert len(counted) == len(plain)
+    for left, right in zip(plain, counted):
+        assert left.equals(right)
+    # Прогресс считается по байтам НА ДИСКЕ: сжатый файл читается сжатым.
+    assert marks[-1] == csv_path.stat().st_size
+
+
+def test_cancel_during_the_drain_tail_stops_queued_blocks(tmp_path: Path) -> None:
+    """Отмена обязана работать и в drain-хвосте, когда файл уже дочитан.
+
+    Прежнее рассуждение «гашение только подождало бы те же вставки» было
+    неверным: неначатые блоки в очереди пула гасятся, на сервер не уходят и
+    честно попадают в blocks_unconfirmed. Нашло состязательное ревью.
+
+    Детерминизм: три блока при max_pending=4 не трогают collect_completed до
+    хвоста, оба воркера заняты долгой вставкой, и на четвёртой проверке (первой
+    в drain) в очереди лежит ровно один неначатый блок.
+    """
+    csv_path = tmp_path / "cancel_drain.csv"
+    csv_path.write_text("ID\n0\n1\n2\n", encoding="utf_8")
+    mappings = [SchemaMapping("ID", "ID", True, "UInt64", False)]
+    stats = LoadStats()
+    checks = 0
+
+    class SlowClient(FakeRawClient):
+        def raw_insert(self, **kwargs):
+            time.sleep(0.5)
+            return super().raw_insert(**kwargs)
+
+    def cancel_from_the_fourth_check() -> bool:
+        nonlocal checks
+        checks += 1
+        return checks >= 4
+
+    with pytest.raises(CsvLoadCancelled):
+        load_csv_via_raw_insert(
+            client=FakeRawClient(),
+            csv_path=csv_path,
+            read_options=ReadOptions(batch_size=1),
+            database="sandbox",
+            table="target_table",
+            mappings=mappings,
+            worker_count=2,
+            client_factory=SlowClient,
+            cancel_callback=cancel_from_the_fourth_check,
+            stats=stats,
+        )
+
+    # Файл дочитан целиком — отмена пришла уже в хвосте.
+    assert stats.source_fully_read is True
+    assert stats.blocks == 2, "блоки, бывшие в полёте, обязаны досчитаться"
+    assert stats.blocks_unconfirmed == 1, "неначатый блок из очереди не погашен"
+
+
+def test_cancel_between_blocks_stops_the_sequential_path(tmp_path: Path) -> None:
+    """Отмена проверяется между блоками: подтверждённое остаётся в счётчиках,
+    новые блоки на сервер не уходят, а файл честно значится недочитанным."""
+    csv_path = tmp_path / "cancel_sequential.csv"
+    csv_path.write_text("ID\n" + "".join(f"{index}\n" for index in range(6)), encoding="utf_8")
+    mappings = [SchemaMapping("ID", "ID", True, "UInt64", False)]
+    stats = LoadStats()
+    client = FakeRawClient()
+    cancelled = False
+
+    def cancel_after_second_block(block) -> None:
+        nonlocal cancelled
+        if block.rows_total >= 2:
+            cancelled = True
+
+    with pytest.raises(CsvLoadCancelled):
+        load_csv_via_raw_insert(
+            client=client,
+            csv_path=csv_path,
+            read_options=ReadOptions(batch_size=1),
+            database="sandbox",
+            table="target_table",
+            mappings=mappings,
+            worker_count=1,
+            progress_callback=cancel_after_second_block,
+            cancel_callback=lambda: cancelled,
+            stats=stats,
+        )
+
+    assert stats.blocks == 2, "подтверждённые до отмены блоки обязаны остаться в счётчиках"
+    assert stats.rows == 2
+    assert len(client.calls) == 2, "после отмены на сервер не должно уйти ни одного блока"
+    assert stats.source_fully_read is False
+
+
+def test_cancel_before_the_first_block_sends_nothing(tmp_path: Path) -> None:
+    csv_path = tmp_path / "cancel_immediately.csv"
+    csv_path.write_text("ID\n1\n2\n", encoding="utf_8")
+    mappings = [SchemaMapping("ID", "ID", True, "UInt64", False)]
+    stats = LoadStats()
+    client = FakeRawClient()
+
+    with pytest.raises(CsvLoadCancelled):
+        load_csv_via_raw_insert(
+            client=client,
+            csv_path=csv_path,
+            read_options=ReadOptions(batch_size=1),
+            database="sandbox",
+            table="target_table",
+            mappings=mappings,
+            worker_count=1,
+            cancel_callback=lambda: True,
+            stats=stats,
+        )
+
+    assert client.calls == []
+    assert stats.blocks == 0
+    assert stats.source_fully_read is False
+
+
+def test_cancel_between_blocks_of_a_single_chunk(tmp_path: Path) -> None:
+    """Отмена обязана срабатывать и ВНУТРИ чанка, между его блоками.
+
+    Рабочий профиль — batch 500 тыс. строк, из одного чанка выходит несколько
+    блоков по лимиту payload. Проверка только на границе чанков дочитала бы
+    чанк до конца и на однофайловом чанке вернулась бы успехом вместо отмены.
+    """
+    csv_path = tmp_path / "cancel_single_chunk.csv"
+    csv_path.write_text("ID\n" + "".join(f"{index}\n" for index in range(8)), encoding="utf_8")
+    mappings = [SchemaMapping("ID", "ID", True, "UInt64", False)]
+    stats = LoadStats()
+    client = FakeRawClient()
+    cancelled = False
+
+    def cancel_on_first_block(block) -> None:
+        nonlocal cancelled
+        cancelled = True
+
+    with pytest.raises(CsvLoadCancelled):
+        load_csv_via_raw_insert(
+            client=client,
+            csv_path=csv_path,
+            # Один чанк на весь файл; лимит в 10 байт (строка `{"ID":0}` — 8)
+            # заставляет резать его на блок в одну строку.
+            read_options=ReadOptions(batch_size=100),
+            max_insert_payload_bytes=10,
+            database="sandbox",
+            table="target_table",
+            mappings=mappings,
+            worker_count=1,
+            progress_callback=cancel_on_first_block,
+            cancel_callback=lambda: cancelled,
+            stats=stats,
+        )
+
+    assert stats.blocks == 1
+    assert len(client.calls) == 1
+    assert stats.source_fully_read is False
+
+
+def test_cancel_between_blocks_of_a_single_chunk_on_the_parallel_path(tmp_path: Path) -> None:
+    csv_path = tmp_path / "cancel_single_chunk_parallel.csv"
+    csv_path.write_text("ID\n" + "".join(f"{index}\n" for index in range(8)), encoding="utf_8")
+    mappings = [SchemaMapping("ID", "ID", True, "UInt64", False)]
+    stats = LoadStats()
+    cancelled = False
+
+    class SlowClient(FakeRawClient):
+        def raw_insert(self, **kwargs):
+            time.sleep(0.05)
+            return super().raw_insert(**kwargs)
+
+    def cancel_on_first_block(block) -> None:
+        nonlocal cancelled
+        cancelled = True
+
+    with pytest.raises(CsvLoadCancelled):
+        load_csv_via_raw_insert(
+            client=FakeRawClient(),
+            csv_path=csv_path,
+            read_options=ReadOptions(batch_size=100),
+            max_insert_payload_bytes=10,
+            database="sandbox",
+            table="target_table",
+            mappings=mappings,
+            worker_count=2,
+            client_factory=SlowClient,
+            progress_callback=cancel_on_first_block,
+            cancel_callback=lambda: cancelled,
+            stats=stats,
+        )
+
+    assert stats.source_fully_read is False
+    assert stats.blocks + stats.blocks_unconfirmed < 8, "отмена не остановила нарезку чанка"
+
+
+def test_cancel_mid_file_on_the_parallel_path_counts_confirmed_and_cancelled(tmp_path: Path) -> None:
+    """Отмена на пути с воркерами — том, которым грузит оператор.
+
+    Блоки, которые сервер успел подтвердить, засчитываются; не отправленные
+    гасятся и попадают в blocks_unconfirmed — иначе запись о прогоне утверждала
+    бы, что отправлено всё прочитанное.
+
+    Отмена взводится СЧЁТЧИКОМ проверок, а не progress_callback: колбэк требует
+    завершённого блока, а к тому моменту освободившиеся воркеры мгновенно
+    разбирают очередь, и отменять уже нечего — тест зависел от того, вернёт ли
+    `wait(FIRST_COMPLETED)` один блок или оба сразу. Долгая вставка держит обоих
+    воркеров занятыми: к четвёртой проверке в очереди лежит ровно один
+    неначатый блок, и исход детерминирован.
+    """
+    csv_path = tmp_path / "cancel_parallel.csv"
+    csv_path.write_text("ID\n" + "".join(f"{index}\n" for index in range(10)), encoding="utf_8")
+    mappings = [SchemaMapping("ID", "ID", True, "UInt64", False)]
+    stats = LoadStats()
+    checks = 0
+
+    class SlowClient(FakeRawClient):
+        def raw_insert(self, **kwargs):
+            time.sleep(0.5)
+            return super().raw_insert(**kwargs)
+
+    def cancel_from_the_fourth_check() -> bool:
+        nonlocal checks
+        checks += 1
+        return checks >= 4
+
+    with pytest.raises(CsvLoadCancelled):
+        load_csv_via_raw_insert(
+            client=FakeRawClient(),
+            csv_path=csv_path,
+            read_options=ReadOptions(batch_size=1),
+            database="sandbox",
+            table="target_table",
+            mappings=mappings,
+            worker_count=2,
+            client_factory=SlowClient,
+            cancel_callback=cancel_from_the_fourth_check,
+            stats=stats,
+        )
+
+    assert stats.source_fully_read is False
+    # Блоки 1 и 2 в момент отмены уже в воркерах: cancel_pending дожидается их
+    # и засчитывает; блок 3 не начат — гасится и попадает в неподтверждённые.
+    assert stats.blocks == 2, "подтверждённые блоки потеряны при отмене"
+    assert stats.rows == 2
+    assert stats.blocks_unconfirmed == 1, "погашенный блок не посчитан"
