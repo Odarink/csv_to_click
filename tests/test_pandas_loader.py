@@ -27,6 +27,7 @@ from csv_click.pandas_loader import (
     mappings_from_editor_rows,
     mappings_to_schema,
     preview_csv_rows,
+    text_columns_for,
     validate_csv_sample_with_pandas_chunks,
 )
 
@@ -281,6 +282,157 @@ def test_chunk_to_json_lines_has_no_nan() -> None:
     decoded = payload.decode("utf-8").strip()
     assert "NaN" not in decoded
     assert json.loads(decoded) == {"ID": 1, "VALUE": None}
+
+
+@pytest.mark.parametrize("ch_type", ["Int8", "Int16", "Int32", "UInt8", "UInt16", "UInt32"])
+def test_narrow_integers_travel_as_numbers_not_strings(ch_type: str) -> None:
+    """Узкие int проваливались в общую текстовую ветку и уезжали строками —
+    из кадра с float-колонкой это была строка '1.0', которую ClickHouse
+    отклоняет при парсинге JSONEachRow (F5 инвентаря, блокер фазы 5)."""
+    chunk = pd.DataFrame({"n": ["1", "2", "3"]})
+    mappings = [SchemaMapping("n", "n", True, ch_type, False)]
+
+    converted = convert_chunk_to_schema(chunk, mappings, chunk_number=1)
+    payload = chunk_to_json_lines(converted, ["n"])
+
+    assert payload == b'{"n":1}\n{"n":2}\n{"n":3}', (ch_type, payload)
+
+
+def test_narrow_integers_from_a_float_frame_lose_the_dot_not_the_value() -> None:
+    """Кадр, где pandas уже прочитал колонку числом: '1.0' обязано уехать 1."""
+    chunk = pd.DataFrame({"n": [1.0, 2.0, 3.0]})
+    mappings = [SchemaMapping("n", "n", True, "Int32", False)]
+
+    converted = convert_chunk_to_schema(chunk, mappings, chunk_number=1)
+    payload = chunk_to_json_lines(converted, ["n"])
+
+    assert payload == b'{"n":1}\n{"n":2}\n{"n":3}', payload
+
+
+def test_narrow_integers_are_read_natively_like_int64() -> None:
+    """pandas разбирает узкие int сам — как Int64, быстрее и без потерь."""
+    mappings = [SchemaMapping("n", "n", True, "Int32", False)]
+    assert text_columns_for(mappings) == set()
+
+
+@pytest.mark.parametrize(
+    ("ch_type", "values", "culprit"),
+    [
+        # Виновник в середине, не последним (метод, п.8).
+        ("Int8", ["1", "300", "2"], "300"),
+        ("UInt8", ["1", "-1", "2"], "-1"),
+        ("Int16", ["1", "70000", "2"], "70000"),
+        ("Int32", ["1", "2.5", "2"], "2.5"),
+    ],
+)
+def test_a_value_outside_the_narrow_type_fails_loudly_naming_it(ch_type, values, culprit) -> None:
+    """Граница узкого типа — падение с именем виновника, не тихая порча."""
+    chunk = pd.DataFrame({"n": values})
+    mappings = [SchemaMapping("n", "n", True, ch_type, False)]
+
+    with pytest.raises(CsvSchemaError) as excinfo:
+        convert_chunk_to_schema(chunk, mappings, chunk_number=1)
+
+    assert f"value '{culprit}'" in str(excinfo.value), str(excinfo.value)
+
+
+def test_nullable_narrow_integer_prints_null_for_missing() -> None:
+    chunk = pd.DataFrame({"n": ["1", "", "3"]})
+    mappings = [SchemaMapping("n", "n", True, "Nullable(Int16)", True)]
+
+    converted = convert_chunk_to_schema(chunk, mappings, chunk_number=1)
+    payload = chunk_to_json_lines(converted, ["n"])
+
+    assert payload == b'{"n":1}\n{"n":null}\n{"n":3}', payload
+
+
+def test_int128_stays_on_the_text_path_without_precision_loss() -> None:
+    """У pandas нет Int128: to_numeric прогнал бы значение через float64 и
+    потерял точность. Такие типы остаются текстом — JSONEachRow принимает
+    целые в кавычках, а цифры доезжают байт в байт."""
+    huge = "170141183460469231731687303715884105727"
+    chunk = pd.DataFrame({"n": [huge]})
+    mappings = [SchemaMapping("n", "n", True, "Int128", False)]
+
+    converted = convert_chunk_to_schema(chunk, mappings, chunk_number=1)
+    payload = chunk_to_json_lines(converted, ["n"])
+
+    assert payload == f'{{"n":"{huge}"}}'.encode(), payload
+    assert text_columns_for(mappings) == {"n"}
+
+
+def test_nullable_lowcardinality_wraps_inside_not_outside() -> None:
+    """Nullable(LowCardinality(...)) — невалидный тип ClickHouse (F6):
+    правильная форма — LowCardinality(Nullable(...))."""
+    rows = [
+        {
+            "source_name": "s",
+            "target_name": "s",
+            "include": True,
+            "inferred_type": "String",
+            "final_type": "String",
+            "custom_type": "LowCardinality(String)",
+            "nullable": True,
+        }
+    ]
+
+    mappings = mappings_from_editor_rows(rows)
+
+    assert mappings[0].final_type == "LowCardinality(Nullable(String))"
+    assert mappings[0].nullable is True
+
+
+def test_unchecking_nullable_on_lowcardinality_strips_the_inner_nullable() -> None:
+    rows = [
+        {
+            "source_name": "s",
+            "target_name": "s",
+            "include": True,
+            "inferred_type": "String",
+            "final_type": "String",
+            "custom_type": "LowCardinality(Nullable(String))",
+            "nullable": False,
+        }
+    ]
+
+    mappings = mappings_from_editor_rows(rows)
+
+    assert mappings[0].final_type == "LowCardinality(String)"
+    assert mappings[0].nullable is False
+
+
+@pytest.mark.parametrize("wrapper_type", ["Array(String)", "Map(String, UInt64)"])
+def test_nullable_on_array_and_map_is_refused_loudly(wrapper_type: str) -> None:
+    """Nullable(Array(...)) и Nullable(Map(...)) невалидны (V1 инвентаря):
+    молча создать такой DDL значит уронить CREATE TABLE после подтверждений."""
+    rows = [
+        {
+            "source_name": "s",
+            "target_name": "s",
+            "include": True,
+            "inferred_type": "String",
+            "final_type": "String",
+            "custom_type": wrapper_type,
+            "nullable": True,
+        }
+    ]
+
+    with pytest.raises(CsvSchemaError, match="Nullable"):
+        mappings_from_editor_rows(rows)
+
+
+def test_lowcardinality_nullable_string_sends_null_for_missing() -> None:
+    """Пропуск в LowCardinality(Nullable(String)) — это null, а не пустая
+    строка: nullable-ность видна и сквозь обёртку."""
+    chunk = pd.DataFrame({"s": ["a", "", "b"]})
+    mappings = [
+        SchemaMapping("s", "s", True, "LowCardinality(Nullable(String))", True)
+    ]
+
+    converted = convert_chunk_to_schema(chunk, mappings, chunk_number=1)
+    payload = chunk_to_json_lines(converted, ["s"])
+
+    assert payload == b'{"s":"a"}\n{"s":null}\n{"s":"b"}', payload
 
 
 def test_json_each_row_payloads_are_split_by_byte_limit() -> None:

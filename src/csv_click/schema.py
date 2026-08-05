@@ -382,8 +382,19 @@ def convert_value(value: str, clickhouse_type: str) -> object:
 
 
 def unwrap_nullable(clickhouse_type: str) -> tuple[bool, str]:
+    """Nullable-ность типа и тип без неё.
+
+    Видит Nullable и СКВОЗЬ LowCardinality: у категориальной колонки Nullable
+    живёт внутри обёртки (`LowCardinality(Nullable(String))` — валидная форма,
+    `Nullable(LowCardinality(...))` ClickHouse отвергает). Без этого конвертер
+    считал такую колонку не-nullable и ронял загрузку на первом же пропуске.
+    """
     if clickhouse_type.startswith("Nullable(") and clickhouse_type.endswith(")"):
         return True, clickhouse_type.removeprefix("Nullable(").removesuffix(")")
+    if clickhouse_type.startswith("LowCardinality(") and clickhouse_type.endswith(")"):
+        inner = clickhouse_type.removeprefix("LowCardinality(").removesuffix(")")
+        inner_nullable, unwrapped = unwrap_nullable(inner)
+        return inner_nullable, f"LowCardinality({unwrapped})"
     return False, clickhouse_type
 
 

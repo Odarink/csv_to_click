@@ -92,6 +92,22 @@ def test_validate_csv_against_schema_returns_row_count(tmp_path: Path) -> None:
     assert validate_csv_against_schema(csv_path, schema) == 2
 
 
+def test_unwrap_nullable_sees_through_lowcardinality() -> None:
+    """Nullable у категориальной колонки живёт ВНУТРИ LowCardinality:
+    unwrap обязан видеть его сквозь обёртку, иначе конвертер считает колонку
+    не-nullable и роняет загрузку на первом же пропуске."""
+    from csv_click.schema import unwrap_nullable
+
+    assert unwrap_nullable("LowCardinality(Nullable(String))") == (
+        True,
+        "LowCardinality(String)",
+    )
+    assert unwrap_nullable("LowCardinality(String)") == (False, "LowCardinality(String)")
+    # Прежний контракт не тронут.
+    assert unwrap_nullable("Nullable(Int64)") == (True, "Int64")
+    assert unwrap_nullable("String") == (False, "String")
+
+
 def test_schema_from_editor_rows_applies_manual_nullable_type(tmp_path: Path) -> None:
     from csv_click.schema import schema_from_editor_rows, schema_to_editor_rows
 
