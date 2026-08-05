@@ -141,7 +141,11 @@ def test_connection_form_uses_persisted_settings_and_no_table_specific_defaults(
     assert '"Distributed sharding key"' in form_source
     assert 'st.text_input("Distributed sharding key"' not in form_source
     assert '"Distributed sharding key", target_names' in form_source
-    assert 'st.text_input("PARTITION BY (optional)")' in form_source
+    # PARTITION BY и имя таблицы — через слот, переживающий пропуск отрисовки:
+    # голый st.text_input без key= молча терял значение (п.6 передачи).
+    assert '_remembered_text_input(' in form_source
+    assert 'st.text_input("PARTITION BY (optional)")' not in form_source
+    assert 'st.text_input("Distributed table name")' not in form_source
     assert 'value="rand()"' not in form_source
     assert 'value="sipHash64(ID)"' not in form_source
     assert '"sharding_key": sharding_key or "rand()"' not in source
