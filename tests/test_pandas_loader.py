@@ -345,6 +345,40 @@ def test_validate_csv_sample_with_pandas_chunks_validates_types_and_payload(tmp_
         )
 
 
+@pytest.mark.parametrize(
+    ("values", "culprit"),
+    [
+        # Виновник в СЕРЕДИНЕ: тест с виновником только в конце уже прятал
+        # мутацию «помнить последнее» (метод, п.8).
+        (["1", "1e999", "2"], "1e999"),
+        (["1e999", "1", "2"], "1e999"),
+        (["1", "2", "1e999"], "1e999"),
+        (["1", "-1e999", "2"], "-1e999"),
+        (["1", "inf", "2"], "inf"),
+        # Нечисло падает в to_numeric голым ValueError, не CsvSchemaError:
+        # поиск виновника обязан пережить и этот класс, иначе построчный
+        # разбор рвётся посреди обработки ошибки.
+        (["1", "abc", "2"], "abc"),
+    ],
+)
+def test_the_error_names_the_actual_bad_value_not_a_neighbour(values, culprit) -> None:
+    """Поиск виновника обязан идти ТЕМ ЖЕ путём, что конвертация.
+
+    `convert_value` принимает 'inf' и '1e999', а векторный путь Float64 их
+    отвергает («became infinity»): построчный поиск другим путём не находил
+    виновника и называл ПЕРВУЮ — исправную — строку. Оператор шёл чинить
+    строку, в которой нет дефекта. Найдено дважды разными ревью (п.7 передачи).
+    """
+    chunk = pd.DataFrame({"amount": values})
+    mappings = [SchemaMapping("amount", "amount", True, "Float64", False)]
+
+    with pytest.raises(CsvSchemaError) as excinfo:
+        convert_chunk_to_schema(chunk, mappings, chunk_number=1)
+
+    message = str(excinfo.value)
+    assert f"value '{culprit}'" in message, message
+
+
 def test_invalid_manual_type_reports_chunk_column_and_value() -> None:
     chunk = pd.DataFrame({"ID": ["abc"]})
     mappings = [SchemaMapping("ID", "ID", True, "UInt64", False)]
