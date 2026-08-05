@@ -361,6 +361,27 @@ def test_int128_stays_on_the_text_path_without_precision_loss() -> None:
     assert text_columns_for(mappings) == {"n"}
 
 
+def test_custom_type_with_quoted_timezone_survives_the_editor() -> None:
+    """Запятая и кавычки внутри скобок — валидный тип, а не «unsafe»:
+    портировано с удалённого мёртвого пути schema_from_editor_rows, где это
+    поведение было запинено единственным тестом."""
+    rows = [
+        {
+            "source_name": "dt",
+            "target_name": "dt",
+            "include": True,
+            "inferred_type": "DateTime",
+            "final_type": "DateTime",
+            "custom_type": "DateTime64(3, 'Europe/Moscow')",
+            "nullable": False,
+        }
+    ]
+
+    mappings = mappings_from_editor_rows(rows)
+
+    assert mappings[0].final_type == "DateTime64(3, 'Europe/Moscow')"
+
+
 def test_nullable_lowcardinality_wraps_inside_not_outside() -> None:
     """Nullable(LowCardinality(...)) — невалидный тип ClickHouse (F6):
     правильная форма — LowCardinality(Nullable(...))."""

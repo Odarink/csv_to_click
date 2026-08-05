@@ -6,7 +6,6 @@ from dataclasses import dataclass
 from datetime import date, datetime
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
-from typing import Iterable
 
 from csv_click.errors import CsvSchemaError
 
@@ -305,32 +304,6 @@ def analyze_csv_schema(csv_path: str | Path, delimiter: str | None = None) -> Cs
     return CsvSchema(columns=columns)
 
 
-def validate_csv_against_schema(
-    csv_path: str | Path,
-    schema: CsvSchema,
-    delimiter: str | None = None,
-) -> int:
-    path = Path(csv_path)
-    dialect = _detect_dialect(path, delimiter)
-    rows_count = 0
-    with path.open("r", encoding="utf-8-sig", newline="") as csv_file:
-        reader = csv.DictReader(csv_file, dialect=dialect)
-        if reader.fieldnames != schema.source_names:
-            raise CsvSchemaError("CSV header changed after schema analysis")
-        for row_num, row in enumerate(reader, start=2):
-            rows_count += 1
-            for column in schema.columns:
-                raw_value = row.get(column.source_name, "")
-                try:
-                    convert_value(raw_value, column.final_type)
-                except CsvSchemaError as exc:
-                    raise CsvSchemaError(
-                        f"Cannot convert row {row_num}, column '{column.source_name}', "
-                        f"value '{raw_value}' to {column.final_type}: {exc}"
-                    ) from exc
-    return rows_count
-
-
 def convert_value(value: str, clickhouse_type: str) -> object:
     raw = value.strip()
     nullable, inner_type = unwrap_nullable(clickhouse_type)
@@ -396,47 +369,6 @@ def unwrap_nullable(clickhouse_type: str) -> tuple[bool, str]:
         inner_nullable, unwrapped = unwrap_nullable(inner)
         return inner_nullable, f"LowCardinality({unwrapped})"
     return False, clickhouse_type
-
-
-def schema_from_editor_rows(rows: Iterable[dict[str, object]]) -> CsvSchema:
-    columns = []
-    for row in rows:
-        custom_type = str(row.get("custom_type") or "").strip()
-        final_type = custom_type or str(row["final_type"])
-        nullable = bool(row.get("nullable", final_type.startswith("Nullable(")))
-        if nullable and not final_type.startswith("Nullable("):
-            final_type = f"Nullable({final_type})"
-        if not nullable and final_type.startswith("Nullable("):
-            final_type = final_type.removeprefix("Nullable(").removesuffix(")")
-        final_type = validate_clickhouse_type_expression(final_type)
-        columns.append(
-            CsvColumn(
-                column_name=str(row["column_name"]),
-                source_name=str(row.get("source_name") or row["column_name"]),
-                inferred_type=str(row["inferred_type"]),
-                final_type=final_type,
-                nullable=final_type.startswith("Nullable("),
-                sample_values=_split_sample_values(row.get("sample_values", "")),
-                notes=str(row.get("notes", "")),
-            )
-        )
-    return CsvSchema(columns=columns)
-
-
-def schema_to_editor_rows(schema: CsvSchema) -> list[dict[str, object]]:
-    return [
-        {
-            "column_name": column.column_name,
-            "source_name": column.source_name,
-            "inferred_type": column.inferred_type,
-            "final_type": column.final_type,
-            "custom_type": "",
-            "nullable": column.final_type.startswith("Nullable("),
-            "sample_values": ", ".join(column.sample_values),
-            "notes": column.notes,
-        }
-        for column in schema.columns
-    ]
 
 
 def _infer_type(stats: _ColumnStats) -> tuple[str, str]:

@@ -8,7 +8,6 @@ from csv_click.schema import (
     CsvSchemaError,
     analyze_csv_schema,
     normalize_identifier,
-    validate_csv_against_schema,
 )
 
 
@@ -68,30 +67,6 @@ def test_mixed_column_falls_back_to_string_with_note(tmp_path: Path) -> None:
     assert "fallback" in value_column.notes.lower()
 
 
-def test_validate_csv_against_manual_type_reports_row_column_and_value(tmp_path: Path) -> None:
-    csv_path = write_csv(
-        tmp_path / "bad_manual_type.csv",
-        "id,value\n1,10\n2,abc\n",
-    )
-    schema = analyze_csv_schema(csv_path)
-    schema.columns[1].final_type = "UInt64"
-
-    with pytest.raises(CsvSchemaError) as exc_info:
-        validate_csv_against_schema(csv_path, schema)
-
-    message = str(exc_info.value)
-    assert "row 3" in message
-    assert "value" in message
-    assert "abc" in message
-
-
-def test_validate_csv_against_schema_returns_row_count(tmp_path: Path) -> None:
-    csv_path = write_csv(tmp_path / "valid.csv", "id,name\n1,Alice\n2,Bob\n")
-    schema = analyze_csv_schema(csv_path)
-
-    assert validate_csv_against_schema(csv_path, schema) == 2
-
-
 def test_unwrap_nullable_sees_through_lowcardinality() -> None:
     """Nullable у категориальной колонки живёт ВНУТРИ LowCardinality:
     unwrap обязан видеть его сквозь обёртку, иначе конвертер считает колонку
@@ -106,20 +81,6 @@ def test_unwrap_nullable_sees_through_lowcardinality() -> None:
     # Прежний контракт не тронут.
     assert unwrap_nullable("Nullable(Int64)") == (True, "Int64")
     assert unwrap_nullable("String") == (False, "String")
-
-
-def test_schema_from_editor_rows_applies_manual_nullable_type(tmp_path: Path) -> None:
-    from csv_click.schema import schema_from_editor_rows, schema_to_editor_rows
-
-    csv_path = write_csv(tmp_path / "manual.csv", "id,value\n1,10\n2,\n")
-    schema = analyze_csv_schema(csv_path)
-    rows = schema_to_editor_rows(schema)
-    rows[1]["final_type"] = "Nullable(String)"
-
-    edited_schema = schema_from_editor_rows(rows)
-
-    assert edited_schema.columns[1].final_type == "Nullable(String)"
-    assert validate_csv_against_schema(csv_path, edited_schema) == 2
 
 
 def test_numeric_zero_one_column_infers_uint_not_bool(tmp_path: Path) -> None:
@@ -665,19 +626,6 @@ def test_clickhouse_type_options_include_nullable_dropdown_values() -> None:
     assert "Nullable(Decimal(38, 10))" in CLICKHOUSE_TYPE_OPTIONS
 
 
-def test_schema_from_editor_rows_accepts_datetime64_timezone_custom_type(tmp_path: Path) -> None:
-    from csv_click.schema import schema_from_editor_rows, schema_to_editor_rows
-
-    csv_path = write_csv(tmp_path / "manual_datetime64.csv", "dt\n2026-06-19 10:00:00\n")
-    schema = analyze_csv_schema(csv_path)
-    rows = schema_to_editor_rows(schema)
-    rows[0]["custom_type"] = "DateTime64(3, 'Europe/Moscow')"
-
-    edited_schema = schema_from_editor_rows(rows)
-
-    assert edited_schema.columns[0].final_type == "DateTime64(3, 'Europe/Moscow')"
-
-
 def test_normalize_identifier_rejects_duplicate_columns_after_normalization() -> None:
     assert normalize_identifier("Order ID") == "order_id"
     assert normalize_identifier("123") == "col_123"
@@ -725,4 +673,3 @@ def test_analyze_csv_schema_reads_a_cyrillic_header(tmp_path: Path) -> None:
         "организационно_правовая_форма",
     ]
     assert schema.source_names[1] == "ИНН"
-    assert validate_csv_against_schema(csv_path, schema) == 2
