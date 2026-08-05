@@ -1435,12 +1435,30 @@ def _format_temporal(
 
 
 def _first_bad_value(series: pd.Series, clickhouse_type: str) -> object:
-    for value in series.tolist():
+    """Виновное значение, найденное ТЕМ ЖЕ путём, каким шла конвертация.
+
+    Раньше виновника искал построчный `convert_value`, а падает векторный
+    `_convert_series` — и пути расходятся: `convert_value` принимает `inf` и
+    `1e999`, которые Float64-ветка отвергает («became infinity»), поэтому
+    поиск не находил ничего и называл ПЕРВУЮ — исправную — строку. Оператор
+    шёл чинить строку без дефекта.
+
+    Бисекция тем же `_convert_series`: инвариант — текущий отрезок падает
+    целиком. Голова прошла — виновник в хвосте (все проверки конвертеров
+    позначенчные либо «есть пропуск», обе декомпозируются по отрезкам),
+    голова упала — сузились в неё. log2(n) вызовов только на пути ошибки.
+    """
+    if len(series) == 0:
+        return ""
+    while len(series) > 1:
+        head = series.iloc[: len(series) // 2]
         try:
-            convert_value(_value_to_string(value), clickhouse_type)
-        except CsvSchemaError:
-            return value
-    return series.iloc[0] if len(series) else ""
+            _convert_series(head, clickhouse_type)
+        except (CsvSchemaError, ValueError, TypeError):
+            series = head
+        else:
+            series = series.iloc[len(series) // 2 :]
+    return series.iloc[0]
 
 
 def _value_to_string(value) -> str:
