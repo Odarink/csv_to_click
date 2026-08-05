@@ -271,6 +271,46 @@ def test_create_tables_stops_when_local_table_is_not_visible() -> None:
     assert not any("CREATE TABLE sandbox.orders\n" in query for query in client.queries)
 
 
+class RollbackAlsoDiesClient:
+    """CREATE проходит, verify не видит таблицу, а откатный DROP падает —
+    соединение умерло сразу после DDL."""
+
+    def __init__(self) -> None:
+        self.queries: list[str] = []
+
+    def query(self, sql: str):
+        self.queries.append(sql)
+        if "DROP TABLE" in sql and any("CREATE TABLE" in q for q in self.queries[:-1]):
+            raise RuntimeError("connection is dead")
+        return type("Result", (), {"result_rows": []})()
+
+
+def test_a_failed_rollback_raises_table_cleanup_error_with_the_original_cause() -> None:
+    """Падение откатного DROP маскировало исходную ошибку и оставляло таблицу
+    на кластере, а запись прогона утверждала not_created. Нашло ревью."""
+    from csv_click.errors import TableCleanupError
+
+    client = RollbackAlsoDiesClient()
+
+    with pytest.raises(TableCleanupError) as excinfo:
+        create_tables(
+            client=client,
+            config=ClickHouseConfig(database="sandbox", cluster="clickhouse"),
+            schema=sample_schema(),
+            distributed_table="orders",
+            order_by="id",
+            sharding_key="id",
+            verify_attempts=1,
+            verify_interval_seconds=0,
+        )
+
+    message = str(excinfo.value)
+    assert "orders_local" in message, "оператор должен узнать, какую таблицу дропать руками"
+    # Исходная причина не подменяется ошибкой дропа.
+    assert "orders_local" in str(excinfo.value.__cause__)
+    assert isinstance(excinfo.value.__cause__, ClickHouseConnectionError)
+
+
 def test_create_tables_blocks_when_both_target_tables_exist() -> None:
     client = FakeClient(
         [

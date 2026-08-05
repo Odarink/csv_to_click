@@ -345,6 +345,73 @@ def test_registry_holds_one_running_job_per_process(job_environment, monkeypatch
     assert current_load_job() is second
 
 
+def test_a_failing_thread_start_does_not_poison_the_registry(job_environment, monkeypatch) -> None:
+    """Сбой thread.start() (нехватка ресурсов ОС) оставлял в реестре фантомную
+    «вечно живую» задачу: все следующие загрузки отбивались до перезапуска
+    процесса, Cancel взводил событие, которое некому читать. Нашло ревью."""
+    broken = job_environment.make_job(FakeRawClient())
+
+    def refuses_to_start() -> None:
+        raise RuntimeError("can't start new thread")
+
+    monkeypatch.setattr(broken, "start", refuses_to_start)
+
+    with pytest.raises(RuntimeError):
+        start_load_job(broken)
+
+    assert current_load_job() is not broken, "фантомная задача осталась в реестре"
+
+    healthy = job_environment.make_job(FakeRawClient())
+    assert start_load_job(healthy) is True, "реестр отравлен: живых задач нет, а старт отбит"
+    assert healthy.wait(5)
+
+
+def test_the_outcome_is_published_even_when_the_record_writer_explodes(
+    job_environment, monkeypatch
+) -> None:
+    """Не-OSError из write_run_record убивал поток ДО публикации исхода и
+    _finished.set(): успешная заливка навсегда выглядела идущей, реестр
+    блокировался. Ошибка по-прежнему летит громко, но исход публикуется."""
+
+    def explodes(**kwargs):
+        raise ValueError("record writer exploded")
+
+    monkeypatch.setattr(load_job, "write_run_record", explodes)
+
+    job = job_environment.make_job(FakeRawClient())
+    with pytest.raises(ValueError):
+        job.run()
+
+    assert job.outcome == "ok"
+    assert job.is_finished is True
+    assert job.is_running is False
+    assert job.record_path is None
+
+
+def test_a_failed_ddl_rollback_reports_cleanup_failed(job_environment, monkeypatch) -> None:
+    """Откат внутри create_tables сам упал: таблица, скорее всего, осталась на
+    кластере, и запись не имеет права утверждать not_created. Нашло ревью."""
+    from csv_click.errors import TableCleanupError
+
+    def create_fails_and_rollback_fails(**kwargs):
+        raise TableCleanupError(
+            "Creating tables failed (verify timed out), and dropping the partially "
+            "created tables failed too (connection dead); sandbox.orders_local is "
+            "likely still on the cluster - drop it yourself."
+        )
+
+    monkeypatch.setattr(load_job, "create_tables", create_fails_and_rollback_fails)
+    job = job_environment.make_job(FakeRawClient())
+
+    job.run()
+
+    assert job.outcome == "failed"
+    assert job.tables_fate == TABLES_CLEANUP_FAILED
+    record = read_single_record(job_environment.records)
+    assert record["tables"]["fate"] == "cleanup_failed"
+    assert "orders_local" in record["error"]
+
+
 def test_cancel_during_preflight_stops_before_connect(job_environment, monkeypatch) -> None:
     """Отмена срабатывает на границе фаз: полная строгая проверка файла до
     50 МБ занимает время, и отменивший не должен ждать connect и DDL."""
@@ -563,6 +630,32 @@ def test_the_job_arms_the_driver_retry_counter_around_the_load(job_environment) 
     record = read_single_record(job_environment.records)
     assert record["stats"]["driver_retries"] == 2
     assert "re-uploaded a request body 2 time(s)" in "\n".join(job.log_lines())
+
+
+def test_retries_from_real_pool_workers_are_counted(job_environment) -> None:
+    """Параллельный путь: ретраи эмитятся с потоков пула, и счётчик узнаёт их
+    только по префиксу имени. Без thread_name_prefix у executor'а воркеры
+    зовутся ThreadPoolExecutor-N_i, и driver_retries молча занижался бы."""
+    import logging
+
+    from csv_click.load_stats import DRIVER_LOGGER_NAME, DRIVER_RETRY_MESSAGE
+
+    driver_logger = logging.getLogger(DRIVER_LOGGER_NAME)
+
+    class ReconnectingClient(FakeRawClient):
+        def raw_insert(self, **kwargs):
+            driver_logger.debug("%s (attempt %s/%s)", DRIVER_RETRY_MESSAGE, 1, 2)
+            return super().raw_insert(**kwargs)
+
+    job = job_environment.make_job(ReconnectingClient(), load_workers=2)
+    job.run()
+
+    record = read_single_record(job_environment.records)
+    assert record["outcome"] == "ok"
+    assert record["stats"]["blocks"] == 2
+    assert record["stats"]["driver_retries"] == 2, (
+        "ретраи с потоков пула не атрибутированы этой загрузке"
+    )
 
 
 def test_insert_wall_time_excludes_preflight_connect_and_ddl(job_environment, monkeypatch) -> None:

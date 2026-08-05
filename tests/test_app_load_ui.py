@@ -226,6 +226,79 @@ def test_a_second_start_warns_instead_of_replacing_the_running_job(
     assert load_job.current_load_job() is running, "живую задачу заменили"
 
 
+def test_a_vanished_csv_shows_an_error_instead_of_a_raw_traceback(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Файл удалили между «Read CSV» и кликом загрузки: раньше это ронял прогон
+    сырым FileNotFoundError (регрессия против main, где был except Exception)."""
+
+    class RecorderSt:
+        def __init__(self) -> None:
+            self.session_state: dict[str, object] = {
+                "type_rows": [
+                    {
+                        "source_name": "ID",
+                        "target_name": "ID",
+                        "include": True,
+                        "inferred_type": "UInt64",
+                        "final_type": "UInt64",
+                        "custom_type": "",
+                        "nullable": False,
+                        "sample_values": "",
+                        "notes": "",
+                    }
+                ]
+            }
+            self.warnings: list[str] = []
+            self.errors: list[str] = []
+
+        def warning(self, text: str) -> None:
+            self.warnings.append(text)
+
+        def error(self, text: str) -> None:
+            self.errors.append(text)
+
+    recorder = RecorderSt()
+    monkeypatch.setattr(app, "st", recorder)
+
+    app._start_load(
+        config=ClickHouseConfig(database="sandbox", cluster="clickhouse"),
+        csv_path=str(tmp_path / "vanished.csv"),
+        read_options=ReadOptions(batch_size=2),
+        schema=mappings_to_schema([SchemaMapping("ID", "ID", True, "UInt64", False)]),
+        distributed_table="orders",
+        order_by="ID",
+        partition_by=None,
+        sharding_key="ID",
+        max_insert_payload_mb=16,
+        load_workers=1,
+        insert_compression="off",
+        strict_preflight=False,
+    )
+
+    assert recorder.errors, "исчезнувший файл должен дать внятную ошибку, а не трейсбек"
+    assert load_job.current_load_job() is None, "задача не должна была создаться"
+
+
+def test_the_finished_log_is_bounded_on_screen(tmp_path: Path) -> None:
+    """Итоговый экран резал лог так же, как живой: полный лог в сокет на каждом
+    прогоне — та самая O(n²), против которой введён LOAD_LOG_TAIL_LINES."""
+    job = _finished_job(tmp_path)
+    for index in range(app.LOAD_LOG_TAIL_LINES + 50):
+        job.log(f"line {index}")
+    _install(job)
+
+    at = AppTest.from_function(_app, default_timeout=30)
+    at.run()
+
+    log_blocks = [str(block.value) for block in at.code]
+    assert log_blocks, "лог завершённой загрузки не найден"
+    rendered = max(log_blocks, key=len)
+    lines = rendered.splitlines()
+    assert len(lines) <= app.LOAD_LOG_TAIL_LINES + 1, "полный лог уехал в сокет"
+    assert "omitted" in lines[0], "оператор не узнает, что лог обрезан"
+
+
 def test_load_progress_line_reports_bytes_not_rows() -> None:
     stats = LoadStats(src_bytes=100 * 1024 * 1024, src_read_bytes=25 * 1024 * 1024)
 

@@ -13,6 +13,7 @@ import zlib
 import lz4.frame
 import numpy as np
 import pandas as pd
+from pandas.io.common import infer_compression
 import pyarrow as pa
 import pyarrow.compute as pc
 import zstandard
@@ -20,7 +21,7 @@ from clickhouse_connect.driver.compression import get_compressor
 
 from csv_click.clickhouse import raw_insert_batch, summary_elapsed_ns
 from csv_click.errors import CsvLoadCancelled, CsvLoadError, CsvReadCancelled, CsvSchemaError
-from csv_click.load_stats import BlockProgress, LoadStats
+from csv_click.load_stats import LOAD_WORKER_THREAD_PREFIX, BlockProgress, LoadStats
 from csv_click.schema import (
     NA_MARKERS,
     CsvColumn,
@@ -162,6 +163,14 @@ def iter_pandas_chunks(
                 encoding=read_options.encoding,
                 chunksize=read_options.batch_size,
                 usecols=raw_usecols,
+                # Файловый объект прячет имя файла, и pandas не может вывести
+                # сжатие из суффикса: data.csv.gz уезжал в парсер сырыми
+                # байтами, хотя превью и инференс (путь строкой) видели
+                # распакованные данные. Вывод — тем же кодом pandas, что и для
+                # пути строкой, иначе пути разойдутся на редком суффиксе.
+                compression=infer_compression(str(csv_path), "infer")
+                if counter is not None
+                else "infer",
                 # Ровно то же, что читают превью и инференс. Без этого путь загрузки
                 # видит другие данные, чем интерфейс: `007` становится числом 7,
                 # литералы NA/null/N/A - пропусками, а `1.50` в Decimal теряет ноль.
@@ -1219,7 +1228,11 @@ def _load_csv_via_raw_insert_parallel(
                 progress_callback(progress)
 
     pending: set[Future] = set()
-    with ThreadPoolExecutor(max_workers=worker_count) as executor:
+    # Именованные воркеры: по префиксу счётчик ретраев драйвера отличает
+    # вставки этой загрузки от прочего трафика процесса (Test connection).
+    with ThreadPoolExecutor(
+        max_workers=worker_count, thread_name_prefix=LOAD_WORKER_THREAD_PREFIX
+    ) as executor:
         try:
             chunks = _iter_timed(
                 iter_pandas_chunks(
@@ -1264,6 +1277,11 @@ def _load_csv_via_raw_insert_parallel(
             # они — отдельный вопрос, на него отвечает `blocks_unconfirmed`.
             stats.source_fully_read = True
             while pending:
+                # Отмена работает и в хвосте: неначатые блоки из очереди пула
+                # гасятся и на сервер не уходят. Прежнее рассуждение «гашение
+                # только подождало бы те же вставки» было неверным ровно для
+                # них — нашло состязательное ревью.
+                _raise_if_load_cancelled(cancel_callback)
                 collect_completed(pending)
         except BaseException:
             # Именно BaseException: RerunException и StopException в Streamlit
@@ -1308,13 +1326,13 @@ def _note_read_bytes(stats: LoadStats) -> Callable[[int], None]:
 
 
 def _raise_if_load_cancelled(cancel_callback: Callable[[], bool] | None) -> None:
-    """Проверка отмены перед каждым блоком.
+    """Проверка отмены перед каждым блоком и на каждом шаге drain-хвоста.
 
     Отдельной проверки на границе чанков нет намеренно: первый блок нового
     чанка проходит эту же, а мутация, убиравшая границу чанков, выживала —
-    поведение неотличимо. Хвост тоже не проверяется: когда файл дочитан и все
-    блоки отданы воркерам, гашение только подождало бы те же вставки и
-    записало доехавшие блоки в неподтверждённые.
+    поведение неотличимо. Хвост проверяется: там в очереди пула могут лежать
+    НЕНАЧАТЫЕ блоки, и их гашение — не «подождать те же вставки», а реально
+    не отправить до worker_count блоков.
     """
     if cancel_callback and cancel_callback():
         raise CsvLoadCancelled("The load was cancelled by the operator")

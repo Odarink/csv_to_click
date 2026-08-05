@@ -29,3 +29,8 @@ class CsvReadCancelled(CsvClickError):
 class CsvLoadCancelled(CsvClickError):
     """Raised when the operator cancels a running load."""
 
+
+class TableCleanupError(CsvClickError):
+    """Raised when dropping partially created tables fails: they are likely
+    still on the cluster, and the run record must not claim otherwise."""
+

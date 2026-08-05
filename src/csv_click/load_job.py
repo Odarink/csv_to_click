@@ -33,6 +33,7 @@ from csv_click.errors import (
     CsvLoadCancelled,
     CsvSchemaError,
     ExistingTableError,
+    TableCleanupError,
 )
 from csv_click.load_stats import (
     BlockProgress,
@@ -472,6 +473,12 @@ class LoadJob:
         except ExistingTableError as exc:
             error_message = f"Existing table error: {exc}"
             self.log(error_message)
+        except TableCleanupError as exc:
+            # Откат внутри create_tables сам упал: локальная таблица, скорее
+            # всего, осталась на кластере, и not_created здесь было бы враньём.
+            fate = TABLES_CLEANUP_FAILED
+            error_message = str(exc)
+            self.log(error_message)
         except (CsvSchemaError, ClickHouseConnectionError, CsvClickError) as exc:
             # Не при `load_completed`: строки уже в таблицах, и сбой отчёта не
             # повод их уничтожать.
@@ -503,29 +510,35 @@ class LoadJob:
                 outcome = "interrupted"
                 error_message = "the load thread was interrupted before the load finished"
             try:
-                record_path = write_run_record(
-                    config=self.run_config,
-                    stats=stats,
-                    csv_path=Path(self.csv_path),
-                    outcome=outcome,
-                    error=error_message,
-                    timestamp=datetime.now(timezone.utc),
-                    tables={
-                        "distributed": self.table_names.distributed,
-                        "local": self.table_names.local,
-                        "fate": fate,
-                    },
-                )
-                self.record_path = record_path
-                self.log(f"Run record saved to {record_path}")
-            except OSError as write_exc:
-                self.log(f"Could not save the run record: {write_exc}")
-            # Исход публикуется ДО отметки о завершении: кто увидел
-            # `is_finished`, обязан увидеть и заполненный итог.
-            self.outcome = outcome
-            self.error_message = error_message
-            self.tables_fate = fate
-            self._finished.set()
+                try:
+                    record_path = write_run_record(
+                        config=self.run_config,
+                        stats=stats,
+                        csv_path=Path(self.csv_path),
+                        outcome=outcome,
+                        error=error_message,
+                        timestamp=datetime.now(timezone.utc),
+                        tables={
+                            "distributed": self.table_names.distributed,
+                            "local": self.table_names.local,
+                            "fate": fate,
+                        },
+                    )
+                    self.record_path = record_path
+                    self.log(f"Run record saved to {record_path}")
+                except OSError as write_exc:
+                    self.log(f"Could not save the run record: {write_exc}")
+            finally:
+                # Исход и отметка завершения выставляются, ЧТО БЫ НИ случилось
+                # с записью: не-OSError отсюда летит дальше громко, но задача
+                # не имеет права остаться «вечно живой» — иначе реестр не
+                # примет ни одной загрузки до перезапуска процесса. Исход
+                # публикуется ДО отметки: кто увидел `is_finished`, обязан
+                # увидеть и заполненный итог.
+                self.outcome = outcome
+                self.error_message = error_message
+                self.tables_fate = fate
+                self._finished.set()
 
 
 # --- реестр: одна активная задача на процесс -------------------------------------
@@ -550,8 +563,16 @@ def start_load_job(job: LoadJob) -> bool:
     with _registry_lock:
         if _current_job is not None and _current_job.is_running:
             return False
+        previous = _current_job
         _current_job = job
-        job.start()
+        try:
+            job.start()
+        except BaseException:
+            # thread.start() упал (нехватка ресурсов ОС): без отката в реестре
+            # осталась бы фантомная «вечно живая» задача, и процесс не принял
+            # бы больше ни одной загрузки. Ошибка летит дальше громко.
+            _current_job = previous
+            raise
     return True
 
 

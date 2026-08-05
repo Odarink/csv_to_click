@@ -11,6 +11,7 @@ import pytest
 
 from csv_click.load_stats import (
     DRIVER_LOGGER_NAME,
+    DRIVER_RETRY_MESSAGE,
     BlockProgress,
     DriverRetryCounter,
     LoadStats,
@@ -438,6 +439,35 @@ def test_overlapping_counters_do_not_duplicate_forwarded_warnings(
                 logger.warning("driver could not reuse the connection")
 
     assert caplog.text.count("driver could not reuse the connection") == 1
+
+
+def test_retry_counter_ignores_retries_of_other_threads() -> None:
+    """Загрузка теперь фоновая, интерфейс жив, и «Test connection» во время
+    заливки писал фантомный retry в запись прогона: логгер драйвера один на
+    процесс. Считаются только поток, взведший счётчик, и воркеры загрузки."""
+    import threading
+
+    from csv_click.load_stats import LOAD_WORKER_THREAD_PREFIX
+
+    logger = logging.getLogger(DRIVER_LOGGER_NAME)
+
+    def emit_retry() -> None:
+        logger.debug("%s (attempt %s/%s)", DRIVER_RETRY_MESSAGE, 1, 2)
+
+    with DriverRetryCounter() as counter:
+        emit_retry()  # поток, взведший счётчик, — его собственная вставка
+
+        foreign = threading.Thread(target=emit_retry, name="ScriptRunner.main")
+        foreign.start()
+        foreign.join()
+
+        worker = threading.Thread(target=emit_retry, name=f"{LOAD_WORKER_THREAD_PREFIX}_0")
+        worker.start()
+        worker.join()
+
+    assert counter.count == 2, (
+        "свой поток и воркер загрузки считаются, чужой Test connection — нет"
+    )
 
 
 def test_write_run_record_persists_knob_positions_and_stats(tmp_path: Path) -> None:

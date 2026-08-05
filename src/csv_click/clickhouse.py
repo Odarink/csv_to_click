@@ -13,6 +13,7 @@ from csv_click.errors import (
     CertificateError,
     ClickHouseConnectionError,
     ExistingTableError,
+    TableCleanupError,
 )
 from csv_click.schema import CsvSchema
 
@@ -355,9 +356,21 @@ def create_tables(
             attempts=verify_attempts,
             interval_seconds=verify_interval_seconds,
         )
-    except Exception:
+    except Exception as exc:
         if created:
-            drop_target_tables(client, config, names.distributed, names.local, log_callback)
+            try:
+                drop_target_tables(client, config, names.distributed, names.local, log_callback)
+            except Exception as cleanup_exc:
+                # Откат сам упал (обычно то же мёртвое соединение): локальная
+                # таблица, скорее всего, осталась на кластере. Молча пробросить
+                # ошибку дропа значило бы и подменить исходную причину, и дать
+                # записи прогона утверждать not_created про существующую таблицу.
+                raise TableCleanupError(
+                    f"Creating tables failed ({exc}), and dropping the partially "
+                    f"created tables failed too ({cleanup_exc}). "
+                    f"{config.database}.{names.local} is likely still on the "
+                    "cluster - check and drop it yourself before reloading."
+                ) from exc
         raise
     return names
 

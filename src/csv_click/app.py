@@ -1133,6 +1133,12 @@ def _start_load(
     except CsvSchemaError as exc:
         st.error(f"CSV schema error: {exc}")
         return
+    except OSError as exc:
+        # Файл исчез или недоступен между «Read CSV» и кликом загрузки: путь
+        # проверяется на существование только на первом шаге. Раньше это
+        # роняло прогон сырым трейсбеком (регрессия против main).
+        st.error(f"CSV file error: {exc}")
+        return
     st.session_state["csv_read_options"] = effective_read_options
     job = LoadJob(
         config=config,
@@ -1232,7 +1238,12 @@ def _render_finished_load(job: LoadJob) -> None:
     if job.record_path is not None:
         st.caption(f"Run record: `{job.record_path}`")
     with st.expander("Load log", expanded=job.outcome != "ok"):
-        st.code("\n".join(job.log_lines()), language="text")
+        # Тот же хвост, что и у живого прогресса: полный лог (строка на каждый
+        # блок) уезжал в сокет на каждом прогоне каждой сессии — ровно та
+        # O(n²), против которой введён LOAD_LOG_TAIL_LINES. Важное — ошибки,
+        # судьба таблиц, разбивка по часам — стоит в конце лога и в хвост
+        # попадает всегда.
+        _render_load_log(st.empty(), job.log_lines())
 
 
 if __name__ == "__main__":
