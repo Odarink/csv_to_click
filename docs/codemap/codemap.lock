@@ -1,9 +1,9 @@
 {
-  "commit": "70eda36da4e5c6406d5593da175dda9a0ed4616b",
-  "branch": "docs/codemap",
+  "commit": "7dd321a6171363693cd269b0a3e2660affeb15b3",
+  "branch": "docs/windows-onboarding",
   "working_tree_dirty": false,
   "uncommitted_changes_in_scope": [],
-  "generated_at": "2026-08-05T18:22:48+03:00",
+  "generated_at": "2026-08-18T19:54:55+03:00",
   "scope": [
     "src/csv_click",
     "tests",
@@ -100,7 +100,7 @@
       "files": [
         "README.md"
       ],
-      "fingerprint": "74bd18de560df5f96c1e488d639909e55aa58fce2cb29f37bf84f2b782b8667e"
+      "fingerprint": "7b495674b598ccd28237677cc4a025413af3bbe0ed8a5345fa2507b52561cb0c"
     },
     "schema": {
       "files": [
